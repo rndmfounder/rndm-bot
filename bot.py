@@ -28,7 +28,7 @@ DB_PATH = "rndm.db"
 DEFAULT_BARAHOLKI_URL = "https://t.me/your_channel/1"
 DEFAULT_PROJECTS_URL = "https://t.me/your_channel/2"
 DEFAULT_GIVEAWAYS_URL = "https://t.me/your_channel/3"
-DEFAULT_MANAGER_URL = "https://t.me/your_manager"
+DEFAULT_MANAGER_URL = "tg://user?id=8423978061"
 
 DEFAULT_CATEGORIES = [
     {
@@ -36,11 +36,7 @@ DEFAULT_CATEGORIES = [
         "label": "⚡ УСТРОЙСТВА",
         "text": """⚡ *УСТРОЙСТВА*
 
-• XROS
-• AEGIS
-• PASITO
-
-Чтобы уточнить наличие и цены — жми кнопку ниже.""",
+Выбирай нужный бренд ниже 👇""",
         "image": "https://via.placeholder.com/1200x800.png?text=USTROYSTVA",
         "sort_order": 1,
     },
@@ -49,11 +45,7 @@ DEFAULT_CATEGORIES = [
         "label": "💧 ЖИДКОСТИ",
         "text": """💧 *ЖИДКОСТИ*
 
-• DUALL
-• TRAVA
-• SKALA
-
-Чтобы уточнить наличие и цены — жми кнопку ниже.""",
+Выбирай нужный бренд ниже 👇""",
         "image": "https://via.placeholder.com/1200x800.png?text=ZHIDKOSTI",
         "sort_order": 2,
     },
@@ -62,11 +54,7 @@ DEFAULT_CATEGORIES = [
         "label": "🔥 ОДНОРАЗКИ",
         "text": """🔥 *ОДНОРАЗКИ*
 
-• VOZOL
-• WAKA
-• NANCY
-
-Чтобы уточнить наличие и цены — жми кнопку ниже.""",
+Выбирай нужный бренд ниже 👇""",
         "image": "https://via.placeholder.com/1200x800.png?text=ODNORAZKI",
         "sort_order": 3,
     },
@@ -75,9 +63,7 @@ DEFAULT_CATEGORIES = [
         "label": "🧊 ШАЙБЫ/ПЛАСТИНКИ",
         "text": """🧊 *ШАЙБЫ/ПЛАСТИНКИ*
 
-Добавь сюда актуальные позиции.
-
-Чтобы уточнить наличие и цены — жми кнопку ниже.""",
+Выбирай нужный раздел ниже 👇""",
         "image": "https://via.placeholder.com/1200x800.png?text=PLATES",
         "sort_order": 4,
     },
@@ -86,9 +72,7 @@ DEFAULT_CATEGORIES = [
         "label": "🛠 РАСХОДНИКИ",
         "text": """🛠 *РАСХОДНИКИ*
 
-Добавь сюда актуальные позиции.
-
-Чтобы уточнить наличие и цены — жми кнопку ниже.""",
+Выбирай нужный раздел ниже 👇""",
         "image": "https://via.placeholder.com/1200x800.png?text=RASHODNIKI",
         "sort_order": 5,
     },
@@ -97,11 +81,173 @@ DEFAULT_CATEGORIES = [
         "label": "💸 СЛИВ/СКИДКИ",
         "text": """💸 *СЛИВ/СКИДКИ*
 
-Добавь сюда товары со скидками и сливом.
-
-Чтобы уточнить наличие и цены — жми кнопку ниже.""",
+Выбирай нужный раздел ниже 👇""",
         "image": "https://via.placeholder.com/1200x800.png?text=SALE",
         "sort_order": 6,
+    },
+]
+
+DEFAULT_SUBCATEGORIES = [
+    {
+        "subcategory_key": "xros",
+        "parent_category_key": "devices",
+        "label": "XROS",
+        "text": """⚡ *XROS*
+
+Популярные под-устройства линейки XROS.
+Уточняй наличие, цвет и цену у менеджера.""",
+        "image": "https://via.placeholder.com/1200x800.png?text=XROS",
+        "sort_order": 1,
+    },
+    {
+        "subcategory_key": "aegis",
+        "parent_category_key": "devices",
+        "label": "AEGIS",
+        "text": """⚡ *AEGIS*
+
+Надёжные устройства AEGIS.
+Уточняй наличие и цены у менеджера.""",
+        "image": "https://via.placeholder.com/1200x800.png?text=AEGIS",
+        "sort_order": 2,
+    },
+    {
+        "subcategory_key": "pasito",
+        "parent_category_key": "devices",
+        "label": "PASITO",
+        "text": """⚡ *PASITO*
+
+Устройства линейки PASITO.
+Уточняй наличие и цены у менеджера.""",
+        "image": "https://via.placeholder.com/1200x800.png?text=PASITO",
+        "sort_order": 3,
+    },
+    {
+        "subcategory_key": "duall",
+        "parent_category_key": "liquids",
+        "label": "DUALL",
+        "text": """💧 *DUALL*
+
+Жидкости DUALL.
+Уточняй вкусы и наличие у менеджера.""",
+        "image": "https://via.placeholder.com/1200x800.png?text=DUALL",
+        "sort_order": 1,
+    },
+    {
+        "subcategory_key": "trava",
+        "parent_category_key": "liquids",
+        "label": "TRAVA",
+        "text": """💧 *TRAVA*
+
+Жидкости TRAVA.
+Уточняй вкусы и наличие у менеджера.""",
+        "image": "https://via.placeholder.com/1200x800.png?text=TRAVA",
+        "sort_order": 2,
+    },
+    {
+        "subcategory_key": "skala",
+        "parent_category_key": "liquids",
+        "label": "SKALA",
+        "text": """💧 *SKALA*
+
+Жидкости SKALA.
+Уточняй вкусы и наличие у менеджера.""",
+        "image": "https://via.placeholder.com/1200x800.png?text=SKALA",
+        "sort_order": 3,
+    },
+    {
+        "subcategory_key": "vozol",
+        "parent_category_key": "disposables",
+        "label": "VOZOL",
+        "text": """🔥 *VOZOL*
+
+Одноразовые устройства VOZOL.
+Уточняй наличие и цены у менеджера.""",
+        "image": "https://via.placeholder.com/1200x800.png?text=VOZOL",
+        "sort_order": 1,
+    },
+    {
+        "subcategory_key": "waka",
+        "parent_category_key": "disposables",
+        "label": "WAKA",
+        "text": """🔥 *WAKA*
+
+Одноразовые устройства WAKA.
+Уточняй наличие и цены у менеджера.""",
+        "image": "https://via.placeholder.com/1200x800.png?text=WAKA",
+        "sort_order": 2,
+    },
+    {
+        "subcategory_key": "nancy",
+        "parent_category_key": "disposables",
+        "label": "NANCY",
+        "text": """🔥 *NANCY*
+
+Одноразовые устройства NANCY.
+Уточняй наличие и цены у менеджера.""",
+        "image": "https://via.placeholder.com/1200x800.png?text=NANCY",
+        "sort_order": 3,
+    },
+    {
+        "subcategory_key": "dlta",
+        "parent_category_key": "plates",
+        "label": "DLTA",
+        "text": """🧊 *DLTA*
+
+Шайбы/пластинки DLTA.
+Уточняй наличие и цены у менеджера.""",
+        "image": "https://via.placeholder.com/1200x800.png?text=DLTA",
+        "sort_order": 1,
+    },
+    {
+        "subcategory_key": "mad_plate",
+        "parent_category_key": "plates",
+        "label": "MAD",
+        "text": """🧊 *MAD*
+
+Шайбы/пластинки MAD.
+Уточняй наличие и цены у менеджера.""",
+        "image": "https://via.placeholder.com/1200x800.png?text=MAD",
+        "sort_order": 2,
+    },
+    {
+        "subcategory_key": "cartridges",
+        "parent_category_key": "supplies",
+        "label": "КАРТРИДЖИ",
+        "text": """🛠 *КАРТРИДЖИ*
+
+Уточняй наличие и совместимость у менеджера.""",
+        "image": "https://via.placeholder.com/1200x800.png?text=CARTRIDGES",
+        "sort_order": 1,
+    },
+    {
+        "subcategory_key": "coils",
+        "parent_category_key": "supplies",
+        "label": "ИСПАРИТЕЛИ",
+        "text": """🛠 *ИСПАРИТЕЛИ*
+
+Уточняй наличие и совместимость у менеджера.""",
+        "image": "https://via.placeholder.com/1200x800.png?text=COILS",
+        "sort_order": 2,
+    },
+    {
+        "subcategory_key": "sale_devices",
+        "parent_category_key": "sale",
+        "label": "СКИДКИ НА УСТРОЙСТВА",
+        "text": """💸 *СКИДКИ НА УСТРОЙСТВА*
+
+Актуальные скидки уточняй у менеджера.""",
+        "image": "https://via.placeholder.com/1200x800.png?text=SALE+DEVICES",
+        "sort_order": 1,
+    },
+    {
+        "subcategory_key": "sale_disposables",
+        "parent_category_key": "sale",
+        "label": "СКИДКИ НА ОДНОРАЗКИ",
+        "text": """💸 *СКИДКИ НА ОДНОРАЗКИ*
+
+Актуальные скидки уточняй у менеджера.""",
+        "image": "https://via.placeholder.com/1200x800.png?text=SALE+DISPOSABLES",
+        "sort_order": 2,
     },
 ]
 
@@ -170,6 +316,19 @@ cursor.execute(
     """
 )
 
+cursor.execute(
+    """
+    CREATE TABLE IF NOT EXISTS subcategories (
+        subcategory_key TEXT PRIMARY KEY,
+        parent_category_key TEXT NOT NULL,
+        label TEXT NOT NULL,
+        text TEXT NOT NULL,
+        image TEXT NOT NULL,
+        sort_order INTEGER NOT NULL
+    )
+    """
+)
+
 conn.commit()
 
 
@@ -193,7 +352,6 @@ for key, value in {
     if not get_setting(key):
         set_setting(key, value)
 
-
 cursor.execute("SELECT COUNT(*) FROM categories")
 categories_count = cursor.fetchone()[0]
 
@@ -206,6 +364,34 @@ if categories_count == 0:
             """,
             (
                 item["category_key"],
+                item["label"],
+                item["text"],
+                item["image"],
+                item["sort_order"],
+            ),
+        )
+    conn.commit()
+
+cursor.execute("SELECT COUNT(*) FROM subcategories")
+subcategories_count = cursor.fetchone()[0]
+
+if subcategories_count == 0:
+    for item in DEFAULT_SUBCATEGORIES:
+        cursor.execute(
+            """
+            INSERT INTO subcategories (
+                subcategory_key,
+                parent_category_key,
+                label,
+                text,
+                image,
+                sort_order
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                item["subcategory_key"],
+                item["parent_category_key"],
                 item["label"],
                 item["text"],
                 item["image"],
@@ -365,6 +551,7 @@ def add_category(label: str, text: str, image: str) -> str:
 
 def delete_category(category_key: str) -> None:
     cursor.execute("DELETE FROM categories WHERE category_key = ?", (category_key,))
+    cursor.execute("DELETE FROM subcategories WHERE parent_category_key = ?", (category_key,))
     conn.commit()
 
 
@@ -414,6 +601,39 @@ def move_category(category_key: str, direction: str) -> bool:
     return True
 
 
+def get_subcategories(parent_category_key: str):
+    cursor.execute(
+        """
+        SELECT subcategory_key, parent_category_key, label, text, image, sort_order
+        FROM subcategories
+        WHERE parent_category_key = ?
+        ORDER BY sort_order ASC, label ASC
+        """,
+        (parent_category_key,),
+    )
+    return cursor.fetchall()
+
+
+def get_subcategory(subcategory_key: str):
+    cursor.execute(
+        """
+        SELECT subcategory_key, parent_category_key, label, text, image, sort_order
+        FROM subcategories
+        WHERE subcategory_key = ?
+        """,
+        (subcategory_key,),
+    )
+    return cursor.fetchone()
+
+
+def has_subcategories(parent_category_key: str) -> bool:
+    cursor.execute(
+        "SELECT 1 FROM subcategories WHERE parent_category_key = ? LIMIT 1",
+        (parent_category_key,),
+    )
+    return cursor.fetchone() is not None
+
+
 def manager_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("💬 Написать менеджеру", url=get_setting("manager_url", DEFAULT_MANAGER_URL))]]
@@ -424,6 +644,16 @@ def assortment_menu_keyboard() -> InlineKeyboardMarkup:
     rows = []
     for category_key, label, text, image, sort_order in get_categories():
         rows.append([InlineKeyboardButton(label, callback_data=f"category:{category_key}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def subcategory_menu_keyboard(parent_category_key: str) -> InlineKeyboardMarkup:
+    rows = []
+
+    for subcategory_key, _, label, text, image, sort_order in get_subcategories(parent_category_key):
+        rows.append([InlineKeyboardButton(label, callback_data=f"subcategory:{subcategory_key}")])
+
+    rows.append([InlineKeyboardButton("⬅️ Назад к категориям", callback_data="assortment_menu")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -529,6 +759,27 @@ async def show_category(query, category_key: str):
     )
 
 
+async def show_subcategory(query, subcategory_key: str):
+    item = get_subcategory(subcategory_key)
+    if not item:
+        await query.message.reply_text("❌ Раздел не найден.")
+        return
+
+    _, parent_category_key, label, text, image, _ = item
+
+    await query.message.reply_photo(
+        photo=image,
+        caption=text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🛒 ЗАКАЗАТЬ", url=get_setting("manager_url", DEFAULT_MANAGER_URL))],
+                [InlineKeyboardButton("⬅️ Назад", callback_data=f"open_category:{parent_category_key}")],
+            ]
+        ),
+    )
+
+
 async def assortment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
@@ -548,7 +799,44 @@ async def assortment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if query.data and query.data.startswith("category:"):
         category_key = query.data.split(":", 1)[1]
+        category = get_category(category_key)
+        if not category:
+            await query.message.reply_text("❌ Категория не найдена.")
+            return
+
+        if has_subcategories(category_key):
+            await query.message.reply_text(
+                f"""📂 *{category[1]}*
+
+Выбирай раздел ниже 👇""",
+                parse_mode="Markdown",
+                reply_markup=subcategory_menu_keyboard(category_key),
+            )
+            return
+
         await show_category(query, category_key)
+        return
+
+    if query.data and query.data.startswith("subcategory:"):
+        subcategory_key = query.data.split(":", 1)[1]
+        await show_subcategory(query, subcategory_key)
+        return
+
+    if query.data and query.data.startswith("open_category:"):
+        category_key = query.data.split(":", 1)[1]
+        category = get_category(category_key)
+        if not category:
+            await query.message.reply_text("❌ Категория не найдена.")
+            return
+
+        await query.message.reply_text(
+            f"""📂 *{category[1]}*
+
+Выбирай раздел ниже 👇""",
+            parse_mode="Markdown",
+            reply_markup=subcategory_menu_keyboard(category_key),
+        )
+        return
 
 
 async def spin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -681,6 +969,8 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     used_count = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM categories")
     category_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM subcategories")
+    subcategory_count = cursor.fetchone()[0]
 
     await safe_send(
         update,
@@ -689,7 +979,8 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Пользователей: *{users_count}*
 Выдано промокодов: *{codes_count}*
 Использовано промокодов: *{used_count}*
-Категорий в ассортименте: *{category_count}*""",
+Категорий: *{category_count}*
+Подкатегорий: *{subcategory_count}*""",
         parse_mode="Markdown",
     )
 
@@ -1151,7 +1442,12 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^📊 Статистика$"), admin_stats))
     app.add_handler(MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main))
 
-    app.add_handler(CallbackQueryHandler(assortment_callback, pattern=r"^(category:|assortment_menu)"))
+    app.add_handler(
+        CallbackQueryHandler(
+            assortment_callback,
+            pattern=r"^(category:|subcategory:|open_category:|assortment_menu)"
+        )
+    )
 
     broadcast_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^📢 Рассылка$"), admin_broadcast_start)],
