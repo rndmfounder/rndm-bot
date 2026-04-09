@@ -41,12 +41,42 @@ CATEGORY_LABELS = {
 }
 
 DEFAULT_CATEGORY_TEXTS = {
-    "devices": "⚡ *УСТРОЙСТВА*\n\n• XROS\n• AEGIS\n• PASITO\n\nЧтобы уточнить наличие и цены — жми кнопку ниже.",
-    "liquids": "💧 *ЖИДКОСТИ*\n\n• DUALL\n• TRAVA\n• SKALA\n\nЧтобы уточнить наличие и цены — жми кнопку ниже.",
-    "disposables": "🔥 *ОДНОРАЗКИ*\n\n• VOZOL\n• WAKA\n• NANCY\n\nЧтобы уточнить наличие и цены — жми кнопку ниже.",
-    "plates": "🧊 *ШАЙБЫ/ПЛАСТИНКИ*\n\nДобавь сюда актуальные позиции.\n\nЧтобы уточнить наличие и цены — жми кнопку ниже.",
-    "supplies": "🛠 *РАСХОДНИКИ*\n\nДобавь сюда актуальные позиции.\n\nЧтобы уточнить наличие и цены — жми кнопку ниже.",
-    "sale": "💸 *СЛИВ/СКИДКИ*\n\nДобавь сюда товары со скидками и сливом.\n\nЧтобы уточнить наличие и цены — жми кнопку ниже.",
+    "devices": "⚡ *УСТРОЙСТВА*
+
+• XROS
+• AEGIS
+• PASITO
+
+Чтобы уточнить наличие и цены — жми кнопку ниже.",
+    "liquids": "💧 *ЖИДКОСТИ*
+
+• DUALL
+• TRAVA
+• SKALA
+
+Чтобы уточнить наличие и цены — жми кнопку ниже.",
+    "disposables": "🔥 *ОДНОРАЗКИ*
+
+• VOZOL
+• WAKA
+• NANCY
+
+Чтобы уточнить наличие и цены — жми кнопку ниже.",
+    "plates": "🧊 *ШАЙБЫ/ПЛАСТИНКИ*
+
+Добавь сюда актуальные позиции.
+
+Чтобы уточнить наличие и цены — жми кнопку ниже.",
+    "supplies": "🛠 *РАСХОДНИКИ*
+
+Добавь сюда актуальные позиции.
+
+Чтобы уточнить наличие и цены — жми кнопку ниже.",
+    "sale": "💸 *СЛИВ/СКИДКИ*
+
+Добавь сюда товары со скидками и сливом.
+
+Чтобы уточнить наличие и цены — жми кнопку ниже.",
 }
 
 DEFAULT_CATEGORY_IMAGES = {
@@ -69,9 +99,6 @@ DEFAULT_CATEGORY_IMAGES = {
 ) = range(7)
 
 
-# =========================
-# DB
-# =========================
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
 
@@ -124,7 +151,6 @@ def get_setting(key: str, default: str = "") -> str:
     return row[0] if row else default
 
 
-# Значения по умолчанию
 for key, value in {
     "baraholki_url": DEFAULT_BARAHOLKI_URL,
     "projects_url": DEFAULT_PROJECTS_URL,
@@ -141,9 +167,7 @@ for category_key in CATEGORY_LABELS:
         set_setting(f"category_image_{category_key}", DEFAULT_CATEGORY_IMAGES[category_key])
 
 
-# =========================
-# Helpers
-# =========================
+
 def now_iso() -> str:
     return datetime.now().isoformat()
 
@@ -316,15 +340,14 @@ async def safe_send(update: Update, text: str, **kwargs):
         await update.message.reply_text(text, **kwargs)
 
 
-# =========================
-# Public handlers
-# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     save_user(user)
     await safe_send(
         update,
-        "🔥 *Добро пожаловать в RNDM SHOP!*\n\nВыбирай нужный раздел ниже 👇",
+        "🔥 *Добро пожаловать в RNDM SHOP!*
+
+Выбирай нужный раздел ниже 👇",
         parse_mode="Markdown",
         reply_markup=main_keyboard(user.id),
     )
@@ -334,7 +357,9 @@ async def assortment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(update.effective_user)
     await safe_send(
         update,
-        "🛍 *АССОРТИМЕНТ RNDM SHOP*\n\nВыбирай категорию ниже 👇",
+        "🛍 *АССОРТИМЕНТ RNDM SHOP*
+
+Выбирай категорию ниже 👇",
         parse_mode="Markdown",
         reply_markup=assortment_menu_keyboard(),
     )
@@ -359,7 +384,9 @@ async def assortment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if query.data == "assortment_menu":
         await query.message.reply_text(
-            "🛍 *АССОРТИМЕНТ RNDM SHOP*\n\nВыбирай категорию ниже 👇",
+            "🛍 *АССОРТИМЕНТ RNDM SHOP*
+
+Выбирай категорию ниже 👇",
             parse_mode="Markdown",
             reply_markup=assortment_menu_keyboard(),
         )
@@ -378,7 +405,9 @@ async def spin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not can_spin(user.id):
         await safe_send(
             update,
-            "⏳ *Ты уже крутил скидку за последние 24 часа.*\n\nПопробуй позже 😈",
+            "⏳ *Ты уже крутил скидку за последние 24 часа.*
+
+Попробуй позже 😈",
             parse_mode="Markdown",
         )
         return
@@ -400,7 +429,10 @@ async def spin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_send(update, "🎰 Крутим твою скидку...")
     await safe_send(
         update,
-        f"💥 *ТЕБЕ ВЫПАЛО: -{discount}%*\n\nТвой промокод: `{code}`\n⏳ Действует *2 часа*",
+        f"💥 *ТЕБЕ ВЫПАЛО: -{discount}%*
+
+Твой промокод: `{code}`
+⏳ Действует *2 часа*",
         parse_mode="Markdown",
         reply_markup=manager_keyboard(),
     )
@@ -410,7 +442,9 @@ async def baraholki(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(update.effective_user)
     await safe_send(
         update,
-        "🛒 *Наши барахолки*\n\nЖми кнопку ниже 👇",
+        "🛒 *Наши барахолки*
+
+Жми кнопку ниже 👇",
         parse_mode="Markdown",
         reply_markup=post_link_keyboard("🛒 Перейти в барахолки", get_setting("baraholki_url", DEFAULT_BARAHOLKI_URL)),
     )
@@ -420,7 +454,9 @@ async def projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(update.effective_user)
     await safe_send(
         update,
-        "🚀 *Наши проекты*\n\nВсе ссылки — по кнопке ниже.",
+        "🚀 *Наши проекты*
+
+Все ссылки — по кнопке ниже.",
         parse_mode="Markdown",
         reply_markup=post_link_keyboard("🚀 Открыть проекты", get_setting("projects_url", DEFAULT_PROJECTS_URL)),
     )
@@ -430,7 +466,9 @@ async def giveaways(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(update.effective_user)
     await safe_send(
         update,
-        "🎁 *Розыгрыши RNDM SHOP*\n\nЖми кнопку ниже.",
+        "🎁 *Розыгрыши RNDM SHOP*
+
+Жми кнопку ниже.",
         parse_mode="Markdown",
         reply_markup=post_link_keyboard("🎁 Смотреть розыгрыши", get_setting("giveaways_url", DEFAULT_GIVEAWAYS_URL)),
     )
@@ -440,15 +478,14 @@ async def manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(update.effective_user)
     await safe_send(
         update,
-        "💬 *Связь с менеджером*\n\nПиши по кнопке ниже.",
+        "💬 *Связь с менеджером*
+
+Пиши по кнопке ниже.",
         parse_mode="Markdown",
         reply_markup=manager_keyboard(),
     )
 
 
-# =========================
-# Admin handlers
-# =========================
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await safe_send(update, "⛔ У тебя нет доступа.")
@@ -456,7 +493,9 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await safe_send(
         update,
-        "⚙️ *Админка RNDM SHOP*\n\nВыбери действие ниже.",
+        "⚙️ *Админка RNDM SHOP*
+
+Выбери действие ниже.",
         parse_mode="Markdown",
         reply_markup=admin_keyboard(),
     )
@@ -468,7 +507,9 @@ async def admin_categories_menu(update: Update, context: ContextTypes.DEFAULT_TY
 
     await safe_send(
         update,
-        "📝 *Настройка категорий ассортимента*\n\nМожно отдельно менять текст и отдельно фото для каждой категории.",
+        "📝 *Настройка категорий ассортимента*
+
+Можно отдельно менять текст и отдельно фото для каждой категории.",
         parse_mode="Markdown",
         reply_markup=admin_categories_keyboard(),
     )
@@ -488,7 +529,11 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await safe_send(
         update,
-        f"📊 *Статистика*\n\nПользователей: *{users_count}*\nВыдано промокодов: *{codes_count}*\nИспользовано промокодов: *{used_count}*",
+        f"📊 *Статистика*
+
+Пользователей: *{users_count}*
+Выдано промокодов: *{codes_count}*
+Использовано промокодов: *{used_count}*",
         parse_mode="Markdown",
     )
 
@@ -514,7 +559,9 @@ async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception:
             failed += 1
 
-    await safe_send(update, f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}", reply_markup=admin_keyboard())
+    await safe_send(update, f"✅ Рассылка завершена.
+Отправлено: {sent}
+Ошибок: {failed}", reply_markup=admin_keyboard())
     return ConversationHandler.END
 
 
@@ -626,13 +673,20 @@ async def check_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     _, discount, used, created_at, used_at, owner_user_id = row
     if used:
-        await safe_send(update, f"⚠️ Промокод уже использован\nСкидка: -{discount}%\nКогда использован: {used_at}")
+        await safe_send(update, f"⚠️ Промокод уже использован
+Скидка: -{discount}%
+Когда использован: {used_at}")
         return
     if not is_code_active(created_at):
-        await safe_send(update, f"⌛ Промокод просрочен\nСкидка была: -{discount}%\nСоздан: {created_at}")
+        await safe_send(update, f"⌛ Промокод просрочен
+Скидка была: -{discount}%
+Создан: {created_at}")
         return
 
-    await safe_send(update, f"✅ Промокод активен\nСкидка: -{discount}%\nСоздан: {created_at}\nВладелец user_id: {owner_user_id}")
+    await safe_send(update, f"✅ Промокод активен
+Скидка: -{discount}%
+Создан: {created_at}
+Владелец user_id: {owner_user_id}")
 
 
 async def use_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -657,12 +711,11 @@ async def use_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cursor.execute("UPDATE promocodes SET used = 1, used_at = ? WHERE code = ?", (now_iso(), code))
     conn.commit()
-    await safe_send(update, f"✅ Промокод {code} активирован\nСкидка: -{discount}%")
+    await safe_send(update, f"✅ Промокод {code} активирован
+Скидка: -{discount}%")
 
 
-# =========================
-# Main
-# =========================
+
 def main():
     app = Application.builder().token(TOKEN).build()
 
