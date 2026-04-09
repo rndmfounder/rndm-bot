@@ -2101,10 +2101,10 @@ def main():
     )
 
     baraholki_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^🛒 Ссылка на барахолки$"), admin_baraholki_start)],
-        states={ADMIN_BARAHOLKI_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_barahолki_save)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
+    entry_points=[MessageHandler(filters.Regex(r"^🛒 Ссылка на барахолки$"), admin_baraholki_start)],
+    states={ADMIN_BARAHOLKI_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_baraholki_save)]},
+    fallbacks=[CommandHandler("cancel", cancel)],
+)
 
     projects_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🚀 Ссылка на проекты$"), admin_projects_start)],
