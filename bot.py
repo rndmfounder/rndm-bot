@@ -582,6 +582,7 @@ def main():
     timeout=10,
     drop_pending_updates=True
 )
+)
 
 
 if __name__ == "__main__":
