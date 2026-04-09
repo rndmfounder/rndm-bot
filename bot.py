@@ -3,6 +3,7 @@ import re
 import random
 import sqlite3
 import string
+import logging
 from datetime import datetime, timedelta
 from itertools import count
 
@@ -66,25 +67,25 @@ DEFAULT_ITEMS = [
         "category_key": "devices",
         "label": "XROS",
         "description": "Популярные устройства линейки XROS.\nНаличие цветов уточнять у менеджеров после заказа 💜",
-        "image": "https://via.placeholder.com/1200x800.png?text=XROS",
+        "image": "",
         "sort_order": 1,
-        "price": 0,
+        "price": 2190,
     },
     {
         "item_key": "aegis_hero_3",
         "category_key": "devices",
         "label": "AEGIS HERO 3",
         "description": "Наличие цветов уточнять у менеджеров после заказа 💜",
-        "image": "https://via.placeholder.com/1200x800.png?text=AEGIS+HERO+3",
+        "image": "",
         "sort_order": 2,
-        "price": 0,
+        "price": 3190,
     },
     {
         "item_key": "pasito_2",
         "category_key": "devices",
         "label": "PASITO 2",
         "description": "Наличие цветов уточнять у менеджеров после заказа 💜",
-        "image": "https://via.placeholder.com/1200x800.png?text=PASITO+2",
+        "image": "",
         "sort_order": 3,
         "price": 0,
     },
@@ -155,6 +156,12 @@ ORDER_PICKUP_USERNAME_WAITING = next(_state)
 
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
+
+logging.basicConfig(
+    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 
 def now_iso() -> str:
@@ -829,15 +836,31 @@ async def show_item(query, item_id: int):
         await query.message.reply_text("❌ Позиция не найдена.")
         return
 
-    item_id, _, category_key, _, description, image, _, price = item
-    caption = f"{description}\n\n💰 *Цена:* {format_price(price)}"
+    item_id, _, category_key, label, description, image, _, price = item
+    caption = f"*{label}*\n\n{description}\n\n💰 *Цена:* {format_price(price)}"
 
-    await query.message.reply_photo(
-        photo=image,
-        caption=caption,
-        parse_mode="Markdown",
-        reply_markup=item_card_keyboard(item_id, category_key),
-    )
+    if not image:
+        await query.message.reply_text(
+            caption,
+            parse_mode="Markdown",
+            reply_markup=item_card_keyboard(item_id, category_key),
+        )
+        return
+
+    try:
+        await query.message.reply_photo(
+            photo=image,
+            caption=caption,
+            parse_mode="Markdown",
+            reply_markup=item_card_keyboard(item_id, category_key),
+        )
+    except Exception:
+        logger.exception("Ошибка при открытии товара item_id=%s, image=%s", item_id, image)
+        await query.message.reply_text(
+            f"{caption}\n\n⚠️ Фото товара не загрузилось.",
+            parse_mode="Markdown",
+            reply_markup=item_card_keyboard(item_id, category_key),
+        )
 
 
 async def open_cart_message(target_message, user_id: int):
@@ -2044,6 +2067,10 @@ async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_send(update, "⬅️ Возвращаю в главное меню.", reply_markup=main_keyboard(update.effective_user.id))
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Ошибка в обработке апдейта:", exc_info=context.error)
+
+
 def main():
     app = Application.builder().token(TOKEN).build()
 
@@ -2101,10 +2128,10 @@ def main():
     )
 
     baraholki_conv = ConversationHandler(
-    entry_points=[MessageHandler(filters.Regex(r"^🛒 Ссылка на барахолки$"), admin_baraholki_start)],
-    states={ADMIN_BARAHOLKI_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_baraholki_save)]},
-    fallbacks=[CommandHandler("cancel", cancel)],
-)
+        entry_points=[MessageHandler(filters.Regex(r"^🛒 Ссылка на барахолки$"), admin_baraholki_start)],
+        states={ADMIN_BARAHOLKI_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_baraholki_save)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
 
     projects_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🚀 Ссылка на проекты$"), admin_projects_start)],
@@ -2238,6 +2265,8 @@ def main():
     app.add_handler(rename_pickup_conv)
     app.add_handler(delete_pickup_conv)
     app.add_handler(reorder_pickup_conv)
+
+    app.add_error_handler(error_handler)
 
     print("RNDM SHOP bot запущен...")
     app.run_polling(poll_interval=1, timeout=10, drop_pending_updates=True)
