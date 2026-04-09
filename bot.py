@@ -22,7 +22,7 @@ from telegram.ext import (
     filters,
 )
 
-TOKEN = os.getenv("8358029510:AAHU-vtZAv1SNp6imkuCjomCKhWUIWvg66U")
+TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("Не найдена переменная окружения BOT_TOKEN")
 
