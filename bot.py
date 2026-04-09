@@ -1,4 +1,5 @@
 import os
+import re
 import random
 import sqlite3
 import string
@@ -31,8 +32,8 @@ ADMIN_IDS = {
 MANAGER_USER_ID = 8423978061
 DEFAULT_MANAGER_URL = f"tg://user?id={MANAGER_USER_ID}"
 
-# ВАЖНО: замени на chat_id своей группы менеджеров
-ORDER_GROUP_ID = int(os.getenv("ORDER_GROUP_ID", "-1001234567890"))
+# ВАЖНО: задай реальный chat_id группы менеджеров
+ORDER_GROUP_ID = int(os.getenv("ORDER_GROUP_ID", "-1003913158040"))
 
 DB_PATH = "rndm.db"
 
@@ -63,101 +64,39 @@ DEFAULT_ITEMS = [
         "item_key": "xros",
         "category_key": "devices",
         "label": "XROS",
-        "description": """⚡ *XROS*
-
-Популярные устройства линейки XROS.
-Для заказа жми кнопку ниже.""",
+        "description": "Популярные устройства линейки XROS.\nНаличие цветов уточнять у менеджеров после заказа 💜",
         "image": "https://via.placeholder.com/1200x800.png?text=XROS",
         "sort_order": 1,
+        "price": 0,
     },
     {
-        "item_key": "aegis",
+        "item_key": "aegis_hero_3",
         "category_key": "devices",
-        "label": "AEGIS",
-        "description": """⚡ *AEGIS*
-
-Надёжные устройства AEGIS.
-Для заказа жми кнопку ниже.""",
-        "image": "https://via.placeholder.com/1200x800.png?text=AEGIS",
+        "label": "AEGIS HERO 3",
+        "description": "Наличие цветов уточнять у менеджеров после заказа 💜",
+        "image": "https://via.placeholder.com/1200x800.png?text=AEGIS+HERO+3",
         "sort_order": 2,
+        "price": 0,
     },
     {
-        "item_key": "pasito",
+        "item_key": "pasito_2",
         "category_key": "devices",
-        "label": "PASITO",
-        "description": """⚡ *PASITO*
-
-Устройства линейки PASITO.
-Для заказа жми кнопку ниже.""",
-        "image": "https://via.placeholder.com/1200x800.png?text=PASITO",
+        "label": "PASITO 2",
+        "description": "Наличие цветов уточнять у менеджеров после заказа 💜",
+        "image": "https://via.placeholder.com/1200x800.png?text=PASITO+2",
         "sort_order": 3,
+        "price": 0,
     },
-    {
-        "item_key": "duall",
-        "category_key": "liquids",
-        "label": "DUALL",
-        "description": """💧 *DUALL*
+]
 
-Жидкости DUALL.
-Для заказа жми кнопку ниже.""",
-        "image": "https://via.placeholder.com/1200x800.png?text=DUALL",
-        "sort_order": 1,
-    },
-    {
-        "item_key": "trava",
-        "category_key": "liquids",
-        "label": "TRAVA",
-        "description": """💧 *TRAVA*
-
-Жидкости TRAVA.
-Для заказа жми кнопку ниже.""",
-        "image": "https://via.placeholder.com/1200x800.png?text=TRAVA",
-        "sort_order": 2,
-    },
-    {
-        "item_key": "skala",
-        "category_key": "liquids",
-        "label": "SKALA",
-        "description": """💧 *SKALA*
-
-Жидкости SKALA.
-Для заказа жми кнопку ниже.""",
-        "image": "https://via.placeholder.com/1200x800.png?text=SKALA",
-        "sort_order": 3,
-    },
-    {
-        "item_key": "vozol",
-        "category_key": "disposables",
-        "label": "VOZOL",
-        "description": """🔥 *VOZOL*
-
-Одноразовые устройства VOZOL.
-Для заказа жми кнопку ниже.""",
-        "image": "https://via.placeholder.com/1200x800.png?text=VOZOL",
-        "sort_order": 1,
-    },
-    {
-        "item_key": "waka",
-        "category_key": "disposables",
-        "label": "WAKA",
-        "description": """🔥 *WAKA*
-
-Одноразовые устройства WAKA.
-Для заказа жми кнопку ниже.""",
-        "image": "https://via.placeholder.com/1200x800.png?text=WAKA",
-        "sort_order": 2,
-    },
-    {
-        "item_key": "nancy",
-        "category_key": "disposables",
-        "label": "NANCY",
-        "description": """🔥 *NANCY*
-
-Одноразовые устройства NANCY.
-Для заказа жми кнопку ниже.""",
-        "image": "https://via.placeholder.com/1200x800.png?text=NANCY",
-        "sort_order": 3,
-    },
+DEFAULT_PICKUP_POINTS = [
+    "Академ",
+    "Сортировка",
+    "Центр",
+    "Юго-Запад",
+    "Железнодорожный",
+    "ЖБИ",
+    "Верхняя Пышма",
 ]
 
 (
@@ -166,28 +105,72 @@ DEFAULT_ITEMS = [
     ADMIN_PROJECTS_WAITING,
     ADMIN_GIVEAWAYS_WAITING,
     ADMIN_MANAGER_WAITING,
+
     ADMIN_ADD_ITEM_CATEGORY_WAITING,
     ADMIN_ADD_ITEM_NAME_WAITING,
     ADMIN_ADD_ITEM_DESC_WAITING,
+    ADMIN_ADD_ITEM_PRICE_WAITING,
     ADMIN_ADD_ITEM_IMAGE_WAITING,
+
     ADMIN_RENAME_ITEM_CATEGORY_WAITING,
     ADMIN_RENAME_ITEM_SELECT_WAITING,
     ADMIN_RENAME_ITEM_NEW_NAME_WAITING,
+
     ADMIN_EDIT_DESC_CATEGORY_WAITING,
     ADMIN_EDIT_DESC_SELECT_WAITING,
     ADMIN_EDIT_DESC_NEW_WAITING,
+
     ADMIN_EDIT_IMAGE_CATEGORY_WAITING,
     ADMIN_EDIT_IMAGE_SELECT_WAITING,
     ADMIN_EDIT_IMAGE_NEW_WAITING,
+
+    ADMIN_EDIT_PRICE_CATEGORY_WAITING,
+    ADMIN_EDIT_PRICE_SELECT_WAITING,
+    ADMIN_EDIT_PRICE_NEW_WAITING,
+
     ADMIN_DELETE_ITEM_CATEGORY_WAITING,
     ADMIN_DELETE_ITEM_SELECT_WAITING,
+
     ADMIN_REORDER_ITEM_CATEGORY_WAITING,
     ADMIN_REORDER_ITEM_WAITING,
-    ORDER_WAITING,
-) = range(23)
+
+    ADMIN_ADD_PICKUP_NAME_WAITING,
+    ADMIN_RENAME_PICKUP_SELECT_WAITING,
+    ADMIN_RENAME_PICKUP_NEW_WAITING,
+    ADMIN_DELETE_PICKUP_SELECT_WAITING,
+    ADMIN_REORDER_PICKUP_WAITING,
+
+    ORDER_CHOICE_WAITING,
+    ORDER_DELIVERY_PHONE_WAITING,
+    ORDER_DELIVERY_USERNAME_WAITING,
+    ORDER_DELIVERY_ADDRESS_WAITING,
+    ORDER_DELIVERY_TIME_WAITING,
+
+    ORDER_PICKUP_POINT_WAITING,
+    ORDER_PICKUP_PHONE_WAITING,
+    ORDER_PICKUP_TIME_WAITING,
+    ORDER_PICKUP_USERNAME_WAITING,
+) = range(41)
 
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
+
+
+def now_iso() -> str:
+    return datetime.now().isoformat()
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def ensure_column(table_name: str, column_name: str, column_def: str) -> None:
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    columns = [row[1] for row in cursor.fetchall()]
+    if column_name not in columns:
+        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
+        conn.commit()
+
 
 cursor.execute(
     """
@@ -232,7 +215,29 @@ cursor.execute(
         label TEXT NOT NULL,
         description TEXT NOT NULL,
         image TEXT NOT NULL,
+        sort_order INTEGER NOT NULL,
+        price INTEGER NOT NULL DEFAULT 0
+    )
+    """
+)
+
+cursor.execute(
+    """
+    CREATE TABLE IF NOT EXISTS pickup_points (
+        pickup_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
         sort_order INTEGER NOT NULL
+    )
+    """
+)
+
+cursor.execute(
+    """
+    CREATE TABLE IF NOT EXISTS cart_items (
+        user_id INTEGER NOT NULL,
+        item_id INTEGER NOT NULL,
+        quantity INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY (user_id, item_id)
     )
     """
 )
@@ -244,15 +249,23 @@ cursor.execute(
         user_id INTEGER NOT NULL,
         username TEXT,
         first_name TEXT,
-        item_id INTEGER NOT NULL,
-        item_label TEXT NOT NULL,
-        order_text TEXT NOT NULL,
+        order_type TEXT NOT NULL,
+        pickup_point TEXT,
+        phone TEXT,
+        contact_username TEXT,
+        address TEXT,
+        delivery_time TEXT,
+        items_text TEXT NOT NULL,
+        total_sum INTEGER NOT NULL DEFAULT 0,
+        comment TEXT,
         created_at TEXT NOT NULL
     )
     """
 )
 
 conn.commit()
+
+ensure_column("items", "price", "INTEGER NOT NULL DEFAULT 0")
 
 
 def set_setting(key: str, value: str) -> None:
@@ -276,13 +289,12 @@ for key, value in {
         set_setting(key, value)
 
 cursor.execute("SELECT COUNT(*) FROM items")
-items_count = cursor.fetchone()[0]
-if items_count == 0:
+if cursor.fetchone()[0] == 0:
     for item in DEFAULT_ITEMS:
         cursor.execute(
             """
-            INSERT INTO items (item_key, category_key, label, description, image, sort_order)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO items (item_key, category_key, label, description, image, sort_order, price)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item["item_key"],
@@ -291,17 +303,19 @@ if items_count == 0:
                 item["description"],
                 item["image"],
                 item["sort_order"],
+                item["price"],
             ),
         )
     conn.commit()
 
-
-def now_iso() -> str:
-    return datetime.now().isoformat()
-
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+cursor.execute("SELECT COUNT(*) FROM pickup_points")
+if cursor.fetchone()[0] == 0:
+    for index, name in enumerate(DEFAULT_PICKUP_POINTS, start=1):
+        cursor.execute(
+            "INSERT INTO pickup_points (name, sort_order) VALUES (?, ?)",
+            (name, index),
+        )
+    conn.commit()
 
 
 def save_user(user) -> None:
@@ -365,7 +379,6 @@ def generate_unique_item_key(label: str) -> str:
     base = slugify_name(label)
     candidate = base
     index = 1
-
     while True:
         cursor.execute("SELECT 1 FROM items WHERE item_key = ?", (candidate,))
         if not cursor.fetchone():
@@ -374,10 +387,38 @@ def generate_unique_item_key(label: str) -> str:
         index += 1
 
 
+def parse_category_from_label(label: str):
+    for key, value in CATEGORY_LABELS.items():
+        if value == label:
+            return key
+    return None
+
+
+def format_price(price: int) -> str:
+    if price <= 0:
+        return "Цена уточняется"
+    return f"{price} ₽"
+
+
+def parse_price(text: str):
+    cleaned = text.strip().replace("₽", "").replace("р", "").replace(" ", "")
+    if not cleaned.isdigit():
+        return None
+    return int(cleaned)
+
+
+def is_valid_phone(phone: str) -> bool:
+    return re.fullmatch(r"\+7\d{10}", phone.strip()) is not None
+
+
+def is_valid_username(username: str) -> bool:
+    return re.fullmatch(r"@[A-Za-z0-9_]{5,32}", username.strip()) is not None
+
+
 def get_items_by_category(category_key: str):
     cursor.execute(
         """
-        SELECT item_id, item_key, category_key, label, description, image, sort_order
+        SELECT item_id, item_key, category_key, label, description, image, sort_order, price
         FROM items
         WHERE category_key = ?
         ORDER BY sort_order ASC, label ASC
@@ -390,7 +431,7 @@ def get_items_by_category(category_key: str):
 def get_item(item_id: int):
     cursor.execute(
         """
-        SELECT item_id, item_key, category_key, label, description, image, sort_order
+        SELECT item_id, item_key, category_key, label, description, image, sort_order, price
         FROM items
         WHERE item_id = ?
         """,
@@ -402,7 +443,7 @@ def get_item(item_id: int):
 def get_item_by_label(category_key: str, label: str):
     cursor.execute(
         """
-        SELECT item_id, item_key, category_key, label, description, image, sort_order
+        SELECT item_id, item_key, category_key, label, description, image, sort_order, price
         FROM items
         WHERE category_key = ? AND label = ?
         """,
@@ -419,16 +460,15 @@ def get_next_item_order(category_key: str) -> int:
     return cursor.fetchone()[0]
 
 
-def add_item(category_key: str, label: str, description: str, image: str) -> int:
+def add_item(category_key: str, label: str, description: str, image: str, price: int) -> int:
     item_key = generate_unique_item_key(label)
     sort_order = get_next_item_order(category_key)
-
     cursor.execute(
         """
-        INSERT INTO items (item_key, category_key, label, description, image, sort_order)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO items (item_key, category_key, label, description, image, sort_order, price)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (item_key, category_key, label, description, image, sort_order),
+        (item_key, category_key, label, description, image, sort_order, price),
     )
     conn.commit()
     return cursor.lastrowid
@@ -449,7 +489,13 @@ def update_item_image(item_id: int, new_image: str) -> None:
     conn.commit()
 
 
+def update_item_price(item_id: int, new_price: int) -> None:
+    cursor.execute("UPDATE items SET price = ? WHERE item_id = ?", (new_price, item_id))
+    conn.commit()
+
+
 def delete_item(item_id: int) -> None:
+    cursor.execute("DELETE FROM cart_items WHERE item_id = ?", (item_id,))
     cursor.execute("DELETE FROM items WHERE item_id = ?", (item_id,))
     conn.commit()
 
@@ -459,7 +505,7 @@ def move_item(item_id: int, direction: str) -> bool:
     if not current:
         return False
 
-    _, _, category_key, _, _, _, current_order = current
+    _, _, category_key, _, _, _, current_order, _ = current
 
     if direction == "up":
         cursor.execute(
@@ -496,6 +542,170 @@ def move_item(item_id: int, direction: str) -> bool:
     return True
 
 
+def get_pickup_points():
+    cursor.execute(
+        """
+        SELECT pickup_id, name, sort_order
+        FROM pickup_points
+        ORDER BY sort_order ASC, name ASC
+        """
+    )
+    return cursor.fetchall()
+
+
+def get_pickup_point_by_name(name: str):
+    cursor.execute(
+        "SELECT pickup_id, name, sort_order FROM pickup_points WHERE name = ?",
+        (name,),
+    )
+    return cursor.fetchone()
+
+
+def get_pickup_point(pickup_id: int):
+    cursor.execute(
+        "SELECT pickup_id, name, sort_order FROM pickup_points WHERE pickup_id = ?",
+        (pickup_id,),
+    )
+    return cursor.fetchone()
+
+
+def get_next_pickup_order() -> int:
+    cursor.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM pickup_points")
+    return cursor.fetchone()[0]
+
+
+def add_pickup_point(name: str) -> None:
+    cursor.execute(
+        "INSERT INTO pickup_points (name, sort_order) VALUES (?, ?)",
+        (name, get_next_pickup_order()),
+    )
+    conn.commit()
+
+
+def rename_pickup_point(pickup_id: int, new_name: str) -> None:
+    cursor.execute("UPDATE pickup_points SET name = ? WHERE pickup_id = ?", (new_name, pickup_id))
+    conn.commit()
+
+
+def delete_pickup_point(pickup_id: int) -> None:
+    cursor.execute("DELETE FROM pickup_points WHERE pickup_id = ?", (pickup_id,))
+    conn.commit()
+
+
+def move_pickup_point(pickup_id: int, direction: str) -> bool:
+    current = get_pickup_point(pickup_id)
+    if not current:
+        return False
+
+    _, _, current_order = current
+
+    if direction == "up":
+        cursor.execute(
+            """
+            SELECT pickup_id, sort_order
+            FROM pickup_points
+            WHERE sort_order < ?
+            ORDER BY sort_order DESC
+            LIMIT 1
+            """,
+            (current_order,),
+        )
+    else:
+        cursor.execute(
+            """
+            SELECT pickup_id, sort_order
+            FROM pickup_points
+            WHERE sort_order > ?
+            ORDER BY sort_order ASC
+            LIMIT 1
+            """,
+            (current_order,),
+        )
+
+    neighbor = cursor.fetchone()
+    if not neighbor:
+        return False
+
+    neighbor_id, neighbor_order = neighbor
+
+    cursor.execute("UPDATE pickup_points SET sort_order = ? WHERE pickup_id = ?", (neighbor_order, pickup_id))
+    cursor.execute("UPDATE pickup_points SET sort_order = ? WHERE pickup_id = ?", (current_order, neighbor_id))
+    conn.commit()
+    return True
+
+
+def add_to_cart(user_id: int, item_id: int, quantity: int = 1) -> None:
+    cursor.execute(
+        """
+        INSERT INTO cart_items (user_id, item_id, quantity)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id, item_id) DO UPDATE SET quantity = quantity + excluded.quantity
+        """,
+        (user_id, item_id, quantity),
+    )
+    conn.commit()
+
+
+def remove_from_cart(user_id: int, item_id: int) -> None:
+    cursor.execute("DELETE FROM cart_items WHERE user_id = ? AND item_id = ?", (user_id, item_id))
+    conn.commit()
+
+
+def clear_cart(user_id: int) -> None:
+    cursor.execute("DELETE FROM cart_items WHERE user_id = ?", (user_id,))
+    conn.commit()
+
+
+def get_cart(user_id: int):
+    cursor.execute(
+        """
+        SELECT ci.item_id, ci.quantity, i.label, i.price, i.category_key
+        FROM cart_items ci
+        JOIN items i ON i.item_id = ci.item_id
+        WHERE ci.user_id = ?
+        ORDER BY i.label ASC
+        """,
+        (user_id,),
+    )
+    return cursor.fetchall()
+
+
+def cart_total(user_id: int) -> int:
+    rows = get_cart(user_id)
+    return sum(price * quantity for _, quantity, _, price, _ in rows)
+
+
+def cart_text(user_id: int) -> str:
+    rows = get_cart(user_id)
+    if not rows:
+        return "🛒 Корзина пока пустая."
+
+    lines = ["🛒 *ТВОЯ КОРЗИНА*\n"]
+    for item_id, quantity, label, price, _ in rows:
+        if price > 0:
+            lines.append(f"• {label} — {quantity} шт × {price} ₽ = {price * quantity} ₽")
+        else:
+            lines.append(f"• {label} — {quantity} шт × цена уточняется")
+
+    total = cart_total(user_id)
+    lines.append("")
+    lines.append(f"*Итого:* {format_price(total)}" if total > 0 else "*Итого:* цена уточняется")
+    return "\n".join(lines)
+
+
+def cart_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    rows = []
+    rows.append([InlineKeyboardButton("✅ Оформить заказ", callback_data="cart_checkout")])
+
+    cart_rows = get_cart(user_id)
+    for item_id, quantity, label, price, _ in cart_rows:
+        rows.append([InlineKeyboardButton(f"❌ Удалить: {label}", callback_data=f"cart_remove:{item_id}")])
+
+    rows.append([InlineKeyboardButton("🗑 Очистить корзину", callback_data="cart_clear")])
+    rows.append([InlineKeyboardButton("⬅️ Назад в ассортимент", callback_data="assortment_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
 def manager_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("💬 Написать менеджеру", url=get_setting("manager_url", DEFAULT_MANAGER_URL))]]
@@ -504,9 +714,10 @@ def manager_keyboard() -> InlineKeyboardMarkup:
 
 def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     keyboard = [
-        ["🛍 Ассортимент", "🎰 Крутить скидку"],
+        ["🛍 Ассортимент", "🛒 Корзина"],
+        ["🎰 Крутить скидку", "💬 Менеджер"],
         ["🛒 Наши барахолки", "🚀 Наши проекты"],
-        ["🎁 Розыгрыши", "💬 Менеджер"],
+        ["🎁 Розыгрыши"],
     ]
     if is_admin(user_id):
         keyboard.append(["⚙️ Админка"])
@@ -518,7 +729,8 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
         [
             ["➕ Добавить кнопку", "✏️ Переименовать кнопку"],
             ["📝 Изменить описание", "🖼 Изменить фото"],
-            ["🗑 Удалить кнопку", "↕️ Порядок кнопок"],
+            ["💰 Изменить цену", "🗑 Удалить кнопку"],
+            ["↕️ Порядок кнопок", "📍 Точки самовывоза"],
             ["📢 Рассылка", "📊 Статистика"],
             ["💬 Ссылка на менеджера", "🛒 Ссылка на барахолки"],
             ["🚀 Ссылка на проекты", "🎁 Ссылка на розыгрыши"],
@@ -528,32 +740,14 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def category_menu_keyboard() -> InlineKeyboardMarkup:
-    rows = []
-    for category_key in CATEGORY_ORDER:
-        rows.append(
-            [InlineKeyboardButton(CATEGORY_LABELS[category_key], callback_data=f"category:{category_key}")]
-        )
-    return InlineKeyboardMarkup(rows)
-
-
-def item_menu_keyboard(category_key: str) -> InlineKeyboardMarkup:
-    rows = []
-    items = get_items_by_category(category_key)
-
-    for item_id, _, _, label, _, _, _ in items:
-        rows.append([InlineKeyboardButton(label, callback_data=f"item:{item_id}")])
-
-    rows.append([InlineKeyboardButton("⬅️ Назад к категориям", callback_data="assortment_menu")])
-    return InlineKeyboardMarkup(rows)
-
-
-def item_card_keyboard(item_id: int, category_key: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+def pickup_admin_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
         [
-            [InlineKeyboardButton("🛒 ЗАКАЗАТЬ", callback_data=f"order:{item_id}")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data=f"open_category:{category_key}")],
-        ]
+            ["➕ Добавить точку", "✏️ Переименовать точку"],
+            ["🗑 Удалить точку", "↕️ Порядок точек"],
+            ["⬅️ Назад"],
+        ],
+        resize_keyboard=True,
     )
 
 
@@ -565,16 +759,54 @@ def admin_category_choice_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
+def category_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for category_key in CATEGORY_ORDER:
+        rows.append([InlineKeyboardButton(CATEGORY_LABELS[category_key], callback_data=f"category:{category_key}")])
+    rows.append([InlineKeyboardButton("🛒 Открыть корзину", callback_data="cart_open")])
+    return InlineKeyboardMarkup(rows)
+
+
+def item_menu_keyboard(category_key: str) -> InlineKeyboardMarkup:
+    rows = []
+    for item_id, _, _, label, _, _, _, price in get_items_by_category(category_key):
+        price_suffix = f" — {price} ₽" if price > 0 else ""
+        rows.append([InlineKeyboardButton(f"{label}{price_suffix}", callback_data=f"item:{item_id}")])
+
+    rows.append([InlineKeyboardButton("🛒 Корзина", callback_data="cart_open")])
+    rows.append([InlineKeyboardButton("⬅️ Назад к категориям", callback_data="assortment_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def item_card_keyboard(item_id: int, category_key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🛒 В корзину", callback_data=f"add_to_cart:{item_id}")],
+            [InlineKeyboardButton("⚡ Купить сейчас", callback_data=f"buy_now:{item_id}")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=f"open_category:{category_key}")],
+        ]
+    )
+
+
+def order_type_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🚚 Доставка", callback_data="checkout_delivery")],
+            [InlineKeyboardButton("📍 Самовывоз", callback_data="checkout_pickup")],
+        ]
+    )
+
+
+def pickup_points_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for pickup_id, name, _ in get_pickup_points():
+        rows.append([InlineKeyboardButton(name, callback_data=f"pickup_select:{pickup_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def safe_send(update: Update, text: str, **kwargs):
     if update.message:
         await update.message.reply_text(text, **kwargs)
-
-
-def parse_category_from_label(label: str):
-    for key, value in CATEGORY_LABELS.items():
-        if value == label:
-            return key
-    return None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -582,9 +814,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(user)
     await safe_send(
         update,
-        """🔥 *Добро пожаловать в RNDM SHOP!*
-
-Выбирай нужный раздел ниже 👇""",
+        "🔥 *Добро пожаловать в RNDM SHOP!*\n\nВыбирай нужный раздел ниже 👇",
         parse_mode="Markdown",
         reply_markup=main_keyboard(user.id),
     )
@@ -594,28 +824,35 @@ async def assortment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(update.effective_user)
     await safe_send(
         update,
-        """🛍 *АССОРТИМЕНТ RNDM SHOP*
-
-Выбирай категорию ниже 👇""",
+        "🛍 *АССОРТИМЕНТ RNDM SHOP*\n\nВыбирай категорию ниже 👇",
         parse_mode="Markdown",
         reply_markup=category_menu_keyboard(),
     )
 
 
-async def show_item(update_or_query, item_id: int):
+async def show_item(query, item_id: int):
     item = get_item(item_id)
     if not item:
-        if hasattr(update_or_query, "message") and update_or_query.message:
-            await update_or_query.message.reply_text("❌ Позиция не найдена.")
+        await query.message.reply_text("❌ Позиция не найдена.")
         return
 
-    item_id, _, category_key, label, description, image, _ = item
+    item_id, _, category_key, label, description, image, _, price = item
+    caption = f"{description}\n\n💰 *Цена:* {format_price(price)}"
 
-    await update_or_query.message.reply_photo(
+    await query.message.reply_photo(
         photo=image,
-        caption=description,
+        caption=caption,
         parse_mode="Markdown",
         reply_markup=item_card_keyboard(item_id, category_key),
+    )
+
+
+async def open_cart_message(target_message, user_id: int):
+    text = cart_text(user_id)
+    await target_message.reply_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=cart_keyboard(user_id),
     )
 
 
@@ -625,23 +862,35 @@ async def assortment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     await query.answer()
+    user = update.effective_user
 
     if query.data == "assortment_menu":
         await query.message.reply_text(
-            """🛍 *АССОРТИМЕНТ RNDM SHOP*
-
-Выбирай категорию ниже 👇""",
+            "🛍 *АССОРТИМЕНТ RNDM SHOP*\n\nВыбирай категорию ниже 👇",
             parse_mode="Markdown",
             reply_markup=category_menu_keyboard(),
         )
         return
 
+    if query.data == "cart_open":
+        await open_cart_message(query.message, user.id)
+        return
+
+    if query.data == "cart_clear":
+        clear_cart(user.id)
+        await query.message.reply_text("🗑 Корзина очищена.", reply_markup=category_menu_keyboard())
+        return
+
+    if query.data.startswith("cart_remove:"):
+        item_id = int(query.data.split(":", 1)[1])
+        remove_from_cart(user.id, item_id)
+        await open_cart_message(query.message, user.id)
+        return
+
     if query.data.startswith("category:"):
         category_key = query.data.split(":", 1)[1]
         await query.message.reply_text(
-            f"""📂 *{CATEGORY_LABELS.get(category_key, "КАТЕГОРИЯ")}*
-
-Выбирай позицию ниже 👇""",
+            f"📂 *{CATEGORY_LABELS.get(category_key, 'КАТЕГОРИЯ')}*\n\nВыбирай позицию ниже 👇",
             parse_mode="Markdown",
             reply_markup=item_menu_keyboard(category_key),
         )
@@ -655,72 +904,104 @@ async def assortment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if query.data.startswith("open_category:"):
         category_key = query.data.split(":", 1)[1]
         await query.message.reply_text(
-            f"""📂 *{CATEGORY_LABELS.get(category_key, "КАТЕГОРИЯ")}*
-
-Выбирай позицию ниже 👇""",
+            f"📂 *{CATEGORY_LABELS.get(category_key, 'КАТЕГОРИЯ')}*\n\nВыбирай позицию ниже 👇",
             parse_mode="Markdown",
             reply_markup=item_menu_keyboard(category_key),
         )
         return
 
-
-async def start_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return ConversationHandler.END
-
-    await query.answer()
-
-    item_id = int(query.data.split(":", 1)[1])
-    item = get_item(item_id)
-    if not item:
-        await query.message.reply_text("❌ Позиция не найдена.")
-        return ConversationHandler.END
-
-    context.user_data["order_item_id"] = item_id
-
-    await query.message.reply_text(
-        f"""🛒 *Оформление заказа: {item[3]}*
-
-Отправь одним сообщением:
-Имя / район / что нужно / количество / комментарий
-
-Пример:
-Кирилл / ЖБИ / XROS 5 MINI / 2 шт / нужен сегодня""",
-        parse_mode="Markdown",
-    )
-    return ORDER_WAITING
+    if query.data.startswith("add_to_cart:"):
+        item_id = int(query.data.split(":", 1)[1])
+        add_to_cart(user.id, item_id)
+        await query.message.reply_text("✅ Товар добавлен в корзину.")
+        return
 
 
-async def finish_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    save_user(user)
+def clear_order_context(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for key in [
+        "checkout_mode",
+        "checkout_buy_now_item_id",
+        "checkout_pickup_point",
+        "checkout_phone",
+        "checkout_username",
+        "checkout_address",
+        "checkout_time",
+    ]:
+        context.user_data.pop(key, None)
 
-    item_id = context.user_data.get("order_item_id")
-    if not item_id:
-        await safe_send(update, "❌ Не удалось определить товар.")
-        return ConversationHandler.END
 
-    item = get_item(item_id)
-    if not item:
-        await safe_send(update, "❌ Товар не найден.")
-        return ConversationHandler.END
+def collect_checkout_items(user_id: int, buy_now_item_id: int | None):
+    if buy_now_item_id:
+        item = get_item(buy_now_item_id)
+        if not item:
+            return []
+        return [{
+            "item_id": item[0],
+            "label": item[3],
+            "price": item[7],
+            "quantity": 1,
+        }]
 
-    order_text = update.message.text.strip()
-    item_label = item[3]
+    rows = get_cart(user_id)
+    result = []
+    for item_id, quantity, label, price, _ in rows:
+        result.append({
+            "item_id": item_id,
+            "label": label,
+            "price": price,
+            "quantity": quantity,
+        })
+    return result
+
+
+def build_items_text(items: list[dict]) -> str:
+    lines = []
+    for item in items:
+        price = item["price"]
+        qty = item["quantity"]
+        label = item["label"]
+        if price > 0:
+            lines.append(f"{label} — {qty} шт × {price} ₽ = {qty * price} ₽")
+        else:
+            lines.append(f"{label} — {qty} шт × цена уточняется")
+    return "\n".join(lines)
+
+
+def build_total_sum(items: list[dict]) -> int:
+    return sum(item["price"] * item["quantity"] for item in items)
+
+
+async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items: list[dict]) -> int:
+    order_type = context.user_data.get("checkout_mode")
+    pickup_point = context.user_data.get("checkout_pickup_point")
+    phone = context.user_data.get("checkout_phone")
+    contact_username = context.user_data.get("checkout_username")
+    address = context.user_data.get("checkout_address")
+    delivery_time = context.user_data.get("checkout_time")
+
+    items_text = build_items_text(items)
+    total_sum = build_total_sum(items)
 
     cursor.execute(
         """
-        INSERT INTO orders (user_id, username, first_name, item_id, item_label, order_text, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO orders (
+            user_id, username, first_name, order_type, pickup_point, phone,
+            contact_username, address, delivery_time, items_text, total_sum, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             user.id,
             user.username,
             user.first_name,
-            item_id,
-            item_label,
-            order_text,
+            order_type,
+            pickup_point,
+            phone,
+            contact_username,
+            address,
+            delivery_time,
+            items_text,
+            total_sum,
             now_iso(),
         ),
     )
@@ -728,42 +1009,245 @@ async def finish_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     order_id = cursor.lastrowid
 
     username_line = f"@{user.username}" if user.username else "нет username"
+    total_line = format_price(total_sum) if total_sum > 0 else "цена уточняется"
 
-    manager_message = (
-        f"🆕 *НОВЫЙ ЗАКАЗ #{order_id}*\n\n"
-        f"*Товар:* {item_label}\n"
-        f"*От пользователя:* {user.first_name or '-'}\n"
-        f"*Username:* {username_line}\n"
-        f"*User ID:* `{user.id}`\n\n"
-        f"*Текст заказа:*\n{order_text}\n\n"
-        f"*Время:* {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+    manager_text = (
+        f"🆕 НОВЫЙ ЗАКАЗ #{order_id}\n\n"
+        f"Тип: {'Доставка' if order_type == 'delivery' else 'Самовывоз'}\n"
+        f"Клиент: {user.first_name or '-'}\n"
+        f"Username в Telegram: {username_line}\n"
+        f"User ID: {user.id}\n"
+        f"Телефон: {phone}\n"
+        f"Контактный username: {contact_username}\n"
     )
 
-    try:
-        await context.bot.send_message(
-            chat_id=ORDER_GROUP_ID,
-            text=manager_message,
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        await safe_send(
-            update,
-            f"⚠️ Заказ записан, но не удалось отправить его в группу.\nПроверь ORDER_GROUP_ID.\n\nОшибка: {e}"
-        )
-        context.user_data.pop("order_item_id", None)
+    if order_type == "delivery":
+        manager_text += f"Адрес: {address}\n"
+    else:
+        manager_text += f"Точка самовывоза: {pickup_point}\n"
+
+    manager_text += (
+        f"Время: {delivery_time}\n\n"
+        f"Товары:\n{items_text}\n\n"
+        f"Итого: {total_line}\n"
+        f"Время заказа: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+    )
+
+    await context.bot.send_message(chat_id=ORDER_GROUP_ID, text=manager_text)
+    return order_id
+
+
+async def begin_checkout(query, context: ContextTypes.DEFAULT_TYPE, buy_now_item_id: int | None = None):
+    user = query.from_user
+    items = collect_checkout_items(user.id, buy_now_item_id)
+    if not items:
+        await query.message.reply_text("🛒 Корзина пустая.")
         return ConversationHandler.END
+
+    clear_order_context(context)
+    context.user_data["checkout_buy_now_item_id"] = buy_now_item_id
+
+    items_text = build_items_text(items)
+    total_sum = build_total_sum(items)
+    total_line = format_price(total_sum) if total_sum > 0 else "цена уточняется"
+
+    await query.message.reply_text(
+        f"🧾 ОФОРМЛЕНИЕ ЗАКАЗА\n\nТовары:\n{items_text}\n\nИтого: {total_line}\n\nВыбери тип заказа:",
+        reply_markup=order_type_keyboard(),
+    )
+    return ORDER_CHOICE_WAITING
+
+
+async def start_checkout_from_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    await query.answer()
+    return await begin_checkout(query, context, buy_now_item_id=None)
+
+
+async def start_checkout_buy_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    await query.answer()
+    item_id = int(query.data.split(":", 1)[1])
+    return await begin_checkout(query, context, buy_now_item_id=item_id)
+
+
+async def checkout_choose_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["checkout_mode"] = "delivery"
+    await query.message.reply_text("1) Ваш телефон в формате +7XXXXXXXXXX")
+    return ORDER_DELIVERY_PHONE_WAITING
+
+
+async def checkout_delivery_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    phone = update.message.text.strip()
+    if not is_valid_phone(phone):
+        await safe_send(update, "❌ Неверный формат. Пример: +79991234567")
+        return ORDER_DELIVERY_PHONE_WAITING
+
+    context.user_data["checkout_phone"] = phone
+    await safe_send(update, "2) Ваш юзернейм в Telegram для связи.\nПример: @ivan1997")
+    return ORDER_DELIVERY_USERNAME_WAITING
+
+
+async def checkout_delivery_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    username = update.message.text.strip()
+    if not is_valid_username(username):
+        await safe_send(update, "❌ Неверный формат. Пример: @ivan1997")
+        return ORDER_DELIVERY_USERNAME_WAITING
+
+    context.user_data["checkout_username"] = username
+    await safe_send(update, "3) Ваш адрес: район, улица, дом")
+    return ORDER_DELIVERY_ADDRESS_WAITING
+
+
+async def checkout_delivery_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    address = update.message.text.strip()
+    if len(address) < 5:
+        await safe_send(update, "❌ Адрес слишком короткий.")
+        return ORDER_DELIVERY_ADDRESS_WAITING
+
+    context.user_data["checkout_address"] = address
+    await safe_send(update, "4) Укажите удобное время")
+    return ORDER_DELIVERY_TIME_WAITING
+
+
+async def checkout_delivery_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    delivery_time = update.message.text.strip()
+    if len(delivery_time) < 2:
+        await safe_send(update, "❌ Укажи время нормально.")
+        return ORDER_DELIVERY_TIME_WAITING
+
+    context.user_data["checkout_time"] = delivery_time
+
+    user = update.effective_user
+    items = collect_checkout_items(user.id, context.user_data.get("checkout_buy_now_item_id"))
+    if not items:
+        await safe_send(update, "❌ Не удалось собрать товары для заказа.")
+        clear_order_context(context)
+        return ConversationHandler.END
+
+    try:
+        order_id = await send_order_to_managers(context, user, items)
+    except Exception as e:
+        await safe_send(update, f"⚠️ Не удалось отправить заказ в группу.\nПроверь ORDER_GROUP_ID.\n\nОшибка: {e}")
+        clear_order_context(context)
+        return ConversationHandler.END
+
+    if not context.user_data.get("checkout_buy_now_item_id"):
+        clear_cart(user.id)
 
     await safe_send(
         update,
-        """✅ *Заказ отправлен менеджерам.*
-
-С тобой скоро свяжутся.""",
-        parse_mode="Markdown",
+        f"✅ Заказ #{order_id} отправлен менеджерам.\nС тобой скоро свяжутся.",
         reply_markup=main_keyboard(user.id),
     )
-
-    context.user_data.pop("order_item_id", None)
+    clear_order_context(context)
     return ConversationHandler.END
+
+
+async def checkout_choose_pickup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["checkout_mode"] = "pickup"
+
+    points = get_pickup_points()
+    if not points:
+        await query.message.reply_text("❌ Нет доступных точек самовывоза.")
+        clear_order_context(context)
+        return ConversationHandler.END
+
+    await query.message.reply_text(
+        "Выбери точку самовывоза:",
+        reply_markup=pickup_points_keyboard(),
+    )
+    return ORDER_PICKUP_POINT_WAITING
+
+
+async def checkout_pickup_point(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    pickup_id = int(query.data.split(":", 1)[1])
+    pickup_point = get_pickup_point(pickup_id)
+    if not pickup_point:
+        await query.message.reply_text("❌ Точка не найдена.")
+        return ORDER_PICKUP_POINT_WAITING
+
+    context.user_data["checkout_pickup_point"] = pickup_point[1]
+    await query.message.reply_text("1) Ваш номер телефона в формате +7XXXXXXXXXX")
+    return ORDER_PICKUP_PHONE_WAITING
+
+
+async def checkout_pickup_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    phone = update.message.text.strip()
+    if not is_valid_phone(phone):
+        await safe_send(update, "❌ Неверный формат. Пример: +79991234567")
+        return ORDER_PICKUP_PHONE_WAITING
+
+    context.user_data["checkout_phone"] = phone
+    await safe_send(update, "2) Укажите удобное время")
+    return ORDER_PICKUP_TIME_WAITING
+
+
+async def checkout_pickup_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pickup_time = update.message.text.strip()
+    if len(pickup_time) < 2:
+        await safe_send(update, "❌ Укажи время нормально.")
+        return ORDER_PICKUP_TIME_WAITING
+
+    context.user_data["checkout_time"] = pickup_time
+    await safe_send(update, "3) Ваш юзернейм в Telegram.\nПример: @ivan1997")
+    return ORDER_PICKUP_USERNAME_WAITING
+
+
+async def checkout_pickup_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    username = update.message.text.strip()
+    if not is_valid_username(username):
+        await safe_send(update, "❌ Неверный формат. Пример: @ivan1997")
+        return ORDER_PICKUP_USERNAME_WAITING
+
+    context.user_data["checkout_username"] = username
+
+    user = update.effective_user
+    items = collect_checkout_items(user.id, context.user_data.get("checkout_buy_now_item_id"))
+    if not items:
+        await safe_send(update, "❌ Не удалось собрать товары для заказа.")
+        clear_order_context(context)
+        return ConversationHandler.END
+
+    try:
+        order_id = await send_order_to_managers(context, user, items)
+    except Exception as e:
+        await safe_send(update, f"⚠️ Не удалось отправить заказ в группу.\nПроверь ORDER_GROUP_ID.\n\nОшибка: {e}")
+        clear_order_context(context)
+        return ConversationHandler.END
+
+    if not context.user_data.get("checkout_buy_now_item_id"):
+        clear_cart(user.id)
+
+    await safe_send(
+        update,
+        f"✅ Заказ #{order_id} отправлен менеджерам.\nС тобой скоро свяжутся.",
+        reply_markup=main_keyboard(user.id),
+    )
+    clear_order_context(context)
+    return ConversationHandler.END
+
+
+async def show_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    save_user(user)
+    await safe_send(
+        update,
+        cart_text(user.id),
+        parse_mode="Markdown",
+        reply_markup=cart_keyboard(user.id),
+    )
 
 
 async def spin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -773,9 +1257,7 @@ async def spin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not can_spin(user.id):
         await safe_send(
             update,
-            """⏳ *Ты уже крутил скидку за последние 24 часа.*
-
-Попробуй позже 😈""",
+            "⏳ *Ты уже крутил скидку за последние 24 часа.*\n\nПопробуй позже 😈",
             parse_mode="Markdown",
         )
         return
@@ -797,10 +1279,7 @@ async def spin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_send(update, "🎰 Крутим твою скидку...")
     await safe_send(
         update,
-        f"""💥 *ТЕБЕ ВЫПАЛО: -{discount}%*
-
-Твой промокод: `{code}`
-⏳ Действует *2 часа*""",
+        f"💥 *ТЕБЕ ВЫПАЛО: -{discount}%*\n\nТвой промокод: `{code}`\n⏳ Действует *2 часа*",
         parse_mode="Markdown",
         reply_markup=manager_keyboard(),
     )
@@ -810,9 +1289,7 @@ async def baraholki(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(update.effective_user)
     await safe_send(
         update,
-        """🛒 *Наши барахолки*
-
-Жми кнопку ниже 👇""",
+        "🛒 *Наши барахолки*\n\nЖми кнопку ниже 👇",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("🛒 Перейти в барахолки", url=get_setting("baraholki_url", DEFAULT_BARAHOLKI_URL))]]
@@ -824,9 +1301,7 @@ async def projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(update.effective_user)
     await safe_send(
         update,
-        """🚀 *Наши проекты*
-
-Все ссылки — по кнопке ниже.""",
+        "🚀 *Наши проекты*\n\nВсе ссылки — по кнопке ниже.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("🚀 Открыть проекты", url=get_setting("projects_url", DEFAULT_PROJECTS_URL))]]
@@ -838,9 +1313,7 @@ async def giveaways(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(update.effective_user)
     await safe_send(
         update,
-        """🎁 *Розыгрыши RNDM SHOP*
-
-Жми кнопку ниже.""",
+        "🎁 *Розыгрыши RNDM SHOP*\n\nЖми кнопку ниже.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("🎁 Смотреть розыгрыши", url=get_setting("giveaways_url", DEFAULT_GIVEAWAYS_URL))]]
@@ -852,9 +1325,7 @@ async def manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(update.effective_user)
     await safe_send(
         update,
-        """💬 *Связь с менеджером*
-
-Пиши по кнопке ниже.""",
+        "💬 *Связь с менеджером*\n\nПиши по кнопке ниже.",
         parse_mode="Markdown",
         reply_markup=manager_keyboard(),
     )
@@ -867,11 +1338,20 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await safe_send(
         update,
-        """⚙️ *Админка*
-
-Управление кнопками внутри категорий и настройками.""",
+        "⚙️ *Админка*\n\nУправление товарами, ценами, точками самовывоза и настройками.",
         parse_mode="Markdown",
         reply_markup=admin_keyboard(),
+    )
+
+
+async def admin_pickup_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    await safe_send(
+        update,
+        "📍 *Точки самовывоза*\n\nУправляй точками ниже.",
+        parse_mode="Markdown",
+        reply_markup=pickup_admin_keyboard(),
     )
 
 
@@ -894,15 +1374,18 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute("SELECT COUNT(*) FROM orders")
     orders_count = cursor.fetchone()[0]
 
+    cursor.execute("SELECT COUNT(*) FROM pickup_points")
+    pickup_count = cursor.fetchone()[0]
+
     await safe_send(
         update,
-        f"""📊 *Статистика*
-
-Пользователей: *{users_count}*
-Кнопок внутри категорий: *{items_count}*
-Выдано промокодов: *{codes_count}*
-Использовано промокодов: *{used_count}*
-Заказов: *{orders_count}*""",
+        f"📊 *Статистика*\n\n"
+        f"Пользователей: *{users_count}*\n"
+        f"Товарных кнопок: *{items_count}*\n"
+        f"Точек самовывоза: *{pickup_count}*\n"
+        f"Выдано промокодов: *{codes_count}*\n"
+        f"Использовано промокодов: *{used_count}*\n"
+        f"Заказов: *{orders_count}*",
         parse_mode="Markdown",
     )
 
@@ -910,7 +1393,6 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-
     await safe_send(update, "📢 Отправь текст рассылки одним сообщением. /cancel для отмены")
     return ADMIN_BROADCAST_WAITING
 
@@ -931,9 +1413,7 @@ async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await safe_send(
         update,
-        f"""✅ Рассылка завершена.
-Отправлено: {sent}
-Ошибок: {failed}""",
+        f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}",
         reply_markup=admin_keyboard(),
     )
     return ConversationHandler.END
@@ -995,11 +1475,7 @@ async def admin_add_item_start(update: Update, context: ContextTypes.DEFAULT_TYP
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
 
-    await safe_send(
-        update,
-        "➕ Выбери категорию, куда добавить кнопку.",
-        reply_markup=admin_category_choice_keyboard(),
-    )
+    await safe_send(update, "➕ Выбери категорию, куда добавить кнопку.", reply_markup=admin_category_choice_keyboard())
     return ADMIN_ADD_ITEM_CATEGORY_WAITING
 
 
@@ -1022,6 +1498,17 @@ async def admin_add_item_name(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def admin_add_item_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["admin_item_desc"] = update.message.text
+    await safe_send(update, "💰 Теперь отправь цену в рублях.\nПример: 1990")
+    return ADMIN_ADD_ITEM_PRICE_WAITING
+
+
+async def admin_add_item_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    price = parse_price(update.message.text)
+    if price is None:
+        await safe_send(update, "❌ Цена должна быть числом. Пример: 1990")
+        return ADMIN_ADD_ITEM_PRICE_WAITING
+
+    context.user_data["admin_item_price"] = price
     await safe_send(update, "🖼 Теперь отправь фото для этой кнопки.")
     return ADMIN_ADD_ITEM_IMAGE_WAITING
 
@@ -1034,17 +1521,19 @@ async def admin_add_item_image(update: Update, context: ContextTypes.DEFAULT_TYP
     category_key = context.user_data.get("admin_item_category")
     name = context.user_data.get("admin_item_name")
     desc = context.user_data.get("admin_item_desc")
+    price = context.user_data.get("admin_item_price")
 
-    if not category_key or not name or not desc:
+    if not category_key or not name or desc is None or price is None:
         await safe_send(update, "❌ Данные потерялись.")
         return ConversationHandler.END
 
     file_id = update.message.photo[-1].file_id
-    add_item(category_key, name, desc, file_id)
+    add_item(category_key, name, desc, file_id, price)
 
     context.user_data.pop("admin_item_category", None)
     context.user_data.pop("admin_item_name", None)
     context.user_data.pop("admin_item_desc", None)
+    context.user_data.pop("admin_item_price", None)
 
     await safe_send(update, "✅ Кнопка добавлена.", reply_markup=admin_keyboard())
     return ConversationHandler.END
@@ -1053,7 +1542,6 @@ async def admin_add_item_image(update: Update, context: ContextTypes.DEFAULT_TYP
 async def admin_rename_item_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-
     await safe_send(update, "✏️ Выбери категорию.", reply_markup=admin_category_choice_keyboard())
     return ADMIN_RENAME_ITEM_CATEGORY_WAITING
 
@@ -1105,7 +1593,6 @@ async def admin_rename_item_new_name(update: Update, context: ContextTypes.DEFAU
 async def admin_edit_desc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-
     await safe_send(update, "📝 Выбери категорию.", reply_markup=admin_category_choice_keyboard())
     return ADMIN_EDIT_DESC_CATEGORY_WAITING
 
@@ -1157,7 +1644,6 @@ async def admin_edit_desc_new(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def admin_edit_image_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-
     await safe_send(update, "🖼 Выбери категорию.", reply_markup=admin_category_choice_keyboard())
     return ADMIN_EDIT_IMAGE_CATEGORY_WAITING
 
@@ -1211,10 +1697,65 @@ async def admin_edit_image_new(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
+async def admin_edit_price_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    await safe_send(update, "💰 Выбери категорию.", reply_markup=admin_category_choice_keyboard())
+    return ADMIN_EDIT_PRICE_CATEGORY_WAITING
+
+
+async def admin_edit_price_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    category_key = parse_category_from_label(update.message.text.strip())
+    if not category_key:
+        await safe_send(update, "❌ Выбери категорию кнопкой ниже.", reply_markup=admin_category_choice_keyboard())
+        return ADMIN_EDIT_PRICE_CATEGORY_WAITING
+
+    items = get_items_by_category(category_key)
+    if not items:
+        await safe_send(update, "❌ В этой категории пока нет кнопок.", reply_markup=admin_keyboard())
+        return ConversationHandler.END
+
+    context.user_data["edit_price_category_key"] = category_key
+    text = "Отправь *точное название* кнопки, у которой нужно изменить цену:\n\n"
+    text += "\n".join([f"• {item[3]} — {format_price(item[7])}" for item in items])
+    await safe_send(update, text)
+    return ADMIN_EDIT_PRICE_SELECT_WAITING
+
+
+async def admin_edit_price_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    category_key = context.user_data.get("edit_price_category_key")
+    item = get_item_by_label(category_key, update.message.text.strip())
+    if not item:
+        await safe_send(update, "❌ Кнопка не найдена. Отправь точное название.")
+        return ADMIN_EDIT_PRICE_SELECT_WAITING
+
+    context.user_data["edit_price_item_id"] = item[0]
+    await safe_send(update, "💰 Отправь новую цену в рублях.\nПример: 1990")
+    return ADMIN_EDIT_PRICE_NEW_WAITING
+
+
+async def admin_edit_price_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    item_id = context.user_data.get("edit_price_item_id")
+    if not item_id:
+        return ConversationHandler.END
+
+    price = parse_price(update.message.text)
+    if price is None:
+        await safe_send(update, "❌ Цена должна быть числом. Пример: 1990")
+        return ADMIN_EDIT_PRICE_NEW_WAITING
+
+    update_item_price(item_id, price)
+
+    context.user_data.pop("edit_price_category_key", None)
+    context.user_data.pop("edit_price_item_id", None)
+
+    await safe_send(update, "✅ Цена обновлена.", reply_markup=admin_keyboard())
+    return ConversationHandler.END
+
+
 async def admin_delete_item_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-
     await safe_send(update, "🗑 Выбери категорию.", reply_markup=admin_category_choice_keyboard())
     return ADMIN_DELETE_ITEM_CATEGORY_WAITING
 
@@ -1245,7 +1786,6 @@ async def admin_delete_item_select(update: Update, context: ContextTypes.DEFAULT
         return ADMIN_DELETE_ITEM_SELECT_WAITING
 
     delete_item(item[0])
-
     context.user_data.pop("delete_category_key", None)
 
     await safe_send(update, "✅ Кнопка удалена.", reply_markup=admin_keyboard())
@@ -1255,7 +1795,6 @@ async def admin_delete_item_select(update: Update, context: ContextTypes.DEFAULT
 async def admin_reorder_item_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-
     await safe_send(update, "↕️ Выбери категорию.", reply_markup=admin_category_choice_keyboard())
     return ADMIN_REORDER_ITEM_CATEGORY_WAITING
 
@@ -1309,6 +1848,132 @@ async def admin_reorder_item_save(update: Update, context: ContextTypes.DEFAULT_
 
     context.user_data.pop("reorder_category_key", None)
     await safe_send(update, "✅ Порядок кнопок обновлён.", reply_markup=admin_keyboard())
+    return ConversationHandler.END
+
+
+async def admin_add_pickup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    await safe_send(update, "➕ Отправь название новой точки самовывоза.")
+    return ADMIN_ADD_PICKUP_NAME_WAITING
+
+
+async def admin_add_pickup_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    if len(name) < 2:
+        await safe_send(update, "❌ Название слишком короткое.")
+        return ADMIN_ADD_PICKUP_NAME_WAITING
+
+    add_pickup_point(name)
+    await safe_send(update, "✅ Точка самовывоза добавлена.", reply_markup=pickup_admin_keyboard())
+    return ConversationHandler.END
+
+
+async def admin_rename_pickup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    points = get_pickup_points()
+    if not points:
+        await safe_send(update, "❌ Нет точек самовывоза.", reply_markup=pickup_admin_keyboard())
+        return ConversationHandler.END
+
+    text = "Отправь *точное название* точки, которую нужно переименовать:\n\n"
+    text += "\n".join([f"• {point[1]}" for point in points])
+    await safe_send(update, text, parse_mode="Markdown")
+    return ADMIN_RENAME_PICKUP_SELECT_WAITING
+
+
+async def admin_rename_pickup_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    point = get_pickup_point_by_name(update.message.text.strip())
+    if not point:
+        await safe_send(update, "❌ Точка не найдена.")
+        return ADMIN_RENAME_PICKUP_SELECT_WAITING
+
+    context.user_data["rename_pickup_id"] = point[0]
+    await safe_send(update, "✏️ Отправь новое название точки.")
+    return ADMIN_RENAME_PICKUP_NEW_WAITING
+
+
+async def admin_rename_pickup_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pickup_id = context.user_data.get("rename_pickup_id")
+    if not pickup_id:
+        return ConversationHandler.END
+
+    rename_pickup_point(pickup_id, update.message.text.strip())
+    context.user_data.pop("rename_pickup_id", None)
+    await safe_send(update, "✅ Точка переименована.", reply_markup=pickup_admin_keyboard())
+    return ConversationHandler.END
+
+
+async def admin_delete_pickup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    points = get_pickup_points()
+    if not points:
+        await safe_send(update, "❌ Нет точек самовывоза.", reply_markup=pickup_admin_keyboard())
+        return ConversationHandler.END
+
+    text = "Отправь *точное название* точки, которую нужно удалить:\n\n"
+    text += "\n".join([f"• {point[1]}" for point in points])
+    await safe_send(update, text, parse_mode="Markdown")
+    return ADMIN_DELETE_PICKUP_SELECT_WAITING
+
+
+async def admin_delete_pickup_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    point = get_pickup_point_by_name(update.message.text.strip())
+    if not point:
+        await safe_send(update, "❌ Точка не найдена.")
+        return ADMIN_DELETE_PICKUP_SELECT_WAITING
+
+    delete_pickup_point(point[0])
+    await safe_send(update, "✅ Точка удалена.", reply_markup=pickup_admin_keyboard())
+    return ConversationHandler.END
+
+
+async def admin_reorder_pickup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    points = get_pickup_points()
+    if not points:
+        await safe_send(update, "❌ Нет точек самовывоза.", reply_markup=pickup_admin_keyboard())
+        return ConversationHandler.END
+
+    text = "Отправь сообщение в формате:\n\nНАЗВАНИЕ ТОЧКИ = up\nили\nНАЗВАНИЕ ТОЧКИ = down\n\n"
+    text += "Текущий порядок:\n"
+    for point in points:
+        text += f"{point[2]}. {point[1]}\n"
+
+    await safe_send(update, text)
+    return ADMIN_REORDER_PICKUP_WAITING
+
+
+async def admin_reorder_pickup_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    if "=" not in raw:
+        await safe_send(update, "❌ Формат: НАЗВАНИЕ ТОЧКИ = up/down")
+        return ADMIN_REORDER_PICKUP_WAITING
+
+    label, direction = [part.strip() for part in raw.split("=", 1)]
+    direction = direction.lower()
+
+    if direction not in {"up", "down"}:
+        await safe_send(update, "❌ Направление должно быть up или down.")
+        return ADMIN_REORDER_PICKUP_WAITING
+
+    point = get_pickup_point_by_name(label)
+    if not point:
+        await safe_send(update, "❌ Точка не найдена.")
+        return ADMIN_REORDER_PICKUP_WAITING
+
+    ok = move_pickup_point(point[0], direction)
+    if not ok:
+        await safe_send(update, "⚠️ Дальше двигать уже некуда.")
+        return ADMIN_REORDER_PICKUP_WAITING
+
+    await safe_send(update, "✅ Порядок точек обновлён.", reply_markup=pickup_admin_keyboard())
     return ConversationHandler.END
 
 
@@ -1387,67 +2052,89 @@ def main():
     app.add_handler(CommandHandler("cancel", cancel))
 
     app.add_handler(MessageHandler(filters.Regex(r"^🛍 Ассортимент$"), assortment))
+    app.add_handler(MessageHandler(filters.Regex(r"^🛒 Корзина$"), show_cart))
     app.add_handler(MessageHandler(filters.Regex(r"^🎰 Крутить скидку$"), spin))
+    app.add_handler(MessageHandler(filters.Regex(r"^💬 Менеджер$"), manager))
     app.add_handler(MessageHandler(filters.Regex(r"^🛒 Наши барахолки$"), baraholki))
     app.add_handler(MessageHandler(filters.Regex(r"^🚀 Наши проекты$"), projects))
     app.add_handler(MessageHandler(filters.Regex(r"^🎁 Розыгрыши$"), giveaways))
-    app.add_handler(MessageHandler(filters.Regex(r"^💬 Менеджер$"), manager))
     app.add_handler(MessageHandler(filters.Regex(r"^⚙️ Админка$"), admin_panel))
+    app.add_handler(MessageHandler(filters.Regex(r"^📍 Точки самовывоза$"), admin_pickup_panel))
     app.add_handler(MessageHandler(filters.Regex(r"^📊 Статистика$"), admin_stats))
     app.add_handler(MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main))
 
     app.add_handler(
         CallbackQueryHandler(
             assortment_callback,
-            pattern=r"^(category:|item:|open_category:|assortment_menu)"
+            pattern=r"^(category:|item:|open_category:|assortment_menu|add_to_cart:|cart_open|cart_remove:|cart_clear)$",
         )
     )
 
-    order_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_order, pattern=r"^order:\d+$")],
+    checkout_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(start_checkout_from_cart, pattern=r"^cart_checkout$"),
+            CallbackQueryHandler(start_checkout_buy_now, pattern=r"^buy_now:\d+$"),
+        ],
         states={
-            ORDER_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, finish_order)]
+            ORDER_CHOICE_WAITING: [
+                CallbackQueryHandler(checkout_choose_delivery, pattern=r"^checkout_delivery$"),
+                CallbackQueryHandler(checkout_choose_pickup, pattern=r"^checkout_pickup$"),
+            ],
+            ORDER_DELIVERY_PHONE_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_delivery_phone)
+            ],
+            ORDER_DELIVERY_USERNAME_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_delivery_username)
+            ],
+            ORDER_DELIVERY_ADDRESS_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_delivery_address)
+            ],
+            ORDER_DELIVERY_TIME_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_delivery_time)
+            ],
+            ORDER_PICKUP_POINT_WAITING: [
+                CallbackQueryHandler(checkout_pickup_point, pattern=r"^pickup_select:\d+$")
+            ],
+            ORDER_PICKUP_PHONE_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_pickup_phone)
+            ],
+            ORDER_PICKUP_TIME_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_pickup_time)
+            ],
+            ORDER_PICKUP_USERNAME_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_pickup_username)
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
     broadcast_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^📢 Рассылка$"), admin_broadcast_start)],
-        states={
-            ADMIN_BROADCAST_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_send)]
-        },
+        states={ADMIN_BROADCAST_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_send)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
     baraholki_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🛒 Ссылка на барахолки$"), admin_baraholki_start)],
-        states={
-            ADMIN_BARAHOLKI_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_baraholki_save)]
-        },
+        states={ADMIN_BARAHOLKI_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_baraholki_save)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
     projects_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🚀 Ссылка на проекты$"), admin_projects_start)],
-        states={
-            ADMIN_PROJECTS_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_projects_save)]
-        },
+        states={ADMIN_PROJECTS_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_projects_save)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
     giveaways_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🎁 Ссылка на розыгрыши$"), admin_giveaways_start)],
-        states={
-            ADMIN_GIVEAWAYS_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_giveaways_save)]
-        },
+        states={ADMIN_GIVEAWAYS_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_giveaways_save)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
     manager_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^💬 Ссылка на менеджера$"), admin_manager_start)],
-        states={
-            ADMIN_MANAGER_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_manager_save)]
-        },
+        states={ADMIN_MANAGER_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_manager_save)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
@@ -1457,6 +2144,7 @@ def main():
             ADMIN_ADD_ITEM_CATEGORY_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_item_category)],
             ADMIN_ADD_ITEM_NAME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_item_name)],
             ADMIN_ADD_ITEM_DESC_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_item_desc)],
+            ADMIN_ADD_ITEM_PRICE_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_item_price)],
             ADMIN_ADD_ITEM_IMAGE_WAITING: [MessageHandler(filters.PHOTO, admin_add_item_image)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -1492,6 +2180,16 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    edit_price_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^💰 Изменить цену$"), admin_edit_price_start)],
+        states={
+            ADMIN_EDIT_PRICE_CATEGORY_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_price_category)],
+            ADMIN_EDIT_PRICE_SELECT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_price_select)],
+            ADMIN_EDIT_PRICE_NEW_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_price_new)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     delete_item_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🗑 Удалить кнопку$"), admin_delete_item_start)],
         states={
@@ -1510,7 +2208,34 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    app.add_handler(order_conv)
+    add_pickup_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^➕ Добавить точку$"), admin_add_pickup_start)],
+        states={ADMIN_ADD_PICKUP_NAME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_pickup_name)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    rename_pickup_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^✏️ Переименовать точку$"), admin_rename_pickup_start)],
+        states={
+            ADMIN_RENAME_PICKUP_SELECT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_rename_pickup_select)],
+            ADMIN_RENAME_PICKUP_NEW_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_rename_pickup_new)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    delete_pickup_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🗑 Удалить точку$"), admin_delete_pickup_start)],
+        states={ADMIN_DELETE_PICKUP_SELECT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_delete_pickup_select)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    reorder_pickup_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^↕️ Порядок точек$"), admin_reorder_pickup_start)],
+        states={ADMIN_REORDER_PICKUP_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_reorder_pickup_save)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    app.add_handler(checkout_conv)
     app.add_handler(broadcast_conv)
     app.add_handler(baraholki_conv)
     app.add_handler(projects_conv)
@@ -1520,8 +2245,13 @@ def main():
     app.add_handler(rename_item_conv)
     app.add_handler(edit_desc_conv)
     app.add_handler(edit_image_conv)
+    app.add_handler(edit_price_conv)
     app.add_handler(delete_item_conv)
     app.add_handler(reorder_item_conv)
+    app.add_handler(add_pickup_conv)
+    app.add_handler(rename_pickup_conv)
+    app.add_handler(delete_pickup_conv)
+    app.add_handler(reorder_pickup_conv)
 
     print("RNDM SHOP bot запущен...")
     app.run_polling(
