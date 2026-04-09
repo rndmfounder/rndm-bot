@@ -19,7 +19,6 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("Не найдена переменная окружения BOT_TOKEN")
 
-# ВСТАВЬ СВОЙ TELEGRAM USER ID
 ADMIN_IDS = {
     8463296102,
 }
@@ -31,67 +30,80 @@ DEFAULT_PROJECTS_URL = "https://t.me/your_channel/2"
 DEFAULT_GIVEAWAYS_URL = "https://t.me/your_channel/3"
 DEFAULT_MANAGER_URL = "https://t.me/your_manager"
 
-CATEGORY_LABELS = {
-    "devices": "⚡ УСТРОЙСТВА",
-    "liquids": "💧 ЖИДКОСТИ",
-    "disposables": "🔥 ОДНОРАЗКИ",
-    "plates": "🧊 ШАЙБЫ/ПЛАСТИНКИ",
-    "supplies": "🛠 РАСХОДНИКИ",
-    "sale": "💸 СЛИВ/СКИДКИ",
-}
-
-DEFAULT_CATEGORY_TEXTS = {
-    "devices": """⚡ *УСТРОЙСТВА*
+DEFAULT_CATEGORIES = [
+    {
+        "category_key": "devices",
+        "label": "⚡ УСТРОЙСТВА",
+        "text": """⚡ *УСТРОЙСТВА*
 
 • XROS
 • AEGIS
 • PASITO
 
 Чтобы уточнить наличие и цены — жми кнопку ниже.""",
-
-    "liquids": """💧 *ЖИДКОСТИ*
+        "image": "https://via.placeholder.com/1200x800.png?text=USTROYSTVA",
+        "sort_order": 1,
+    },
+    {
+        "category_key": "liquids",
+        "label": "💧 ЖИДКОСТИ",
+        "text": """💧 *ЖИДКОСТИ*
 
 • DUALL
 • TRAVA
 • SKALA
 
 Чтобы уточнить наличие и цены — жми кнопку ниже.""",
-
-    "disposables": """🔥 *ОДНОРАЗКИ*
+        "image": "https://via.placeholder.com/1200x800.png?text=ZHIDKOSTI",
+        "sort_order": 2,
+    },
+    {
+        "category_key": "disposables",
+        "label": "🔥 ОДНОРАЗКИ",
+        "text": """🔥 *ОДНОРАЗКИ*
 
 • VOZOL
 • WAKA
 • NANCY
 
 Чтобы уточнить наличие и цены — жми кнопку ниже.""",
-
-    "plates": """🧊 *ШАЙБЫ/ПЛАСТИНКИ*
+        "image": "https://via.placeholder.com/1200x800.png?text=ODNORAZKI",
+        "sort_order": 3,
+    },
+    {
+        "category_key": "plates",
+        "label": "🧊 ШАЙБЫ/ПЛАСТИНКИ",
+        "text": """🧊 *ШАЙБЫ/ПЛАСТИНКИ*
 
 Добавь сюда актуальные позиции.
 
 Чтобы уточнить наличие и цены — жми кнопку ниже.""",
-
-    "supplies": """🛠 *РАСХОДНИКИ*
+        "image": "https://via.placeholder.com/1200x800.png?text=PLATES",
+        "sort_order": 4,
+    },
+    {
+        "category_key": "supplies",
+        "label": "🛠 РАСХОДНИКИ",
+        "text": """🛠 *РАСХОДНИКИ*
 
 Добавь сюда актуальные позиции.
 
 Чтобы уточнить наличие и цены — жми кнопку ниже.""",
-
-    "sale": """💸 *СЛИВ/СКИДКИ*
+        "image": "https://via.placeholder.com/1200x800.png?text=RASHODNIKI",
+        "sort_order": 5,
+    },
+    {
+        "category_key": "sale",
+        "label": "💸 СЛИВ/СКИДКИ",
+        "text": """💸 *СЛИВ/СКИДКИ*
 
 Добавь сюда товары со скидками и сливом.
 
 Чтобы уточнить наличие и цены — жми кнопку ниже.""",
-}
-
-DEFAULT_CATEGORY_IMAGES = {
-    "devices": "https://via.placeholder.com/1200x800.png?text=USTROYSTVA",
-    "liquids": "https://via.placeholder.com/1200x800.png?text=ZHIDKOSTI",
-    "disposables": "https://via.placeholder.com/1200x800.png?text=ODNORAZKI",
-    "plates": "https://via.placeholder.com/1200x800.png?text=PLATES",
-    "supplies": "https://via.placeholder.com/1200x800.png?text=RASHODNIKI",
-    "sale": "https://via.placeholder.com/1200x800.png?text=SALE",
-}
+        "image": "https://via.placeholder.com/1200x800.png?text=SALE",
+        "sort_order": 6,
+    },
+]
 
 (
     ADMIN_BROADCAST_WAITING,
@@ -101,7 +113,13 @@ DEFAULT_CATEGORY_IMAGES = {
     ADMIN_MANAGER_WAITING,
     ADMIN_CATEGORY_TEXT_WAITING,
     ADMIN_CATEGORY_IMAGE_WAITING,
-) = range(7)
+    ADMIN_NEW_CATEGORY_NAME_WAITING,
+    ADMIN_NEW_CATEGORY_TEXT_WAITING,
+    ADMIN_NEW_CATEGORY_IMAGE_WAITING,
+    ADMIN_DELETE_CATEGORY_WAITING,
+    ADMIN_RENAME_CATEGORY_WAITING,
+    ADMIN_REORDER_CATEGORY_WAITING,
+) = range(13)
 
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
@@ -140,6 +158,18 @@ cursor.execute(
     """
 )
 
+cursor.execute(
+    """
+    CREATE TABLE IF NOT EXISTS categories (
+        category_key TEXT PRIMARY KEY,
+        label TEXT NOT NULL,
+        text TEXT NOT NULL,
+        image TEXT NOT NULL,
+        sort_order INTEGER NOT NULL
+    )
+    """
+)
+
 conn.commit()
 
 
@@ -163,11 +193,26 @@ for key, value in {
     if not get_setting(key):
         set_setting(key, value)
 
-for category_key in CATEGORY_LABELS:
-    if not get_setting(f"category_text_{category_key}"):
-        set_setting(f"category_text_{category_key}", DEFAULT_CATEGORY_TEXTS[category_key])
-    if not get_setting(f"category_image_{category_key}"):
-        set_setting(f"category_image_{category_key}", DEFAULT_CATEGORY_IMAGES[category_key])
+
+cursor.execute("SELECT COUNT(*) FROM categories")
+categories_count = cursor.fetchone()[0]
+
+if categories_count == 0:
+    for item in DEFAULT_CATEGORIES:
+        cursor.execute(
+            """
+            INSERT INTO categories (category_key, label, text, image, sort_order)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                item["category_key"],
+                item["label"],
+                item["text"],
+                item["image"],
+                item["sort_order"],
+            ),
+        )
+    conn.commit()
 
 
 def now_iso() -> str:
@@ -228,6 +273,147 @@ def is_code_active(created_at: str) -> bool:
     return datetime.now() - created <= timedelta(hours=2)
 
 
+def slugify_category_name(name: str) -> str:
+    allowed = string.ascii_lowercase + string.digits + "_"
+    base = name.lower().strip().replace(" ", "_")
+    cleaned = "".join(ch for ch in base if ch in allowed)
+    if not cleaned:
+        cleaned = "category"
+    return cleaned
+
+
+def generate_unique_category_key(label: str) -> str:
+    base = slugify_category_name(label)
+    candidate = base
+    index = 1
+
+    while True:
+        cursor.execute("SELECT 1 FROM categories WHERE category_key = ?", (candidate,))
+        exists = cursor.fetchone()
+        if not exists:
+            return candidate
+        candidate = f"{base}_{index}"
+        index += 1
+
+
+def get_categories():
+    cursor.execute(
+        """
+        SELECT category_key, label, text, image, sort_order
+        FROM categories
+        ORDER BY sort_order ASC, label ASC
+        """
+    )
+    return cursor.fetchall()
+
+
+def get_category(category_key: str):
+    cursor.execute(
+        """
+        SELECT category_key, label, text, image, sort_order
+        FROM categories
+        WHERE category_key = ?
+        """,
+        (category_key,),
+    )
+    return cursor.fetchone()
+
+
+def get_next_category_order() -> int:
+    cursor.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM categories")
+    return cursor.fetchone()[0]
+
+
+def update_category_label(category_key: str, new_label: str) -> None:
+    cursor.execute(
+        "UPDATE categories SET label = ? WHERE category_key = ?",
+        (new_label, category_key),
+    )
+    conn.commit()
+
+
+def update_category_text(category_key: str, new_text: str) -> None:
+    cursor.execute(
+        "UPDATE categories SET text = ? WHERE category_key = ?",
+        (new_text, category_key),
+    )
+    conn.commit()
+
+
+def update_category_image(category_key: str, new_image: str) -> None:
+    cursor.execute(
+        "UPDATE categories SET image = ? WHERE category_key = ?",
+        (new_image, category_key),
+    )
+    conn.commit()
+
+
+def add_category(label: str, text: str, image: str) -> str:
+    category_key = generate_unique_category_key(label)
+    sort_order = get_next_category_order()
+
+    cursor.execute(
+        """
+        INSERT INTO categories (category_key, label, text, image, sort_order)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (category_key, label, text, image, sort_order),
+    )
+    conn.commit()
+    return category_key
+
+
+def delete_category(category_key: str) -> None:
+    cursor.execute("DELETE FROM categories WHERE category_key = ?", (category_key,))
+    conn.commit()
+
+
+def move_category(category_key: str, direction: str) -> bool:
+    current = get_category(category_key)
+    if not current:
+        return False
+
+    _, _, _, _, current_order = current
+
+    if direction == "up":
+        cursor.execute(
+            """
+            SELECT category_key, sort_order FROM categories
+            WHERE sort_order < ?
+            ORDER BY sort_order DESC
+            LIMIT 1
+            """,
+            (current_order,),
+        )
+    else:
+        cursor.execute(
+            """
+            SELECT category_key, sort_order FROM categories
+            WHERE sort_order > ?
+            ORDER BY sort_order ASC
+            LIMIT 1
+            """,
+            (current_order,),
+        )
+
+    neighbor = cursor.fetchone()
+    if not neighbor:
+        return False
+
+    neighbor_key, neighbor_order = neighbor
+
+    cursor.execute(
+        "UPDATE categories SET sort_order = ? WHERE category_key = ?",
+        (neighbor_order, category_key),
+    )
+    cursor.execute(
+        "UPDATE categories SET sort_order = ? WHERE category_key = ?",
+        (current_order, neighbor_key),
+    )
+    conn.commit()
+    return True
+
+
 def manager_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("💬 Написать менеджеру", url=get_setting("manager_url", DEFAULT_MANAGER_URL))]]
@@ -235,16 +421,10 @@ def manager_keyboard() -> InlineKeyboardMarkup:
 
 
 def assortment_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("⚡ УСТРОЙСТВА", callback_data="category:devices")],
-            [InlineKeyboardButton("💧 ЖИДКОСТИ", callback_data="category:liquids")],
-            [InlineKeyboardButton("🔥 ОДНОРАЗКИ", callback_data="category:disposables")],
-            [InlineKeyboardButton("🧊 ШАЙБЫ/ПЛАСТИНКИ", callback_data="category:plates")],
-            [InlineKeyboardButton("🛠 РАСХОДНИКИ", callback_data="category:supplies")],
-            [InlineKeyboardButton("💸 СЛИВ/СКИДКИ", callback_data="category:sale")],
-        ]
-    )
+    rows = []
+    for category_key, label, text, image, sort_order in get_categories():
+        rows.append([InlineKeyboardButton(label, callback_data=f"category:{category_key}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def category_keyboard() -> InlineKeyboardMarkup:
@@ -282,6 +462,8 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
             ["📢 Рассылка", "🛒 Ссылка на барахолки"],
             ["🚀 Ссылка на проекты", "🎁 Ссылка на розыгрыши"],
             ["💬 Ссылка на менеджера", "📝 Категории ассортимента"],
+            ["➕ Добавить кнопку", "✏️ Переименовать кнопку"],
+            ["🗑 Удалить кнопку", "↕️ Порядок кнопок"],
             ["📊 Статистика"],
             ["⬅️ Назад"],
         ],
@@ -290,37 +472,15 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
 
 
 def admin_categories_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            ["⚡ Текст: Устройства", "💧 Текст: Жидкости"],
-            ["🔥 Текст: Одноразки", "🧊 Текст: Шайбы/Пластинки"],
-            ["🛠 Текст: Расходники", "💸 Текст: Слив/Скидки"],
-            ["🖼 Фото: Устройства", "🖼 Фото: Жидкости"],
-            ["🖼 Фото: Одноразки", "🖼 Фото: Шайбы/Пластинки"],
-            ["🖼 Фото: Расходники", "🖼 Фото: Слив/Скидки"],
-            ["⬅️ Назад"],
-        ],
-        resize_keyboard=True,
-    )
+    keyboard = []
 
+    categories = get_categories()
+    for category_key, label, text, image, sort_order in categories:
+        keyboard.append([f"📝 Текст: {label}"])
+        keyboard.append([f"🖼 Фото: {label}"])
 
-CATEGORY_TEXT_BUTTONS = {
-    "⚡ Текст: Устройства": "devices",
-    "💧 Текст: Жидкости": "liquids",
-    "🔥 Текст: Одноразки": "disposables",
-    "🧊 Текст: Шайбы/Пластинки": "plates",
-    "🛠 Текст: Расходники": "supplies",
-    "💸 Текст: Слив/Скидки": "sale",
-}
-
-CATEGORY_IMAGE_BUTTONS = {
-    "🖼 Фото: Устройства": "devices",
-    "🖼 Фото: Жидкости": "liquids",
-    "🖼 Фото: Одноразки": "disposables",
-    "🖼 Фото: Шайбы/Пластинки": "plates",
-    "🖼 Фото: Расходники": "supplies",
-    "🖼 Фото: Слив/Скидки": "sale",
-}
+    keyboard.append(["⬅️ Назад"])
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
 async def safe_send(update: Update, text: str, **kwargs):
@@ -354,8 +514,12 @@ async def assortment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_category(query, category_key: str):
-    image_value = get_setting(f"category_image_{category_key}", DEFAULT_CATEGORY_IMAGES[category_key])
-    text = get_setting(f"category_text_{category_key}", DEFAULT_CATEGORY_TEXTS[category_key])
+    category = get_category(category_key)
+    if not category:
+        await query.message.reply_text("❌ Категория не найдена.")
+        return
+
+    _, label, text, image_value, _ = category
 
     await query.message.reply_photo(
         photo=image_value,
@@ -384,8 +548,7 @@ async def assortment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if query.data and query.data.startswith("category:"):
         category_key = query.data.split(":", 1)[1]
-        if category_key in CATEGORY_LABELS:
-            await show_category(query, category_key)
+        await show_category(query, category_key)
 
 
 async def spin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -516,6 +679,8 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     codes_count = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM promocodes WHERE used = 1")
     used_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM categories")
+    category_count = cursor.fetchone()[0]
 
     await safe_send(
         update,
@@ -523,7 +688,8 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Пользователей: *{users_count}*
 Выдано промокодов: *{codes_count}*
-Использовано промокодов: *{used_count}*""",
+Использовано промокодов: *{used_count}*
+Категорий в ассортименте: *{category_count}*""",
         parse_mode="Markdown",
     )
 
@@ -554,7 +720,7 @@ async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYP
         f"""✅ Рассылка завершена.
 Отправлено: {sent}
 Ошибок: {failed}""",
-        reply_markup=admin_keyboard()
+        reply_markup=admin_keyboard(),
     )
     return ConversationHandler.END
 
@@ -615,13 +781,26 @@ async def admin_category_text_start(update: Update, context: ContextTypes.DEFAUL
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
 
-    button_text = update.message.text
-    category_key = CATEGORY_TEXT_BUTTONS.get(button_text)
-    if not category_key:
+    button_text = update.message.text.strip()
+    prefix = "📝 Текст: "
+    if not button_text.startswith(prefix):
         return ConversationHandler.END
 
+    category_label = button_text[len(prefix):].strip()
+
+    cursor.execute(
+        "SELECT category_key FROM categories WHERE label = ?",
+        (category_label,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        await safe_send(update, "❌ Категория не найдена.")
+        return ConversationHandler.END
+
+    category_key = row[0]
     context.user_data["edit_category_key"] = category_key
-    await safe_send(update, f"📝 Отправь новый текст для категории {CATEGORY_LABELS[category_key]}. /cancel для отмены")
+
+    await safe_send(update, f"📝 Отправь новый текст для категории {category_label}. /cancel для отмены")
     return ADMIN_CATEGORY_TEXT_WAITING
 
 
@@ -630,11 +809,17 @@ async def admin_category_text_save(update: Update, context: ContextTypes.DEFAULT
     if not category_key:
         return ConversationHandler.END
 
-    set_setting(f"category_text_{category_key}", update.message.text)
+    category = get_category(category_key)
+    if not category:
+        await safe_send(update, "❌ Категория не найдена.")
+        return ConversationHandler.END
+
+    update_category_text(category_key, update.message.text)
+
     await safe_send(
         update,
-        f"✅ Текст для категории {CATEGORY_LABELS[category_key]} обновлён.",
-        reply_markup=admin_categories_keyboard()
+        f"✅ Текст для категории {category[1]} обновлён.",
+        reply_markup=admin_categories_keyboard(),
     )
     return ConversationHandler.END
 
@@ -643,19 +828,37 @@ async def admin_category_image_start(update: Update, context: ContextTypes.DEFAU
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
 
-    button_text = update.message.text
-    category_key = CATEGORY_IMAGE_BUTTONS.get(button_text)
-    if not category_key:
+    button_text = update.message.text.strip()
+    prefix = "🖼 Фото: "
+    if not button_text.startswith(prefix):
         return ConversationHandler.END
 
+    category_label = button_text[len(prefix):].strip()
+
+    cursor.execute(
+        "SELECT category_key FROM categories WHERE label = ?",
+        (category_label,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        await safe_send(update, "❌ Категория не найдена.")
+        return ConversationHandler.END
+
+    category_key = row[0]
     context.user_data["edit_category_key"] = category_key
-    await safe_send(update, f"🖼 Отправь фото для категории {CATEGORY_LABELS[category_key]}. /cancel для отмены")
+
+    await safe_send(update, f"🖼 Отправь фото для категории {category_label}. /cancel для отмены")
     return ADMIN_CATEGORY_IMAGE_WAITING
 
 
 async def admin_category_image_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     category_key = context.user_data.get("edit_category_key")
     if not category_key:
+        return ConversationHandler.END
+
+    category = get_category(category_key)
+    if not category:
+        await safe_send(update, "❌ Категория не найдена.")
         return ConversationHandler.END
 
     if not update.message.photo:
@@ -665,13 +868,184 @@ async def admin_category_image_save(update: Update, context: ContextTypes.DEFAUL
     photo = update.message.photo[-1]
     file_id = photo.file_id
 
-    set_setting(f"category_image_{category_key}", file_id)
+    update_category_image(category_key, file_id)
 
     await safe_send(
         update,
-        f"✅ Фото для категории {CATEGORY_LABELS[category_key]} обновлено.",
-        reply_markup=admin_categories_keyboard()
+        f"✅ Фото для категории {category[1]} обновлено.",
+        reply_markup=admin_categories_keyboard(),
     )
+    return ConversationHandler.END
+
+
+async def admin_add_category_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    await safe_send(update, "➕ Отправь название новой кнопки. /cancel для отмены")
+    return ADMIN_NEW_CATEGORY_NAME_WAITING
+
+
+async def admin_add_category_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_category_label"] = update.message.text.strip()
+    await safe_send(update, "📝 Теперь отправь текст внутри новой категории.")
+    return ADMIN_NEW_CATEGORY_TEXT_WAITING
+
+
+async def admin_add_category_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_category_text"] = update.message.text
+    await safe_send(update, "🖼 Теперь отправь фото для новой категории.")
+    return ADMIN_NEW_CATEGORY_IMAGE_WAITING
+
+
+async def admin_add_category_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        await safe_send(update, "❌ Нужно отправить именно фото.")
+        return ADMIN_NEW_CATEGORY_IMAGE_WAITING
+
+    label = context.user_data.get("new_category_label")
+    text = context.user_data.get("new_category_text")
+
+    if not label or not text:
+        await safe_send(update, "❌ Данные новой категории потерялись.")
+        return ConversationHandler.END
+
+    photo = update.message.photo[-1]
+    file_id = photo.file_id
+
+    add_category(label=label, text=text, image=file_id)
+
+    context.user_data.pop("new_category_label", None)
+    context.user_data.pop("new_category_text", None)
+
+    await safe_send(
+        update,
+        f"✅ Новая кнопка *{label}* добавлена.",
+        parse_mode="Markdown",
+        reply_markup=admin_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+async def admin_delete_category_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    categories = get_categories()
+    if not categories:
+        await safe_send(update, "❌ Нет категорий для удаления.", reply_markup=admin_keyboard())
+        return ConversationHandler.END
+
+    text = "🗑 Отправь точное название кнопки, которую нужно удалить:\n\n"
+    text += "\n".join([f"• {label}" for _, label, _, _, _ in categories])
+
+    await safe_send(update, text)
+    return ADMIN_DELETE_CATEGORY_WAITING
+
+
+async def admin_delete_category_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    label = update.message.text.strip()
+
+    cursor.execute("SELECT category_key FROM categories WHERE label = ?", (label,))
+    row = cursor.fetchone()
+    if not row:
+        await safe_send(update, "❌ Категория не найдена.")
+        return ADMIN_DELETE_CATEGORY_WAITING
+
+    category_key = row[0]
+    delete_category(category_key)
+
+    await safe_send(update, f"✅ Кнопка *{label}* удалена.", parse_mode="Markdown", reply_markup=admin_keyboard())
+    return ConversationHandler.END
+
+
+async def admin_rename_category_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    categories = get_categories()
+    if not categories:
+        await safe_send(update, "❌ Нет категорий.", reply_markup=admin_keyboard())
+        return ConversationHandler.END
+
+    text = "✏️ Отправь сообщение в формате:\n\nСТАРОЕ НАЗВАНИЕ = НОВОЕ НАЗВАНИЕ\n\n"
+    text += "Доступные кнопки:\n"
+    text += "\n".join([f"• {label}" for _, label, _, _, _ in categories])
+
+    await safe_send(update, text)
+    return ADMIN_RENAME_CATEGORY_WAITING
+
+
+async def admin_rename_category_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+
+    if "=" not in raw:
+        await safe_send(update, "❌ Формат: СТАРОЕ НАЗВАНИЕ = НОВОЕ НАЗВАНИЕ")
+        return ADMIN_RENAME_CATEGORY_WAITING
+
+    old_label, new_label = [part.strip() for part in raw.split("=", 1)]
+
+    cursor.execute("SELECT category_key FROM categories WHERE label = ?", (old_label,))
+    row = cursor.fetchone()
+    if not row:
+        await safe_send(update, "❌ Старая категория не найдена.")
+        return ADMIN_RENAME_CATEGORY_WAITING
+
+    update_category_label(row[0], new_label)
+
+    await safe_send(
+        update,
+        f"✅ Кнопка *{old_label}* переименована в *{new_label}*.",
+        parse_mode="Markdown",
+        reply_markup=admin_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+async def admin_reorder_category_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    categories = get_categories()
+    if not categories:
+        await safe_send(update, "❌ Нет категорий.", reply_markup=admin_keyboard())
+        return ConversationHandler.END
+
+    text = "↕️ Отправь сообщение в формате:\n\nНАЗВАНИЕ КНОПКИ = up\nили\nНАЗВАНИЕ КНОПКИ = down\n\n"
+    text += "Текущий порядок:\n"
+    for _, label, _, _, order in categories:
+        text += f"{order}. {label}\n"
+
+    await safe_send(update, text)
+    return ADMIN_REORDER_CATEGORY_WAITING
+
+
+async def admin_reorder_category_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+
+    if "=" not in raw:
+        await safe_send(update, "❌ Формат: НАЗВАНИЕ КНОПКИ = up/down")
+        return ADMIN_REORDER_CATEGORY_WAITING
+
+    label, direction = [part.strip() for part in raw.split("=", 1)]
+    direction = direction.lower()
+
+    if direction not in {"up", "down"}:
+        await safe_send(update, "❌ Направление должно быть up или down.")
+        return ADMIN_REORDER_CATEGORY_WAITING
+
+    cursor.execute("SELECT category_key FROM categories WHERE label = ?", (label,))
+    row = cursor.fetchone()
+    if not row:
+        await safe_send(update, "❌ Категория не найдена.")
+        return ADMIN_REORDER_CATEGORY_WAITING
+
+    ok = move_category(row[0], direction)
+    if not ok:
+        await safe_send(update, "⚠️ Дальше двигать уже некуда.")
+        return ADMIN_REORDER_CATEGORY_WAITING
+
+    await safe_send(update, "✅ Порядок кнопок обновлён.", reply_markup=admin_keyboard())
     return ConversationHandler.END
 
 
@@ -820,14 +1194,7 @@ def main():
     )
 
     category_text_conv = ConversationHandler(
-        entry_points=[
-            MessageHandler(
-                filters.Regex(
-                    r"^(⚡ Текст: Устройства|💧 Текст: Жидкости|🔥 Текст: Одноразки|🧊 Текст: Шайбы/Пластинки|🛠 Текст: Расходники|💸 Текст: Слив/Скидки)$"
-                ),
-                admin_category_text_start
-            )
-        ],
+        entry_points=[MessageHandler(filters.Regex(r"^📝 Текст: "), admin_category_text_start)],
         states={
             ADMIN_CATEGORY_TEXT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_category_text_save)]
         },
@@ -835,16 +1202,43 @@ def main():
     )
 
     category_image_conv = ConversationHandler(
-        entry_points=[
-            MessageHandler(
-                filters.Regex(
-                    r"^(🖼 Фото: Устройства|🖼 Фото: Жидкости|🖼 Фото: Одноразки|🖼 Фото: Шайбы/Пластинки|🖼 Фото: Расходники|🖼 Фото: Слив/Скидки)$"
-                ),
-                admin_category_image_start
-            )
-        ],
+        entry_points=[MessageHandler(filters.Regex(r"^🖼 Фото: "), admin_category_image_start)],
         states={
             ADMIN_CATEGORY_IMAGE_WAITING: [MessageHandler(filters.PHOTO, admin_category_image_save)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    add_category_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^➕ Добавить кнопку$"), admin_add_category_start)],
+        states={
+            ADMIN_NEW_CATEGORY_NAME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_category_name)],
+            ADMIN_NEW_CATEGORY_TEXT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_category_text)],
+            ADMIN_NEW_CATEGORY_IMAGE_WAITING: [MessageHandler(filters.PHOTO, admin_add_category_image)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    delete_category_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🗑 Удалить кнопку$"), admin_delete_category_start)],
+        states={
+            ADMIN_DELETE_CATEGORY_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_delete_category_save)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    rename_category_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^✏️ Переименовать кнопку$"), admin_rename_category_start)],
+        states={
+            ADMIN_RENAME_CATEGORY_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_rename_category_save)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    reorder_category_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^↕️ Порядок кнопок$"), admin_reorder_category_start)],
+        states={
+            ADMIN_REORDER_CATEGORY_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_reorder_category_save)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
@@ -856,6 +1250,10 @@ def main():
     app.add_handler(manager_conv)
     app.add_handler(category_text_conv)
     app.add_handler(category_image_conv)
+    app.add_handler(add_category_conv)
+    app.add_handler(delete_category_conv)
+    app.add_handler(rename_category_conv)
+    app.add_handler(reorder_category_conv)
 
     print("RNDM SHOP bot запущен...")
     app.run_polling(
