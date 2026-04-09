@@ -1,4 +1,4 @@
-import os
+ import os
 import re
 import random
 import sqlite3
@@ -577,7 +577,11 @@ def main():
     app.add_handler(giveaways_conv)
 
     print("RNDM SHOP bot запущен...")
-    app.run_polling()
+    app.run_polling(
+    poll_interval=1,
+    timeout=10,
+    drop_pending_updates=True
+)
 
 
 if __name__ == "__main__":
