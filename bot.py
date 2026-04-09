@@ -4,12 +4,7 @@ import sqlite3
 import string
 from datetime import datetime, timedelta
 
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    Update,
-)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -24,6 +19,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("Не найдена переменная окружения BOT_TOKEN")
 
+# ВСТАВЬ СВОЙ TELEGRAM USER ID
 ADMIN_IDS = {
     8463296102,
 }
@@ -35,7 +31,7 @@ DEFAULT_PROJECTS_URL = "https://t.me/your_channel/2"
 DEFAULT_GIVEAWAYS_URL = "https://t.me/your_channel/3"
 DEFAULT_MANAGER_URL = "https://t.me/your_manager"
 
-CATEGORY_KEYS = {
+CATEGORY_LABELS = {
     "devices": "⚡ УСТРОЙСТВА",
     "liquids": "💧 ЖИДКОСТИ",
     "disposables": "🔥 ОДНОРАЗКИ",
@@ -45,27 +41,27 @@ CATEGORY_KEYS = {
 }
 
 DEFAULT_CATEGORY_TEXTS = {
-    "devices": "⚡ *УСТРОЙСТВА*\\n\\nДобавь сюда актуальные устройства, например:\\n• XROS\\n• AEGIS\\n• PASITO",
-    "liquids": "💧 *ЖИДКОСТИ*\\n\\nДобавь сюда актуальные жидкости, например:\\n• DUALL\\n• TRAVA\\n• SKALA",
-    "disposables": "🔥 *ОДНОРАЗКИ*\\n\\nДобавь сюда актуальные одноразки, например:\\n• VOZOL\\n• WAKA\\n• NANCY",
-    "plates": "🧊 *ШАЙБЫ/ПЛАСТИНКИ*\\n\\nДобавь сюда актуальные шайбы / пластинки.",
-    "supplies": "🛠 *РАСХОДНИКИ*\\n\\nДобавь сюда актуальные расходники.",
-    "sale": "💸 *СЛИВ / СКИДКИ*\\n\\nДобавь сюда позиции со сливом и скидками.",
+    "devices": "⚡ *УСТРОЙСТВА*\n\n• XROS\n• AEGIS\n• PASITO\n\nЧтобы уточнить наличие и цены — жми кнопку ниже.",
+    "liquids": "💧 *ЖИДКОСТИ*\n\n• DUALL\n• TRAVA\n• SKALA\n\nЧтобы уточнить наличие и цены — жми кнопку ниже.",
+    "disposables": "🔥 *ОДНОРАЗКИ*\n\n• VOZOL\n• WAKA\n• NANCY\n\nЧтобы уточнить наличие и цены — жми кнопку ниже.",
+    "plates": "🧊 *ШАЙБЫ/ПЛАСТИНКИ*\n\nДобавь сюда актуальные позиции.\n\nЧтобы уточнить наличие и цены — жми кнопку ниже.",
+    "supplies": "🛠 *РАСХОДНИКИ*\n\nДобавь сюда актуальные позиции.\n\nЧтобы уточнить наличие и цены — жми кнопку ниже.",
+    "sale": "💸 *СЛИВ/СКИДКИ*\n\nДобавь сюда товары со скидками и сливом.\n\nЧтобы уточнить наличие и цены — жми кнопку ниже.",
 }
 
 DEFAULT_CATEGORY_IMAGES = {
-    "devices": "https://via.placeholder.com/1200x800?text=USTROYSTVA",
-    "liquids": "https://via.placeholder.com/1200x800?text=ZHIDKOSTI",
-    "disposables": "https://via.placeholder.com/1200x800?text=ODNORAZKI",
-    "plates": "https://via.placeholder.com/1200x800?text=SHAYBY",
-    "supplies": "https://via.placeholder.com/1200x800?text=RASHODNIKI",
-    "sale": "https://via.placeholder.com/1200x800?text=SALE",
+    "devices": "https://via.placeholder.com/1200x800.png?text=USTROYSTVA",
+    "liquids": "https://via.placeholder.com/1200x800.png?text=ZHIDKOSTI",
+    "disposables": "https://via.placeholder.com/1200x800.png?text=ODNORAZKI",
+    "plates": "https://via.placeholder.com/1200x800.png?text=PLATES",
+    "supplies": "https://via.placeholder.com/1200x800.png?text=RASHODNIKI",
+    "sale": "https://via.placeholder.com/1200x800.png?text=SALE",
 }
 
 (
     ADMIN_BROADCAST_WAITING,
-    ADMIN_PROJECTS_WAITING,
     ADMIN_BARAHOLKI_WAITING,
+    ADMIN_PROJECTS_WAITING,
     ADMIN_GIVEAWAYS_WAITING,
     ADMIN_MANAGER_WAITING,
     ADMIN_CATEGORY_TEXT_WAITING,
@@ -73,6 +69,9 @@ DEFAULT_CATEGORY_IMAGES = {
 ) = range(7)
 
 
+# =========================
+# DB
+# =========================
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
 
@@ -125,6 +124,7 @@ def get_setting(key: str, default: str = "") -> str:
     return row[0] if row else default
 
 
+# Значения по умолчанию
 for key, value in {
     "baraholki_url": DEFAULT_BARAHOLKI_URL,
     "projects_url": DEFAULT_PROJECTS_URL,
@@ -134,14 +134,16 @@ for key, value in {
     if not get_setting(key):
         set_setting(key, value)
 
-for category_key, text in DEFAULT_CATEGORY_TEXTS.items():
+for category_key in CATEGORY_LABELS:
     if not get_setting(f"category_text_{category_key}"):
-        set_setting(f"category_text_{category_key}", text)
+        set_setting(f"category_text_{category_key}", DEFAULT_CATEGORY_TEXTS[category_key])
     if not get_setting(f"category_image_{category_key}"):
         set_setting(f"category_image_{category_key}", DEFAULT_CATEGORY_IMAGES[category_key])
 
 
-
+# =========================
+# Helpers
+# =========================
 def now_iso() -> str:
     return datetime.now().isoformat()
 
@@ -239,10 +241,10 @@ def category_keyboard() -> InlineKeyboardMarkup:
 
 
 
-def post_link_keyboard(text: str, url: str) -> InlineKeyboardMarkup:
+def post_link_keyboard(button_text: str, url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(text, url=url)],
+            [InlineKeyboardButton(button_text, url=url)],
             [InlineKeyboardButton("💬 Написать менеджеру", url=get_setting("manager_url", DEFAULT_MANAGER_URL))],
         ]
     )
@@ -314,17 +316,17 @@ async def safe_send(update: Update, text: str, **kwargs):
         await update.message.reply_text(text, **kwargs)
 
 
+# =========================
+# Public handlers
+# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     save_user(user)
     await safe_send(
         update,
-        "🔥 *Добро пожаловать в RNDM SHOP!*
-
-"
-        "Выбирай нужный раздел ниже 👇",
-        reply_markup=main_keyboard(user.id),
+        "🔥 *Добро пожаловать в RNDM SHOP!*\n\nВыбирай нужный раздел ниже 👇",
         parse_mode="Markdown",
+        reply_markup=main_keyboard(user.id),
     )
 
 
@@ -332,9 +334,7 @@ async def assortment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(update.effective_user)
     await safe_send(
         update,
-        "🛍 *АССОРТИМЕНТ RNDM SHOP*
-
-Выбирай категорию ниже 👇",
+        "🛍 *АССОРТИМЕНТ RNDM SHOP*\n\nВыбирай категорию ниже 👇",
         parse_mode="Markdown",
         reply_markup=assortment_menu_keyboard(),
     )
@@ -353,21 +353,21 @@ async def show_category(query, category_key: str):
 
 async def assortment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not query:
+        return
     await query.answer()
 
     if query.data == "assortment_menu":
         await query.message.reply_text(
-            "🛍 *АССОРТИМЕНТ RNDM SHOP*
-
-Выбирай категорию ниже 👇",
+            "🛍 *АССОРТИМЕНТ RNDM SHOP*\n\nВыбирай категорию ниже 👇",
             parse_mode="Markdown",
             reply_markup=assortment_menu_keyboard(),
         )
         return
 
-    if query.data.startswith("category:"):
+    if query.data and query.data.startswith("category:"):
         category_key = query.data.split(":", 1)[1]
-        if category_key in CATEGORY_KEYS:
+        if category_key in CATEGORY_LABELS:
             await show_category(query, category_key)
 
 
@@ -378,9 +378,7 @@ async def spin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not can_spin(user.id):
         await safe_send(
             update,
-            "⏳ *Ты уже крутил скидку за последние 24 часа.*
-
-Попробуй позже 😈",
+            "⏳ *Ты уже крутил скидку за последние 24 часа.*\n\nПопробуй позже 😈",
             parse_mode="Markdown",
         )
         return
@@ -402,12 +400,7 @@ async def spin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_send(update, "🎰 Крутим твою скидку...")
     await safe_send(
         update,
-        f"💥 *ТЕБЕ ВЫПАЛО: -{discount}%*
-
-"
-        f"Твой промокод: `{code}`
-"
-        f"⏳ Действует *2 часа*",
+        f"💥 *ТЕБЕ ВЫПАЛО: -{discount}%*\n\nТвой промокод: `{code}`\n⏳ Действует *2 часа*",
         parse_mode="Markdown",
         reply_markup=manager_keyboard(),
     )
@@ -417,9 +410,7 @@ async def baraholki(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(update.effective_user)
     await safe_send(
         update,
-        "🛒 *Наши барахолки*
-
-Жми кнопку ниже 👇",
+        "🛒 *Наши барахолки*\n\nЖми кнопку ниже 👇",
         parse_mode="Markdown",
         reply_markup=post_link_keyboard("🛒 Перейти в барахолки", get_setting("baraholki_url", DEFAULT_BARAHOLKI_URL)),
     )
@@ -429,9 +420,7 @@ async def projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(update.effective_user)
     await safe_send(
         update,
-        "🚀 *Наши проекты*
-
-Все ссылки — по кнопке ниже.",
+        "🚀 *Наши проекты*\n\nВсе ссылки — по кнопке ниже.",
         parse_mode="Markdown",
         reply_markup=post_link_keyboard("🚀 Открыть проекты", get_setting("projects_url", DEFAULT_PROJECTS_URL)),
     )
@@ -441,9 +430,7 @@ async def giveaways(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(update.effective_user)
     await safe_send(
         update,
-        "🎁 *Розыгрыши RNDM SHOP*
-
-Жми кнопку ниже.",
+        "🎁 *Розыгрыши RNDM SHOP*\n\nЖми кнопку ниже.",
         parse_mode="Markdown",
         reply_markup=post_link_keyboard("🎁 Смотреть розыгрыши", get_setting("giveaways_url", DEFAULT_GIVEAWAYS_URL)),
     )
@@ -453,23 +440,23 @@ async def manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(update.effective_user)
     await safe_send(
         update,
-        "💬 *Связь с менеджером*
-
-Пиши по кнопке ниже.",
+        "💬 *Связь с менеджером*\n\nПиши по кнопке ниже.",
         parse_mode="Markdown",
         reply_markup=manager_keyboard(),
     )
 
 
+# =========================
+# Admin handlers
+# =========================
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await safe_send(update, "⛔ У тебя нет доступа.")
         return
+
     await safe_send(
         update,
-        "⚙️ *Админка RNDM SHOP*
-
-Выбери действие ниже.",
+        "⚙️ *Админка RNDM SHOP*\n\nВыбери действие ниже.",
         parse_mode="Markdown",
         reply_markup=admin_keyboard(),
     )
@@ -478,12 +465,10 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_categories_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
+
     await safe_send(
         update,
-        "📝 *Настройка категорий ассортимента*
-
-"
-        "Можно отдельно менять текст и отдельно фото для каждой категории.",
+        "📝 *Настройка категорий ассортимента*\n\nМожно отдельно менять текст и отдельно фото для каждой категории.",
         parse_mode="Markdown",
         reply_markup=admin_categories_keyboard(),
     )
@@ -503,11 +488,7 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await safe_send(
         update,
-        f"📊 *Статистика*
-
-Пользователей: *{users_count}*
-Выдано промокодов: *{codes_count}*
-Использовано промокодов: *{used_count}*",
+        f"📊 *Статистика*\n\nПользователей: *{users_count}*\nВыдано промокодов: *{codes_count}*\nИспользовано промокодов: *{used_count}*",
         parse_mode="Markdown",
     )
 
@@ -533,20 +514,7 @@ async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception:
             failed += 1
 
-    await safe_send(update, f"✅ Рассылка завершена.
-Отправлено: {sent}
-Ошибок: {failed}", reply_markup=admin_keyboard())
-    return ConversationHandler.END
-
-
-async def admin_projects_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_send(update, "🚀 Отправь новую ссылку на проекты. /cancel для отмены")
-    return ADMIN_PROJECTS_WAITING
-
-
-async def admin_projects_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    set_setting("projects_url", update.message.text.strip())
-    await safe_send(update, "✅ Ссылка на проекты обновлена.", reply_markup=admin_keyboard())
+    await safe_send(update, f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}", reply_markup=admin_keyboard())
     return ConversationHandler.END
 
 
@@ -558,6 +526,17 @@ async def admin_baraholki_start(update: Update, context: ContextTypes.DEFAULT_TY
 async def admin_baraholki_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_setting("baraholki_url", update.message.text.strip())
     await safe_send(update, "✅ Ссылка на барахолки обновлена.", reply_markup=admin_keyboard())
+    return ConversationHandler.END
+
+
+async def admin_projects_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_send(update, "🚀 Отправь новую ссылку на проекты. /cancel для отмены")
+    return ADMIN_PROJECTS_WAITING
+
+
+async def admin_projects_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    set_setting("projects_url", update.message.text.strip())
+    await safe_send(update, "✅ Ссылка на проекты обновлена.", reply_markup=admin_keyboard())
     return ConversationHandler.END
 
 
@@ -589,8 +568,7 @@ async def admin_category_text_start(update: Update, context: ContextTypes.DEFAUL
     if not category_key:
         return ConversationHandler.END
     context.user_data["edit_category_key"] = category_key
-    context.user_data["edit_category_mode"] = "text"
-    await safe_send(update, f"📝 Отправь новый текст для категории {CATEGORY_KEYS[category_key]}. /cancel для отмены")
+    await safe_send(update, f"📝 Отправь новый текст для категории {CATEGORY_LABELS[category_key]}. /cancel для отмены")
     return ADMIN_CATEGORY_TEXT_WAITING
 
 
@@ -599,7 +577,7 @@ async def admin_category_text_save(update: Update, context: ContextTypes.DEFAULT
     if not category_key:
         return ConversationHandler.END
     set_setting(f"category_text_{category_key}", update.message.text)
-    await safe_send(update, f"✅ Текст для категории {CATEGORY_KEYS[category_key]} обновлён.", reply_markup=admin_categories_keyboard())
+    await safe_send(update, f"✅ Текст для категории {CATEGORY_LABELS[category_key]} обновлён.", reply_markup=admin_categories_keyboard())
     return ConversationHandler.END
 
 
@@ -609,8 +587,7 @@ async def admin_category_image_start(update: Update, context: ContextTypes.DEFAU
     if not category_key:
         return ConversationHandler.END
     context.user_data["edit_category_key"] = category_key
-    context.user_data["edit_category_mode"] = "image"
-    await safe_send(update, f"🖼 Отправь новую ссылку на фото для категории {CATEGORY_KEYS[category_key]}. /cancel для отмены")
+    await safe_send(update, f"🖼 Отправь новую ссылку на фото для категории {CATEGORY_LABELS[category_key]}. /cancel для отмены")
     return ADMIN_CATEGORY_IMAGE_WAITING
 
 
@@ -619,7 +596,7 @@ async def admin_category_image_save(update: Update, context: ContextTypes.DEFAUL
     if not category_key:
         return ConversationHandler.END
     set_setting(f"category_image_{category_key}", update.message.text.strip())
-    await safe_send(update, f"✅ Фото для категории {CATEGORY_KEYS[category_key]} обновлено.", reply_markup=admin_categories_keyboard())
+    await safe_send(update, f"✅ Фото для категории {CATEGORY_LABELS[category_key]} обновлено.", reply_markup=admin_categories_keyboard())
     return ConversationHandler.END
 
 
@@ -649,19 +626,13 @@ async def check_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     _, discount, used, created_at, used_at, owner_user_id = row
     if used:
-        await safe_send(update, f"⚠️ Промокод уже использован
-Скидка: -{discount}%
-Когда использован: {used_at}")
+        await safe_send(update, f"⚠️ Промокод уже использован\nСкидка: -{discount}%\nКогда использован: {used_at}")
         return
     if not is_code_active(created_at):
-        await safe_send(update, f"⌛ Промокод просрочен
-Скидка была: -{discount}%
-Создан: {created_at}")
+        await safe_send(update, f"⌛ Промокод просрочен\nСкидка была: -{discount}%\nСоздан: {created_at}")
         return
-    await safe_send(update, f"✅ Промокод активен
-Скидка: -{discount}%
-Создан: {created_at}
-Владелец user_id: {owner_user_id}")
+
+    await safe_send(update, f"✅ Промокод активен\nСкидка: -{discount}%\nСоздан: {created_at}\nВладелец user_id: {owner_user_id}")
 
 
 async def use_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -686,11 +657,12 @@ async def use_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cursor.execute("UPDATE promocodes SET used = 1, used_at = ? WHERE code = ?", (now_iso(), code))
     conn.commit()
-    await safe_send(update, f"✅ Промокод {code} активирован
-Скидка: -{discount}%")
+    await safe_send(update, f"✅ Промокод {code} активирован\nСкидка: -{discount}%")
 
 
-
+# =========================
+# Main
+# =========================
 def main():
     app = Application.builder().token(TOKEN).build()
 
@@ -706,8 +678,8 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^🎁 Розыгрыши$"), giveaways))
     app.add_handler(MessageHandler(filters.Regex(r"^💬 Менеджер$"), manager))
     app.add_handler(MessageHandler(filters.Regex(r"^⚙️ Админка$"), admin_panel))
-    app.add_handler(MessageHandler(filters.Regex(r"^📊 Статистика$"), admin_stats))
     app.add_handler(MessageHandler(filters.Regex(r"^📝 Категории ассортимента$"), admin_categories_menu))
+    app.add_handler(MessageHandler(filters.Regex(r"^📊 Статистика$"), admin_stats))
     app.add_handler(MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main))
 
     app.add_handler(CallbackQueryHandler(assortment_callback, pattern=r"^(category:|assortment_menu)"))
@@ -718,15 +690,15 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    projects_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^🚀 Ссылка на проекты$"), admin_projects_start)],
-        states={ADMIN_PROJECTS_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_projects_save)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
     baraholki_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🛒 Ссылка на барахолки$"), admin_baraholki_start)],
         states={ADMIN_BARAHOLKI_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_baraholki_save)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    projects_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🚀 Ссылка на проекты$"), admin_projects_start)],
+        states={ADMIN_PROJECTS_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_projects_save)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
@@ -755,8 +727,8 @@ def main():
     )
 
     app.add_handler(broadcast_conv)
-    app.add_handler(projects_conv)
     app.add_handler(baraholki_conv)
+    app.add_handler(projects_conv)
     app.add_handler(giveaways_conv)
     app.add_handler(manager_conv)
     app.add_handler(category_text_conv)
