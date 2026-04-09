@@ -150,7 +150,7 @@ DEFAULT_PICKUP_POINTS = [
     ORDER_PICKUP_PHONE_WAITING,
     ORDER_PICKUP_TIME_WAITING,
     ORDER_PICKUP_USERNAME_WAITING,
-) = range(41)
+) = range(40)
 
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
