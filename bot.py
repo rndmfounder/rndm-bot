@@ -1713,7 +1713,7 @@ async def admin_info_blocks_save_photo(update: Update, context: ContextTypes.DEF
     if not block_key:
         return ConversationHandler.END
 
-    if not update.message.photo:
+    if not update.message or not update.message.photo:
         await safe_send(update, "❌ Нужно отправить именно фото.")
         return ADMIN_INFO_BLOCK_PHOTO_WAITING
 
@@ -2670,6 +2670,7 @@ def main():
     )
 
     app.add_handler(checkout_conv)
+    app.add_handler(info_blocks_conv)
     app.add_handler(broadcast_conv)
     app.add_handler(baraholki_conv)
     app.add_handler(projects_conv)
@@ -2683,7 +2684,6 @@ def main():
     app.add_handler(edit_price_conv)
     app.add_handler(delete_item_conv)
     app.add_handler(reorder_item_conv)
-    app.add_handler(info_blocks_conv)
     app.add_handler(add_pickup_conv)
     app.add_handler(rename_pickup_conv)
     app.add_handler(delete_pickup_conv)
