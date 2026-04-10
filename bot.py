@@ -329,6 +329,20 @@ INFO_BLOCK_DEFAULTS = {
 }
 
 
+INFO_BLOCK_URL_SETTINGS = {
+    "vk": "vk_url",
+    "baraholki": "baraholki_url",
+    "projects": "projects_url",
+    "giveaways": "giveaways_url",
+}
+
+INFO_BLOCK_BUTTON_LABELS = {
+    "vk": "📱 Открыть VK",
+    "baraholki": "🛒 Перейти в барахолки",
+    "projects": "🚀 Открыть проекты",
+    "giveaways": "🎁 Смотреть розыгрыши",
+}
+
 def get_info_block_text(block_key: str) -> str:
     return get_setting(f"info_text:{block_key}", INFO_BLOCK_DEFAULTS.get(block_key, "ℹ️ Информация скоро появится."))
 
@@ -368,20 +382,37 @@ def info_block_action_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def get_info_block_url(block_key: str) -> str:
+    setting_key = INFO_BLOCK_URL_SETTINGS.get(block_key)
+    if not setting_key:
+        return ""
+    return get_setting(setting_key, "")
+
+
+def get_info_block_reply_markup(block_key: str):
+    url = get_info_block_url(block_key)
+    if not url:
+        return None
+
+    button_label = INFO_BLOCK_BUTTON_LABELS.get(block_key, "🔗 Открыть")
+    return InlineKeyboardMarkup([[InlineKeyboardButton(button_label, url=url)]])
+
+
 async def show_info_block_message(target_message, block_key: str):
     title = INFO_BLOCK_LABELS.get(block_key, "ℹ️ Информация")
     text_value = get_info_block_text(block_key)
     photo = get_info_block_photo(block_key)
     caption = text_value or title
+    reply_markup = get_info_block_reply_markup(block_key)
 
     if photo:
         try:
-            await target_message.reply_photo(photo=photo, caption=caption)
+            await target_message.reply_photo(photo=photo, caption=caption, reply_markup=reply_markup)
             return
         except Exception:
             logger.exception("Ошибка при открытии инфо-блока %s", block_key)
 
-    await target_message.reply_text(caption)
+    await target_message.reply_text(caption, reply_markup=reply_markup)
 
 
 for key, value in {
@@ -1589,40 +1620,26 @@ async def spin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def baraholki(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def open_info_block(update: Update, block_key: str):
     save_user(update.effective_user)
-    await safe_send(
-        update,
-        "🛒 *Наши барахолки*\n\nЖми кнопку ниже 👇",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🛒 Перейти в барахолки", url=get_setting("baraholki_url", DEFAULT_BARAHOLKI_URL))]]
-        ),
-    )
+    if update.message:
+        await show_info_block_message(update.message, block_key)
+
+
+async def vk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await open_info_block(update, "vk")
+
+
+async def baraholki(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await open_info_block(update, "baraholki")
 
 
 async def projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_user(update.effective_user)
-    await safe_send(
-        update,
-        "🚀 *Наши проекты*\n\nВсе ссылки — по кнопке ниже.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🚀 Открыть проекты", url=get_setting("projects_url", DEFAULT_PROJECTS_URL))]]
-        ),
-    )
+    await open_info_block(update, "projects")
 
 
 async def giveaways(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_user(update.effective_user)
-    await safe_send(
-        update,
-        "🎁 *Розыгрыши RNDM SHOP*\n\nЖми кнопку ниже.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🎁 Смотреть розыгрыши", url=get_setting("giveaways_url", DEFAULT_GIVEAWAYS_URL))]]
-        ),
-    )
+    await open_info_block(update, "giveaways")
 
 
 async def manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2468,6 +2485,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^📦 История заказов$"), show_order_history))
     app.add_handler(MessageHandler(filters.Regex(r"^🎰 Крутить скидку$"), spin))
     app.add_handler(MessageHandler(filters.Regex(r"^💬 Менеджер$"), manager))
+    app.add_handler(MessageHandler(filters.Regex(r"^📱 Наш VK$"), vk))
     app.add_handler(MessageHandler(filters.Regex(r"^🛒 Наши барахолки$"), baraholki))
     app.add_handler(MessageHandler(filters.Regex(r"^🚀 Наши проекты$"), projects))
     app.add_handler(MessageHandler(filters.Regex(r"^🎁 Розыгрыши$"), giveaways))
