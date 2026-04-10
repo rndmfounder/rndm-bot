@@ -143,6 +143,9 @@ ADMIN_RENAME_PICKUP_NEW_WAITING = next(_state)
 ADMIN_DELETE_PICKUP_SELECT_WAITING = next(_state)
 ADMIN_REORDER_PICKUP_WAITING = next(_state)
 
+ADMIN_SET_CATEGORY_PHOTO_CATEGORY_WAITING = next(_state)
+ADMIN_SET_CATEGORY_PHOTO_IMAGE_WAITING = next(_state)
+
 ORDER_CHOICE_WAITING = next(_state)
 ORDER_DELIVERY_PHONE_WAITING = next(_state)
 ORDER_DELIVERY_USERNAME_WAITING = next(_state)
@@ -287,6 +290,23 @@ def get_setting(key: str, default: str = "") -> str:
     return row[0] if row else default
 
 
+def category_image_setting_key(category_key: str) -> str:
+    return f"category_image:{category_key}"
+
+
+def get_category_image(category_key: str) -> str:
+    return get_setting(category_image_setting_key(category_key), "")
+
+
+def set_category_image(category_key: str, file_id: str) -> None:
+    set_setting(category_image_setting_key(category_key), file_id)
+
+
+def clear_category_image(category_key: str) -> None:
+    cursor.execute("DELETE FROM settings WHERE key = ?", (category_image_setting_key(category_key),))
+    conn.commit()
+
+
 for key, value in {
     "baraholki_url": DEFAULT_BARAHOLKI_URL,
     "projects_url": DEFAULT_PROJECTS_URL,
@@ -355,7 +375,7 @@ def can_spin(user_id: int) -> bool:
     if not row or not row[0]:
         return True
     last_spin = datetime.fromisoformat(row[0])
-    return datetime.now() - last_spin > timedelta(hours=24)
+    return datetime.now() - last_spin >= timedelta(hours=48)
 
 
 def generate_code() -> str:
@@ -363,17 +383,12 @@ def generate_code() -> str:
 
 
 def get_discount() -> int:
-    rand = random.randint(1, 100)
-    if rand <= 60:
-        return 10
-    if rand <= 90:
-        return 20
-    return 40
+    return 10 if random.random() < 0.05 else 5
 
 
 def is_code_active(created_at: str) -> bool:
     created = datetime.fromisoformat(created_at)
-    return datetime.now() - created <= timedelta(hours=2)
+    return datetime.now() - created <= timedelta(hours=12)
 
 
 def slugify_name(name: str) -> str:
@@ -736,9 +751,11 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
             ["➕ Добавить кнопку", "✏️ Переименовать кнопку"],
             ["📝 Изменить описание", "🖼 Изменить фото"],
             ["💰 Изменить цену", "🗑 Удалить кнопку"],
-            ["↕️ Порядок кнопок", "📍 Точки самовывоза"],
-            ["📢 Рассылка", "📊 Статистика"],
-            ["💬 Ссылка на менеджера", "🛒 Ссылка на барахолки"],
+            ["🖼 Фото категорий", "📍 Точки самовывоза"],
+            ["↕️ Порядок кнопок", "📊 Статистика"],
+            ["📢 Рассылка", "💬 Ссылка на менеджера"],
+            ["🛒 Ссылка на барахолки", "🚀 Ссылка на проекты"],
+            ["🎁 Ссылка на розыгрыши"],
             ["🚀 Ссылка на проекты", "🎁 Ссылка на розыгрыши"],
             ["⬅️ Назад"],
         ],
@@ -802,6 +819,31 @@ def order_type_keyboard() -> InlineKeyboardMarkup:
 def pickup_points_keyboard() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(name, callback_data=f"pickup_select:{pickup_id}")] for pickup_id, name, _ in get_pickup_points()]
     return InlineKeyboardMarkup(rows)
+
+
+async def open_category_view(target_message, category_key: str):
+    category_title = CATEGORY_LABELS.get(category_key, "КАТЕГОРИЯ")
+    caption = f"📂 *{category_title}*\n\nВыбирай позицию ниже 👇"
+    reply_markup = item_menu_keyboard(category_key)
+    category_image = get_category_image(category_key)
+
+    if category_image:
+        try:
+            await target_message.reply_photo(
+                photo=category_image,
+                caption=caption,
+                parse_mode="Markdown",
+                reply_markup=reply_markup,
+            )
+            return
+        except Exception:
+            logger.exception("Ошибка при открытии фото категории %s", category_key)
+
+    await target_message.reply_text(
+        caption,
+        parse_mode="Markdown",
+        reply_markup=reply_markup,
+    )
 
 
 async def safe_send(update: Update, text: str, **kwargs):
@@ -904,11 +946,7 @@ async def assortment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if query.data.startswith("category:"):
         category_key = query.data.split(":", 1)[1]
-        await query.message.reply_text(
-            f"📂 *{CATEGORY_LABELS.get(category_key, 'КАТЕГОРИЯ')}*\n\nВыбирай позицию ниже 👇",
-            parse_mode="Markdown",
-            reply_markup=item_menu_keyboard(category_key),
-        )
+        await open_category_view(query.message, category_key)
         return
 
     if query.data.startswith("item:"):
@@ -918,11 +956,7 @@ async def assortment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if query.data.startswith("open_category:"):
         category_key = query.data.split(":", 1)[1]
-        await query.message.reply_text(
-            f"📂 *{CATEGORY_LABELS.get(category_key, 'КАТЕГОРИЯ')}*\n\nВыбирай позицию ниже 👇",
-            parse_mode="Markdown",
-            reply_markup=item_menu_keyboard(category_key),
-        )
+        await open_category_view(query.message, category_key)
         return
 
     if query.data.startswith("add_to_cart:"):
@@ -1295,7 +1329,7 @@ async def spin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not can_spin(user.id):
         await safe_send(
             update,
-            "⏳ *Ты уже крутил скидку за последние 24 часа.*\n\nПопробуй позже 😈",
+            "⏳ *Ты уже крутил скидку за последние 48 часов.*\n\nПопробуй позже 😈",
             parse_mode="Markdown",
         )
         return
@@ -1317,7 +1351,7 @@ async def spin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_send(update, "🎰 Крутим твою скидку...")
     await safe_send(
         update,
-        f"💥 *ТЕБЕ ВЫПАЛО: -{discount}%*\n\nТвой промокод: `{code}`\n⏳ Действует *2 часа*",
+        f"💥 *ТЕБЕ ВЫПАЛО: -{discount}%*\n\nТвой промокод: `{code}`\n⏳ Действует *12 часов*",
         parse_mode="Markdown",
         reply_markup=manager_keyboard(),
     )
@@ -2004,6 +2038,53 @@ async def admin_reorder_pickup_save(update: Update, context: ContextTypes.DEFAUL
     return ConversationHandler.END
 
 
+async def admin_set_category_photo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    await safe_send(
+        update,
+        "🖼 Выбери категорию, для которой нужно установить фото.",
+        reply_markup=admin_category_choice_keyboard(),
+    )
+    return ADMIN_SET_CATEGORY_PHOTO_CATEGORY_WAITING
+
+
+async def admin_set_category_photo_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    category_key = parse_category_from_label(update.message.text.strip())
+    if not category_key:
+        await safe_send(update, "❌ Выбери категорию кнопкой ниже.", reply_markup=admin_category_choice_keyboard())
+        return ADMIN_SET_CATEGORY_PHOTO_CATEGORY_WAITING
+
+    context.user_data["category_photo_key"] = category_key
+    current_photo = get_category_image(category_key)
+    extra = "\nСейчас фото уже установлено — новое фото заменит старое." if current_photo else ""
+    await safe_send(update, f"🖼 Отправь фото для категории {CATEGORY_LABELS[category_key]}.{extra}")
+    return ADMIN_SET_CATEGORY_PHOTO_IMAGE_WAITING
+
+
+async def admin_set_category_photo_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    category_key = context.user_data.get("category_photo_key")
+    if not category_key:
+        await safe_send(update, "❌ Категория потерялась. Начни заново.", reply_markup=admin_keyboard())
+        return ConversationHandler.END
+
+    if not update.message.photo:
+        await safe_send(update, "❌ Нужно отправить именно фото.")
+        return ADMIN_SET_CATEGORY_PHOTO_IMAGE_WAITING
+
+    file_id = update.message.photo[-1].file_id
+    set_category_image(category_key, file_id)
+    context.user_data.pop("category_photo_key", None)
+
+    await safe_send(
+        update,
+        f"✅ Фото для категории {CATEGORY_LABELS[category_key]} обновлено.",
+        reply_markup=admin_keyboard(),
+    )
+    return ConversationHandler.END
+
+
 async def check_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await safe_send(update, "Использование: /check RNDM-XXXXXX")
@@ -2193,6 +2274,15 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    category_photo_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🖼 Фото категорий$"), admin_set_category_photo_start)],
+        states={
+            ADMIN_SET_CATEGORY_PHOTO_CATEGORY_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_set_category_photo_category)],
+            ADMIN_SET_CATEGORY_PHOTO_IMAGE_WAITING: [MessageHandler(filters.PHOTO, admin_set_category_photo_image)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     edit_price_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^💰 Изменить цену$"), admin_edit_price_start)],
         states={
@@ -2258,6 +2348,7 @@ def main():
     app.add_handler(rename_item_conv)
     app.add_handler(edit_desc_conv)
     app.add_handler(edit_image_conv)
+    app.add_handler(category_photo_conv)
     app.add_handler(edit_price_conv)
     app.add_handler(delete_item_conv)
     app.add_handler(reorder_item_conv)
