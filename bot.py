@@ -2465,7 +2465,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
     await safe_send(update, "⬅️ Возвращаю в главное меню.", reply_markup=main_keyboard(update.effective_user.id))
+    return ConversationHandler.END
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2480,19 +2482,9 @@ def main():
     app.add_handler(CommandHandler("use", use_code))
     app.add_handler(CommandHandler("cancel", cancel))
 
-    app.add_handler(MessageHandler(filters.Regex(r"^🛍 Ассортимент$"), assortment))
-    app.add_handler(MessageHandler(filters.Regex(r"^🛒 Корзина$"), show_cart))
-    app.add_handler(MessageHandler(filters.Regex(r"^📦 История заказов$"), show_order_history))
-    app.add_handler(MessageHandler(filters.Regex(r"^🎰 Крутить скидку$"), spin))
-    app.add_handler(MessageHandler(filters.Regex(r"^💬 Менеджер$"), manager))
-    app.add_handler(MessageHandler(filters.Regex(r"^📱 Наш VK$"), vk))
-    app.add_handler(MessageHandler(filters.Regex(r"^🛒 Наши барахолки$"), baraholki))
-    app.add_handler(MessageHandler(filters.Regex(r"^🚀 Наши проекты$"), projects))
-    app.add_handler(MessageHandler(filters.Regex(r"^🎁 Розыгрыши$"), giveaways))
-    app.add_handler(MessageHandler(filters.Regex(r"^⚙️ Админка$"), admin_panel))
-    app.add_handler(MessageHandler(filters.Regex(r"^📍 Точки самовывоза$"), admin_pickup_panel))
-    app.add_handler(MessageHandler(filters.Regex(r"^📊 Статистика$"), admin_stats))
-    app.add_handler(MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main))
+    # ВАЖНО: conversation handlers должны регистрироваться раньше обычных MessageHandler.
+    # Иначе кнопки внутри админских сценариев (например "📱 Наш VK" в инфо-блоках)
+    # будут перехватываться публичными обработчиками и редактирование не сработает.
 
     app.add_handler(
         CallbackQueryHandler(
@@ -2524,7 +2516,7 @@ def main():
             ORDER_PICKUP_TIME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_pickup_time)],
             ORDER_PICKUP_USERNAME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_pickup_username)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main)],
     )
 
     broadcast_conv = ConversationHandler(
@@ -2642,9 +2634,12 @@ def main():
             ADMIN_INFO_BLOCK_SELECT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_info_blocks_select)],
             ADMIN_INFO_BLOCK_ACTION_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_info_blocks_action)],
             ADMIN_INFO_BLOCK_TEXT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_info_blocks_save_text)],
-            ADMIN_INFO_BLOCK_PHOTO_WAITING: [MessageHandler(filters.PHOTO, admin_info_blocks_save_photo)],
+            ADMIN_INFO_BLOCK_PHOTO_WAITING: [
+                MessageHandler(filters.PHOTO, admin_info_blocks_save_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_info_blocks_save_photo),
+            ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main)],
     )
 
     add_pickup_conv = ConversationHandler(
@@ -2693,6 +2688,20 @@ def main():
     app.add_handler(rename_pickup_conv)
     app.add_handler(delete_pickup_conv)
     app.add_handler(reorder_pickup_conv)
+
+    app.add_handler(MessageHandler(filters.Regex(r"^🛍 Ассортимент$"), assortment))
+    app.add_handler(MessageHandler(filters.Regex(r"^🛒 Корзина$"), show_cart))
+    app.add_handler(MessageHandler(filters.Regex(r"^📦 История заказов$"), show_order_history))
+    app.add_handler(MessageHandler(filters.Regex(r"^🎰 Крутить скидку$"), spin))
+    app.add_handler(MessageHandler(filters.Regex(r"^💬 Менеджер$"), manager))
+    app.add_handler(MessageHandler(filters.Regex(r"^📱 Наш VK$"), vk))
+    app.add_handler(MessageHandler(filters.Regex(r"^🛒 Наши барахолки$"), baraholki))
+    app.add_handler(MessageHandler(filters.Regex(r"^🚀 Наши проекты$"), projects))
+    app.add_handler(MessageHandler(filters.Regex(r"^🎁 Розыгрыши$"), giveaways))
+    app.add_handler(MessageHandler(filters.Regex(r"^⚙️ Админка$"), admin_panel))
+    app.add_handler(MessageHandler(filters.Regex(r"^📍 Точки самовывоза$"), admin_pickup_panel))
+    app.add_handler(MessageHandler(filters.Regex(r"^📊 Статистика$"), admin_stats))
+    app.add_handler(MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main))
 
     app.add_error_handler(error_handler)
 
