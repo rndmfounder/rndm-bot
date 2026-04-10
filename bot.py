@@ -42,6 +42,7 @@ DB_PATH = "rndm.db"
 DEFAULT_BARAHOLKI_URL = "https://t.me/your_channel/1"
 DEFAULT_PROJECTS_URL = "https://t.me/your_channel/2"
 DEFAULT_GIVEAWAYS_URL = "https://t.me/your_channel/3"
+DEFAULT_VK_URL = "https://vk.ru/rndm196"
 
 CATEGORY_ORDER = [
     "devices",
@@ -146,6 +147,12 @@ ADMIN_REORDER_PICKUP_WAITING = next(_state)
 ADMIN_SET_CATEGORY_PHOTO_CATEGORY_WAITING = next(_state)
 ADMIN_SET_CATEGORY_PHOTO_IMAGE_WAITING = next(_state)
 
+ADMIN_INFO_BLOCK_SELECT_WAITING = next(_state)
+ADMIN_INFO_BLOCK_ACTION_WAITING = next(_state)
+ADMIN_INFO_BLOCK_TEXT_WAITING = next(_state)
+ADMIN_INFO_BLOCK_PHOTO_WAITING = next(_state)
+
+ORDER_PROMOCODE_WAITING = next(_state)
 ORDER_CHOICE_WAITING = next(_state)
 ORDER_DELIVERY_PHONE_WAITING = next(_state)
 ORDER_DELIVERY_USERNAME_WAITING = next(_state)
@@ -307,10 +314,81 @@ def clear_category_image(category_key: str) -> None:
     conn.commit()
 
 
+INFO_BLOCK_LABELS = {
+    "vk": "📱 Наш VK",
+    "baraholki": "🛒 Наши барахолки",
+    "projects": "🚀 Наши проекты",
+    "giveaways": "🎁 Розыгрыши",
+}
+
+INFO_BLOCK_DEFAULTS = {
+    "vk": "📱 Наш VK\n\nЗдесь ты можешь следить за нашими точками и новостями во VK.",
+    "baraholki": "🛒 Наши барахолки\n\nАктуальная информация по нашим барахолкам.",
+    "projects": "🚀 Наши проекты\n\nАктуальная информация по нашим проектам.",
+    "giveaways": "🎁 Розыгрыши\n\nАктуальная информация по нашим розыгрышам.",
+}
+
+
+def get_info_block_text(block_key: str) -> str:
+    return get_setting(f"info_text:{block_key}", INFO_BLOCK_DEFAULTS.get(block_key, "ℹ️ Информация скоро появится."))
+
+
+def set_info_block_text(block_key: str, value: str) -> None:
+    set_setting(f"info_text:{block_key}", value)
+
+
+def get_info_block_photo(block_key: str) -> str:
+    return get_setting(f"info_photo:{block_key}", "")
+
+
+def set_info_block_photo(block_key: str, file_id: str) -> None:
+    set_setting(f"info_photo:{block_key}", file_id)
+
+
+def parse_info_block_from_label(label: str):
+    for key, value in INFO_BLOCK_LABELS.items():
+        if value == label:
+            return key
+    return None
+
+
+def info_block_choice_keyboard() -> ReplyKeyboardMarkup:
+    keyboard = [[INFO_BLOCK_LABELS[key]] for key in ["vk", "baraholki", "projects", "giveaways"]]
+    keyboard.append(["⬅️ Назад"])
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+def info_block_action_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["📝 Изменить текст", "🖼 Изменить фото"],
+            ["⬅️ Назад"],
+        ],
+        resize_keyboard=True,
+    )
+
+
+async def show_info_block_message(target_message, block_key: str):
+    title = INFO_BLOCK_LABELS.get(block_key, "ℹ️ Информация")
+    text_value = get_info_block_text(block_key)
+    photo = get_info_block_photo(block_key)
+    caption = text_value or title
+
+    if photo:
+        try:
+            await target_message.reply_photo(photo=photo, caption=caption)
+            return
+        except Exception:
+            logger.exception("Ошибка при открытии инфо-блока %s", block_key)
+
+    await target_message.reply_text(caption)
+
+
 for key, value in {
     "baraholki_url": DEFAULT_BARAHOLKI_URL,
     "projects_url": DEFAULT_PROJECTS_URL,
     "giveaways_url": DEFAULT_GIVEAWAYS_URL,
+    "vk_url": DEFAULT_VK_URL,
     "manager_url": DEFAULT_MANAGER_URL,
 }.items():
     if not get_setting(key):
@@ -344,6 +422,10 @@ if cursor.fetchone()[0] == 0:
             (name, index),
         )
     conn.commit()
+
+for block_key, default_text in INFO_BLOCK_DEFAULTS.items():
+    if not get_setting(f"info_text:{block_key}"):
+        set_info_block_text(block_key, default_text)
 
 
 def save_user(user) -> None:
@@ -739,6 +821,7 @@ def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         ["📦 История заказов", "🎰 Крутить скидку"],
         ["🛒 Наши барахолки", "🚀 Наши проекты"],
         ["🎁 Розыгрыши", "💬 Менеджер"],
+        ["📱 Наш VK"],
     ]
     if is_admin(user_id):
         keyboard.append(["⚙️ Админка"])
@@ -751,16 +834,16 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
             ["➕ Добавить кнопку", "✏️ Переименовать кнопку"],
             ["📝 Изменить описание", "🖼 Изменить фото"],
             ["💰 Изменить цену", "🗑 Удалить кнопку"],
-            ["🖼 Фото категорий", "📍 Точки самовывоза"],
-            ["↕️ Порядок кнопок", "📊 Статистика"],
-            ["📢 Рассылка", "💬 Ссылка на менеджера"],
-            ["🛒 Ссылка на барахолки", "🚀 Ссылка на проекты"],
-            ["🎁 Ссылка на розыгрыши"],
+            ["🖼 Фото категорий", "🗂 Инфо-блоки"],
+            ["📍 Точки самовывоза", "↕️ Порядок кнопок"],
+            ["📢 Рассылка", "📊 Статистика"],
+            ["💬 Ссылка на менеджера", "🛒 Ссылка на барахолки"],
             ["🚀 Ссылка на проекты", "🎁 Ссылка на розыгрыши"],
             ["⬅️ Назад"],
         ],
         resize_keyboard=True,
     )
+
 
 
 def pickup_admin_keyboard() -> ReplyKeyboardMarkup:
@@ -975,6 +1058,11 @@ def clear_order_context(context: ContextTypes.DEFAULT_TYPE) -> None:
         "checkout_username",
         "checkout_address",
         "checkout_time",
+        "checkout_promocode",
+        "checkout_discount_percent",
+        "checkout_discount_amount",
+        "checkout_total_before_discount",
+        "checkout_total_after_discount",
     ]:
         context.user_data.pop(key, None)
 
@@ -1016,6 +1104,60 @@ def build_total_sum(items: list[dict]) -> int:
     return sum(item["price"] * item["quantity"] for item in items)
 
 
+def get_promocode(code: str):
+    cursor.execute(
+        """
+        SELECT code, discount, used, created_at, used_at, owner_user_id
+        FROM promocodes
+        WHERE code = ?
+        """,
+        (code.strip().upper(),),
+    )
+    return cursor.fetchone()
+
+
+def validate_promocode_for_user(code: str, user_id: int):
+    promo = get_promocode(code)
+    if not promo:
+        return False, "❌ Промокод не найден.", None
+
+    promo_code, discount, used, created_at, used_at, owner_user_id = promo
+
+    if owner_user_id and owner_user_id != user_id:
+        return False, "⛔ Этот промокод принадлежит другому пользователю.", None
+
+    if used:
+        return False, "⚠️ Этот промокод уже использован.", None
+
+    if not is_code_active(created_at):
+        return False, "⌛ Срок действия промокода истёк.", None
+
+    return True, "✅ Промокод применён.", discount
+
+
+def mark_promocode_used(code: str) -> None:
+    cursor.execute(
+        "UPDATE promocodes SET used = 1, used_at = ? WHERE code = ?",
+        (now_iso(), code.strip().upper()),
+    )
+    conn.commit()
+
+
+def apply_discount_to_total(total_sum: int, discount_percent: int) -> tuple[int, int]:
+    if total_sum <= 0 or discount_percent <= 0:
+        return total_sum, 0
+
+    discount_amount = int(round(total_sum * discount_percent / 100.0))
+    final_sum = max(total_sum - discount_amount, 0)
+    return final_sum, discount_amount
+
+
+def promocode_skip_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⏭ Пропустить", callback_data="skip_promocode")]]
+    )
+
+
 async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items: list[dict]) -> int:
     order_type = context.user_data.get("checkout_mode")
     pickup_point = context.user_data.get("checkout_pickup_point")
@@ -1023,9 +1165,12 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
     contact_username = context.user_data.get("checkout_username")
     address = context.user_data.get("checkout_address")
     delivery_time = context.user_data.get("checkout_time")
+    promocode = context.user_data.get("checkout_promocode")
+    discount_percent = context.user_data.get("checkout_discount_percent", 0)
 
     items_text = build_items_text(items)
     total_sum = build_total_sum(items)
+    final_sum, discount_amount = apply_discount_to_total(total_sum, discount_percent)
 
     cursor.execute(
         """
@@ -1046,7 +1191,7 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
             address,
             delivery_time,
             items_text,
-            total_sum,
+            final_sum,
             now_iso(),
         ),
     )
@@ -1055,6 +1200,7 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
 
     username_line = f"@{user.username}" if user.username else "нет username"
     total_line = format_price(total_sum) if total_sum > 0 else "цена уточняется"
+    final_line = format_price(final_sum) if final_sum > 0 else "цена уточняется"
 
     manager_text = (
         f"🆕 НОВЫЙ ЗАКАЗ #{order_id}\n\n"
@@ -1071,10 +1217,16 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
     else:
         manager_text += f"Точка самовывоза: {pickup_point}\n"
 
+    if promocode:
+        manager_text += f"Промокод: {promocode}\n"
+        manager_text += f"Скидка: -{discount_percent}%\n"
+        manager_text += f"Размер скидки: {discount_amount} ₽\n"
+
     manager_text += (
         f"Время: {delivery_time}\n\n"
         f"Товары:\n{items_text}\n\n"
-        f"Итого: {total_line}\n"
+        f"Сумма до скидки: {total_line}\n"
+        f"Итого к оплате: {final_line}\n"
         f"Время заказа: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
     )
 
@@ -1095,8 +1247,73 @@ async def begin_checkout(query, context: ContextTypes.DEFAULT_TYPE, buy_now_item
     total_sum = build_total_sum(items)
     total_line = format_price(total_sum) if total_sum > 0 else "цена уточняется"
 
+    context.user_data["checkout_promocode"] = None
+    context.user_data["checkout_discount_percent"] = 0
+    context.user_data["checkout_discount_amount"] = 0
+    context.user_data["checkout_total_before_discount"] = total_sum
+    context.user_data["checkout_total_after_discount"] = total_sum
+
     await query.message.reply_text(
-        f"🧾 ОФОРМЛЕНИЕ ЗАКАЗА\n\nТовары:\n{items_text}\n\nИтого: {total_line}\n\nВыбери тип заказа:",
+        f"🧾 ОФОРМЛЕНИЕ ЗАКАЗА\n\n"
+        f"Товары:\n{items_text}\n\n"
+        f"Итого без скидки: {total_line}\n\n"
+        f"Если у тебя есть промокод — отправь его сейчас сообщением.\n"
+        f"Если промокода нет, нажми кнопку ниже:",
+        reply_markup=promocode_skip_keyboard(),
+    )
+    return ORDER_PROMOCODE_WAITING
+
+
+async def checkout_promocode_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    code = update.message.text.strip().upper()
+
+    ok, message, discount = validate_promocode_for_user(code, user.id)
+    if not ok:
+        await safe_send(
+            update,
+            f"{message}\n\nОтправь другой промокод или нажми /cancel для отмены заказа."
+        )
+        return ORDER_PROMOCODE_WAITING
+
+    items = collect_checkout_items(user.id, context.user_data.get("checkout_buy_now_item_id"))
+    total_sum = build_total_sum(items)
+    final_sum, discount_amount = apply_discount_to_total(total_sum, discount)
+
+    context.user_data["checkout_promocode"] = code
+    context.user_data["checkout_discount_percent"] = discount
+    context.user_data["checkout_discount_amount"] = discount_amount
+    context.user_data["checkout_total_before_discount"] = total_sum
+    context.user_data["checkout_total_after_discount"] = final_sum
+
+    await safe_send(
+        update,
+        f"✅ Промокод применён: *{code}*\n"
+        f"Скидка: *-{discount}%*\n"
+        f"Размер скидки: *{discount_amount} ₽*\n"
+        f"Итого к оплате: *{final_sum} ₽*\n\n"
+        f"Теперь выбери тип заказа:",
+        parse_mode="Markdown",
+        reply_markup=order_type_keyboard(),
+    )
+    return ORDER_CHOICE_WAITING
+
+
+async def checkout_skip_promocode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["checkout_promocode"] = None
+    context.user_data["checkout_discount_percent"] = 0
+    context.user_data["checkout_discount_amount"] = 0
+
+    items = collect_checkout_items(query.from_user.id, context.user_data.get("checkout_buy_now_item_id"))
+    total_sum = build_total_sum(items)
+    context.user_data["checkout_total_before_discount"] = total_sum
+    context.user_data["checkout_total_after_discount"] = total_sum
+
+    await query.message.reply_text(
+        "Ок, продолжаем без промокода.\n\nВыбери тип заказа:",
         reply_markup=order_type_keyboard(),
     )
     return ORDER_CHOICE_WAITING
@@ -1177,6 +1394,10 @@ async def checkout_delivery_time(update: Update, context: ContextTypes.DEFAULT_T
         await safe_send(update, f"⚠️ Не удалось отправить заказ в группу.\nПроверь ORDER_GROUP_ID.\n\nОшибка: {e}")
         clear_order_context(context)
         return ConversationHandler.END
+
+    promocode = context.user_data.get("checkout_promocode")
+    if promocode:
+        mark_promocode_used(promocode)
 
     if not context.user_data.get("checkout_buy_now_item_id"):
         clear_cart(user.id)
@@ -1263,6 +1484,10 @@ async def checkout_pickup_username(update: Update, context: ContextTypes.DEFAULT
         await safe_send(update, f"⚠️ Не удалось отправить заказ в группу.\nПроверь ORDER_GROUP_ID.\n\nОшибка: {e}")
         clear_order_context(context)
         return ConversationHandler.END
+
+    promocode = context.user_data.get("checkout_promocode")
+    if promocode:
+        mark_promocode_used(promocode)
 
     if not context.user_data.get("checkout_buy_now_item_id"):
         clear_cart(user.id)
@@ -1351,7 +1576,14 @@ async def spin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_send(update, "🎰 Крутим твою скидку...")
     await safe_send(
         update,
-        f"💥 *ТЕБЕ ВЫПАЛО: -{discount}%*\n\nТвой промокод: `{code}`\n⏳ Действует *12 часов*",
+        f"💥 *ТЕБЕ ВЫПАЛО: -{discount}%*\n\n"
+        f"Твой промокод: `{code}`\n"
+        f"⏳ Действует *12 часов*\n\n"
+        f"*Как активировать:*\n"
+        f"1. Добавь товары в корзину.\n"
+        f"2. Нажми *Оформить заказ*.\n"
+        f"3. На шаге с промокодом отправь этот код сообщением: `{code}`\n"
+        f"4. Бот сам применит скидку к заказу.",
         parse_mode="Markdown",
         reply_markup=manager_keyboard(),
     )
@@ -1401,6 +1633,77 @@ async def manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=manager_keyboard(),
     )
+
+
+async def admin_info_blocks_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    context.user_data.pop("info_block_key", None)
+    await safe_send(
+        update,
+        "🗂 Выбери блок, который хочешь изменить.",
+        reply_markup=info_block_choice_keyboard(),
+    )
+    return ADMIN_INFO_BLOCK_SELECT_WAITING
+
+
+async def admin_info_blocks_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    block_key = parse_info_block_from_label(update.message.text.strip())
+    if not block_key:
+        await safe_send(update, "❌ Выбери блок кнопкой ниже.", reply_markup=info_block_choice_keyboard())
+        return ADMIN_INFO_BLOCK_SELECT_WAITING
+
+    context.user_data["info_block_key"] = block_key
+    await safe_send(
+        update,
+        f"Выбран блок: {INFO_BLOCK_LABELS[block_key]}\nЧто изменить?",
+        reply_markup=info_block_action_keyboard(),
+    )
+    return ADMIN_INFO_BLOCK_ACTION_WAITING
+
+
+async def admin_info_blocks_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    block_key = context.user_data.get("info_block_key")
+    if not block_key:
+        return ConversationHandler.END
+
+    text_value = update.message.text.strip()
+    if text_value == "📝 Изменить текст":
+        await safe_send(update, f"📝 Отправь новый текст для блока {INFO_BLOCK_LABELS[block_key]}.")
+        return ADMIN_INFO_BLOCK_TEXT_WAITING
+    if text_value == "🖼 Изменить фото":
+        await safe_send(update, f"🖼 Отправь новое фото для блока {INFO_BLOCK_LABELS[block_key]}.")
+        return ADMIN_INFO_BLOCK_PHOTO_WAITING
+
+    await safe_send(update, "❌ Выбери действие кнопкой ниже.", reply_markup=info_block_action_keyboard())
+    return ADMIN_INFO_BLOCK_ACTION_WAITING
+
+
+async def admin_info_blocks_save_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    block_key = context.user_data.get("info_block_key")
+    if not block_key:
+        return ConversationHandler.END
+
+    set_info_block_text(block_key, update.message.text)
+    context.user_data.pop("info_block_key", None)
+    await safe_send(update, "✅ Текст блока обновлён.", reply_markup=admin_keyboard())
+    return ConversationHandler.END
+
+
+async def admin_info_blocks_save_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    block_key = context.user_data.get("info_block_key")
+    if not block_key:
+        return ConversationHandler.END
+
+    if not update.message.photo:
+        await safe_send(update, "❌ Нужно отправить именно фото.")
+        return ADMIN_INFO_BLOCK_PHOTO_WAITING
+
+    set_info_block_photo(block_key, update.message.photo[-1].file_id)
+    context.user_data.pop("info_block_key", None)
+    await safe_send(update, "✅ Фото блока обновлено.", reply_markup=admin_keyboard())
+    return ConversationHandler.END
 
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2186,6 +2489,10 @@ def main():
             CallbackQueryHandler(start_checkout_buy_now, pattern=r"^buy_now:\d+$"),
         ],
         states={
+            ORDER_PROMOCODE_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_promocode_input),
+                CallbackQueryHandler(checkout_skip_promocode, pattern=r"^skip_promocode$"),
+            ],
             ORDER_CHOICE_WAITING: [
                 CallbackQueryHandler(checkout_choose_delivery, pattern=r"^checkout_delivery$"),
                 CallbackQueryHandler(checkout_choose_pickup, pattern=r"^checkout_pickup$"),
@@ -2311,6 +2618,17 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    info_blocks_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🗂 Инфо-блоки$"), admin_info_blocks_start)],
+        states={
+            ADMIN_INFO_BLOCK_SELECT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_info_blocks_select)],
+            ADMIN_INFO_BLOCK_ACTION_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_info_blocks_action)],
+            ADMIN_INFO_BLOCK_TEXT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_info_blocks_save_text)],
+            ADMIN_INFO_BLOCK_PHOTO_WAITING: [MessageHandler(filters.PHOTO, admin_info_blocks_save_photo)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     add_pickup_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^➕ Добавить точку$"), admin_add_pickup_start)],
         states={ADMIN_ADD_PICKUP_NAME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_pickup_name)]},
@@ -2352,6 +2670,7 @@ def main():
     app.add_handler(edit_price_conv)
     app.add_handler(delete_item_conv)
     app.add_handler(reorder_item_conv)
+    app.add_handler(info_blocks_conv)
     app.add_handler(add_pickup_conv)
     app.add_handler(rename_pickup_conv)
     app.add_handler(delete_pickup_conv)
