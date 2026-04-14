@@ -300,6 +300,48 @@ def ensure_column(table_name: str, column_name: str, column_def: str) -> None:
         conn.commit()
 
 
+def ensure_postgres_cart_items_primary_key() -> None:
+    """Без PRIMARY KEY (user_id, item_id) INSERT ... ON CONFLICT в PostgreSQL падает — корзина не сохраняется."""
+    if not USE_POSTGRES:
+        return
+    try:
+        cursor.execute(
+            """
+            SELECT 1
+            FROM information_schema.table_constraints
+            WHERE table_schema = 'public'
+              AND table_name = 'cart_items'
+              AND constraint_type = 'PRIMARY KEY'
+            """
+        )
+        if cursor.fetchone():
+            return
+        cursor.execute(
+            """
+            SELECT user_id, item_id, SUM(quantity) AS total_qty
+            FROM cart_items
+            GROUP BY user_id, item_id
+            HAVING COUNT(*) > 1
+            """
+        )
+        dup_rows = cursor.fetchall()
+        for row in dup_rows:
+            uid, iid, total_qty = int(row[0]), int(row[1]), int(row[2])
+            cursor.execute(
+                "DELETE FROM cart_items WHERE user_id = ? AND item_id = ?",
+                (uid, iid),
+            )
+            cursor.execute(
+                "INSERT INTO cart_items (user_id, item_id, quantity) VALUES (?, ?, ?)",
+                (uid, iid, total_qty),
+            )
+        cursor.execute("ALTER TABLE cart_items ADD PRIMARY KEY (user_id, item_id)")
+        conn.commit()
+        logger.info("cart_items: добавлен PRIMARY KEY (user_id, item_id)")
+    except Exception:
+        logger.exception("cart_items: не удалось восстановить PRIMARY KEY")
+
+
 def init_database() -> None:
     if USE_POSTGRES:
         statements = [
@@ -679,6 +721,7 @@ def init_database() -> None:
     ensure_column("orders", "status_updated_by", "INTEGER")
     ensure_column("broadcast_logs", "blocked", "INTEGER NOT NULL DEFAULT 0")
     ensure_column("broadcast_logs", "details", "TEXT")
+    ensure_postgres_cart_items_primary_key()
 
 
 init_database()
@@ -1466,14 +1509,28 @@ def move_pickup_point(pickup_id: int, direction: str) -> bool:
 
 
 def add_to_cart(user_id: int, item_id: int, quantity: int = 1) -> None:
+    # Без составного PK в PostgreSQL ON CONFLICT(...) падает; UPSERT через SELECT надёжнее для SQLite и PG.
     cursor.execute(
-        """
-        INSERT INTO cart_items (user_id, item_id, quantity)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id, item_id) DO UPDATE SET quantity = quantity + excluded.quantity
-        """,
-        (user_id, item_id, quantity),
+        "SELECT 1 FROM cart_items WHERE user_id = ? AND item_id = ?",
+        (user_id, item_id),
     )
+    if cursor.fetchone():
+        cursor.execute(
+            """
+            UPDATE cart_items
+            SET quantity = quantity + ?
+            WHERE user_id = ? AND item_id = ?
+            """,
+            (quantity, user_id, item_id),
+        )
+    else:
+        cursor.execute(
+            """
+            INSERT INTO cart_items (user_id, item_id, quantity)
+            VALUES (?, ?, ?)
+            """,
+            (user_id, item_id, quantity),
+        )
     conn.commit()
     log_action(user_id, "cart_add", f"item={item_id};qty={quantity}")
 
