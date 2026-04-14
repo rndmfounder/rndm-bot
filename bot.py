@@ -162,6 +162,8 @@ ADMIN_AUTOPOST_TEXT_WAITING = next(_state)
 ADMIN_AUTOPOST_PHOTO_WAITING = next(_state)
 ADMIN_AUTOPOST_BUTTON_WAITING = next(_state)
 ADMIN_AUTOPOST_INTERVAL_WAITING = next(_state)
+ADMIN_BLACKLIST_WAITING = next(_state)
+ADMIN_CATEGORY_DISCOUNT_WAITING = next(_state)
 
 ORDER_PROMOCODE_WAITING = next(_state)
 ORDER_CHOICE_WAITING = next(_state)
@@ -413,6 +415,42 @@ def init_database() -> None:
                 created_by BIGINT
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS blacklist (
+                user_id BIGINT PRIMARY KEY,
+                reason TEXT,
+                added_at TEXT NOT NULL,
+                added_by BIGINT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS customer_ratings (
+                rating_id BIGSERIAL PRIMARY KEY,
+                order_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                manager_id BIGINT NOT NULL,
+                rating INTEGER NOT NULL,
+                comment TEXT,
+                created_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS category_discounts (
+                category_key TEXT PRIMARY KEY,
+                discount_percent INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                updated_by BIGINT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS action_logs (
+                log_id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT,
+                action_type TEXT NOT NULL,
+                payload TEXT,
+                created_at TEXT NOT NULL
+            )
+            """,
         ]
     else:
         statements = [
@@ -560,6 +598,42 @@ def init_database() -> None:
                 created_by INTEGER
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS blacklist (
+                user_id INTEGER PRIMARY KEY,
+                reason TEXT,
+                added_at TEXT NOT NULL,
+                added_by INTEGER NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS customer_ratings (
+                rating_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                manager_id INTEGER NOT NULL,
+                rating INTEGER NOT NULL,
+                comment TEXT,
+                created_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS category_discounts (
+                category_key TEXT PRIMARY KEY,
+                discount_percent INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                updated_by INTEGER NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS action_logs (
+                log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                action_type TEXT NOT NULL,
+                payload TEXT,
+                created_at TEXT NOT NULL
+            )
+            """,
         ]
 
     for statement in statements:
@@ -571,6 +645,8 @@ def init_database() -> None:
     ensure_column("orders", "status", "TEXT NOT NULL DEFAULT 'new'")
     ensure_column("orders", "status_updated_at", "TEXT")
     ensure_column("orders", "status_updated_by", "INTEGER")
+    ensure_column("broadcast_logs", "blocked", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column("broadcast_logs", "details", "TEXT")
 
 
 init_database()
@@ -899,6 +975,40 @@ def autopost_button_markup(button_text: str, button_url: str):
     if not button_text or not button_url:
         return None
     return InlineKeyboardMarkup([[InlineKeyboardButton(button_text, url=button_url)]])
+
+
+def log_action(user_id: int | None, action_type: str, payload: str = "") -> None:
+    cursor.execute(
+        "INSERT INTO action_logs (user_id, action_type, payload, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, action_type, payload[:1000], now_iso()),
+    )
+    conn.commit()
+
+
+def is_user_blacklisted(user_id: int) -> bool:
+    cursor.execute("SELECT 1 FROM blacklist WHERE user_id = ?", (user_id,))
+    return cursor.fetchone() is not None
+
+
+def get_category_discount_percent(category_key: str) -> int:
+    cursor.execute("SELECT discount_percent FROM category_discounts WHERE category_key = ?", (category_key,))
+    row = cursor.fetchone()
+    return int(row[0]) if row else 0
+
+
+def calc_discounted_price(base_price: int, category_key: str) -> int:
+    if base_price <= 0:
+        return base_price
+    discount = get_category_discount_percent(category_key)
+    if discount <= 0:
+        return base_price
+    return max(int(round(base_price * (100 - discount) / 100.0)), 0)
+
+
+def rating_summary_for_user(user_id: int) -> tuple[float, int]:
+    cursor.execute("SELECT COALESCE(AVG(rating), 0), COUNT(*) FROM customer_ratings WHERE user_id = ?", (user_id,))
+    avg_value, count_value = cursor.fetchone()
+    return float(avg_value or 0), int(count_value or 0)
 
 
 def build_ref_link(bot_username: str, user_id: int) -> str:
@@ -1238,16 +1348,19 @@ def add_to_cart(user_id: int, item_id: int, quantity: int = 1) -> None:
         (user_id, item_id, quantity),
     )
     conn.commit()
+    log_action(user_id, "cart_add", f"item={item_id};qty={quantity}")
 
 
 def remove_from_cart(user_id: int, item_id: int) -> None:
     cursor.execute("DELETE FROM cart_items WHERE user_id = ? AND item_id = ?", (user_id, item_id))
     conn.commit()
+    log_action(user_id, "cart_remove", f"item={item_id}")
 
 
 def clear_cart(user_id: int) -> None:
     cursor.execute("DELETE FROM cart_items WHERE user_id = ?", (user_id,))
     conn.commit()
+    log_action(user_id, "cart_clear", "")
 
 
 def get_cart(user_id: int):
@@ -1261,7 +1374,12 @@ def get_cart(user_id: int):
         """,
         (user_id,),
     )
-    return cursor.fetchall()
+    rows = cursor.fetchall()
+    result = []
+    for item_id, quantity, label, base_price, category_key in rows:
+        price = calc_discounted_price(base_price, category_key)
+        result.append((item_id, quantity, label, price, category_key))
+    return result
 
 
 def cart_total(user_id: int) -> int:
@@ -1320,22 +1438,82 @@ def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
 def admin_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            ["📊 Статистика", "📢 Рассылка"],
-            ["📈 Аналитика PRO", "🤖 Авто-рассылки"],
-            ["🎯 Создать розыгрыш", "🏁 Завершить розыгрыш"],
-            ["🎁 Реф. розыгрыш", "🗂 Инфо-блоки"],
-            ["💬 Ссылка на менеджера", "🎁 Ссылка на розыгрыши"],
-            ["🛒 Ссылка на барахолки", "🚀 Ссылка на проекты"],
-            ["➕ Добавить кнопку", "✏️ Переименовать кнопку"],
-            ["📝 Изменить описание", "🖼 Изменить фото"],
-            ["💰 Изменить цену", "🗑 Удалить кнопку"],
-            ["📍 Точки самовывоза", "↕️ Порядок кнопок"],
-            ["🖼 Фото категорий", "🗑 Удалить фото категории"],
+            ["🛍 Редактор каталога", "📣 Рассылки"],
+            ["🎁 Розыгрыши (админ)", "👥 Клиенты"],
+            ["🔗 Ссылки и инфо", "📊 Аналитика"],
             ["⬅️ Назад"],
         ],
         resize_keyboard=True,
     )
 
+
+
+def admin_catalog_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["➕ Добавить кнопку", "✏️ Переименовать кнопку"],
+            ["📝 Изменить описание", "🖼 Изменить фото"],
+            ["💰 Изменить цену", "🗑 Удалить кнопку"],
+            ["📍 Точки самовывоза", "↕️ Порядок кнопок"],
+            ["🖼 Фото категорий", "🗑 Удалить фото категории"],
+            ["🏷 Акции категорий"],
+            ["↩️ Админка"],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def admin_broadcast_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["📢 Рассылка", "🤖 Авто-рассылки"],
+            ["↩️ Админка"],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def admin_giveaways_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["🎯 Создать розыгрыш", "🏁 Завершить розыгрыш"],
+            ["🎁 Реф. розыгрыш"],
+            ["↩️ Админка"],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def admin_clients_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["🚫 Черный список"],
+            ["↩️ Админка"],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def admin_links_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["🗂 Инфо-блоки", "💬 Ссылка на менеджера"],
+            ["🛒 Ссылка на барахолки", "🚀 Ссылка на проекты"],
+            ["🎁 Ссылка на розыгрыши"],
+            ["↩️ Админка"],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def admin_analytics_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["📊 Статистика", "📈 Аналитика PRO"],
+            ["↩️ Админка"],
+        ],
+        resize_keyboard=True,
+    )
 
 
 def pickup_admin_keyboard() -> ReplyKeyboardMarkup:
@@ -1363,8 +1541,12 @@ def category_menu_keyboard() -> InlineKeyboardMarkup:
 
 def item_menu_keyboard(category_key: str) -> InlineKeyboardMarkup:
     rows = []
-    for item_id, _, _, label, _, _, _, price in get_items_by_category(category_key):
+    category_discount = get_category_discount_percent(category_key)
+    for item_id, _, _, label, _, _, _, base_price in get_items_by_category(category_key):
+        price = calc_discounted_price(base_price, category_key)
         suffix = f" — {price} ₽" if price > 0 else ""
+        if category_discount > 0 and base_price > 0:
+            suffix += f" (-{category_discount}%)"
         rows.append([InlineKeyboardButton(f"{label}{suffix}", callback_data=f"item:{item_id}")])
 
     rows.append([InlineKeyboardButton("🛒 Корзина", callback_data="cart_open")])
@@ -1415,6 +1597,11 @@ def order_status_keyboard(order_id: int, client_user_id: int) -> InlineKeyboardM
             InlineKeyboardButton("🎉 Выдан", callback_data=f"order_status:{order_id}:done"),
             InlineKeyboardButton("❌ Отменён", callback_data=f"order_status:{order_id}:canceled"),
         ],
+        [
+            InlineKeyboardButton("⭐1", callback_data=f"order_rate:{order_id}:1"),
+            InlineKeyboardButton("⭐3", callback_data=f"order_rate:{order_id}:3"),
+            InlineKeyboardButton("⭐5", callback_data=f"order_rate:{order_id}:5"),
+        ],
         [InlineKeyboardButton("👤 Профиль клиента", url=f"tg://user?id={client_user_id}")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -1457,9 +1644,13 @@ async def safe_send(update: Update, text: str, **kwargs):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if is_user_blacklisted(user.id):
+        await safe_send(update, "⛔ Доступ к боту ограничен. Обратись к менеджеру.")
+        return
     is_new_user = save_user(user)
     if is_new_user and context.args:
         register_referral_if_valid(user.id, context.args[0])
+    log_action(user.id, "start", "entry")
     await safe_send(
         update,
         "🔥 *Добро пожаловать в RNDM SHOP!*\n\nВыбирай нужный раздел ниже 👇",
@@ -1484,8 +1675,13 @@ async def show_item(query, item_id: int):
         await query.message.reply_text("❌ Позиция не найдена.")
         return
 
-    item_id, _, category_key, label, description, image, _, price = item
-    caption = f"*{label}*\n\n{description}\n\n💰 *Цена:* {format_price(price)}"
+    item_id, _, category_key, label, description, image, _, base_price = item
+    price = calc_discounted_price(base_price, category_key)
+    discount = get_category_discount_percent(category_key)
+    discount_line = ""
+    if discount > 0 and base_price > 0:
+        discount_line = f"\n🏷 Акция категории: -{discount}% (было {base_price} ₽)"
+    caption = f"*{label}*\n\n{description}\n\n💰 *Цена:* {format_price(price)}{discount_line}"
 
     if not image:
         await query.message.reply_text(
@@ -1595,10 +1791,11 @@ def collect_checkout_items(user_id: int, buy_now_item_id):
         item = get_item(buy_now_item_id)
         if not item:
             return []
+        final_price = calc_discounted_price(item[7], item[2])
         return [{
             "item_id": item[0],
             "label": item[3],
-            "price": item[7],
+            "price": final_price,
             "quantity": 1,
         }]
 
@@ -1747,10 +1944,13 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
         )
         order_id = cursor.lastrowid
     conn.commit()
+    log_action(user.id, "order_created", f"order_id={order_id};total={final_sum};type={order_type}")
 
     username_line = f"@{user.username}" if user.username else "нет username"
     total_line = format_price(total_sum) if total_sum > 0 else "цена уточняется"
     final_line = format_price(final_sum) if final_sum > 0 else "цена уточняется"
+    rating_avg, rating_count = rating_summary_for_user(user.id)
+    rating_text = f"{rating_avg:.2f}/5 ({rating_count} оценок)" if rating_count > 0 else "пока нет"
 
     manager_text = (
         f"{render_order_title(order_id, 'new')}\n\n"
@@ -1760,6 +1960,7 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
         f"User ID: {user.id}\n"
         f"Телефон: {phone}\n"
         f"Контактный username: {contact_username}\n"
+        f"Рейтинг клиента: {rating_text}\n"
     )
 
     if order_type == "delivery":
@@ -1821,6 +2022,7 @@ async def order_status_callback(update: Update, context: ContextTypes.DEFAULT_TY
         (new_status, now_iso(), manager_id, order_id),
     )
     conn.commit()
+    log_action(manager_id, "order_status", f"order={order_id};status={new_status}")
 
     message = query.message
     if not message or not message.text:
@@ -1841,6 +2043,71 @@ async def order_status_callback(update: Update, context: ContextTypes.DEFAULT_TY
         logger.exception("Не удалось обновить сообщение заказа order_id=%s", order_id)
 
     await query.answer("Статус обновлён")
+
+
+async def order_rate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    parts = query.data.split(":")
+    if len(parts) != 3:
+        return
+    _, order_id_raw, rating_raw = parts
+    if not order_id_raw.isdigit() or not rating_raw.isdigit():
+        return
+
+    order_id = int(order_id_raw)
+    rating = int(rating_raw)
+    if rating < 1 or rating > 5:
+        return
+
+    manager_id = query.from_user.id if query.from_user else 0
+    cursor.execute("SELECT user_id FROM orders WHERE order_id = ?", (order_id,))
+    row = cursor.fetchone()
+    if not row:
+        await query.answer("Заказ не найден", show_alert=True)
+        return
+    client_user_id = row[0]
+    cursor.execute(
+        """
+        INSERT INTO customer_ratings (order_id, user_id, manager_id, rating, comment, created_at)
+        VALUES (?, ?, ?, ?, '', ?)
+        """,
+        (order_id, client_user_id, manager_id, rating, now_iso()),
+    )
+    conn.commit()
+    log_action(manager_id, "order_rate", f"order={order_id};client={client_user_id};rating={rating}")
+    avg_value, cnt_value = rating_summary_for_user(client_user_id)
+    await query.answer(f"Оценка сохранена: {rating}/5. Ср: {avg_value:.2f} ({cnt_value})")
+
+
+async def rate_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not context.args:
+        await safe_send(update, "Использование: /ratecomment ORDER_ID текст комментария")
+        return
+    if len(context.args) < 2 or not context.args[0].isdigit():
+        await safe_send(update, "Пример: /ratecomment 123 Клиент просит перезвонить вечером")
+        return
+
+    order_id = int(context.args[0])
+    comment = " ".join(context.args[1:]).strip()
+    cursor.execute("SELECT user_id FROM orders WHERE order_id = ?", (order_id,))
+    row = cursor.fetchone()
+    if not row:
+        await safe_send(update, "❌ Заказ не найден.")
+        return
+    client_user_id = row[0]
+    cursor.execute(
+        """
+        INSERT INTO customer_ratings (order_id, user_id, manager_id, rating, comment, created_at)
+        VALUES (?, ?, ?, 0, ?, ?)
+        """,
+        (order_id, client_user_id, update.effective_user.id, comment, now_iso()),
+    )
+    conn.commit()
+    await safe_send(update, "✅ Комментарий к клиенту сохранён.")
 
 
 async def begin_checkout(query, context: ContextTypes.DEFAULT_TYPE, buy_now_item_id=None):
@@ -2354,10 +2621,40 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await safe_send(
         update,
-        "⚙️ *Админка*\n\nУправление товарами, ценами, точками самовывоза и настройками.",
+        "⚙️ *Админка*\n\nВыбери раздел управления.",
         parse_mode="Markdown",
         reply_markup=admin_keyboard(),
     )
+
+
+async def admin_open_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin(update.effective_user.id):
+        await safe_send(update, "🛍 Раздел: редактор каталога", reply_markup=admin_catalog_keyboard())
+
+
+async def admin_open_broadcasts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin(update.effective_user.id):
+        await safe_send(update, "📣 Раздел: рассылки", reply_markup=admin_broadcast_keyboard())
+
+
+async def admin_open_giveaways(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin(update.effective_user.id):
+        await safe_send(update, "🎁 Раздел: розыгрыши", reply_markup=admin_giveaways_keyboard())
+
+
+async def admin_open_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin(update.effective_user.id):
+        await safe_send(update, "👥 Раздел: клиенты", reply_markup=admin_clients_keyboard())
+
+
+async def admin_open_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin(update.effective_user.id):
+        await safe_send(update, "🔗 Раздел: ссылки и инфо", reply_markup=admin_links_keyboard())
+
+
+async def admin_open_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin(update.effective_user.id):
+        await safe_send(update, "📊 Раздел: аналитика", reply_markup=admin_analytics_keyboard())
 
 
 async def admin_pickup_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2419,8 +2716,8 @@ async def admin_advanced_stats(update: Update, context: ContextTypes.DEFAULT_TYP
     auto_posts_count = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM auto_posts WHERE is_active = 1")
     auto_posts_active = cursor.fetchone()[0]
-    cursor.execute("SELECT COALESCE(SUM(sent), 0), COALESCE(SUM(failed), 0) FROM broadcast_logs")
-    sent_sum, failed_sum = cursor.fetchone()
+    cursor.execute("SELECT COALESCE(SUM(sent), 0), COALESCE(SUM(failed), 0), COALESCE(SUM(blocked), 0) FROM broadcast_logs")
+    sent_sum, failed_sum, blocked_sum = cursor.fetchone()
 
     cursor.execute("SELECT item_id, label FROM items")
     items = cursor.fetchall()
@@ -2443,9 +2740,115 @@ async def admin_advanced_stats(update: Update, context: ContextTypes.DEFAULT_TYP
         f"Автопостов активных: *{auto_posts_active}*\n"
         f"Доставлено рассылок: *{sent_sum}*\n"
         f"Ошибок рассылок: *{failed_sum}*\n\n"
+        f"Блокировок бота: *{blocked_sum}*\n\n"
         f"*Топ товаров по заказам:*\n{top_text}",
         parse_mode="Markdown",
     )
+
+
+async def admin_blacklist_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    await safe_send(
+        update,
+        "🚫 Формат:\nadd USER_ID причина\nremove USER_ID\nlist",
+    )
+    return ADMIN_BLACKLIST_WAITING
+
+
+async def admin_blacklist_manage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    if raw.lower() == "list":
+        cursor.execute("SELECT user_id, COALESCE(reason, '') FROM blacklist ORDER BY added_at DESC LIMIT 30")
+        rows = cursor.fetchall()
+        if not rows:
+            await safe_send(update, "Список пуст.")
+            return ADMIN_BLACKLIST_WAITING
+        lines = ["🚫 Черный список:"]
+        for user_id, reason in rows:
+            lines.append(f"• {user_id} — {reason or 'без причины'}")
+        await safe_send(update, "\n".join(lines))
+        return ADMIN_BLACKLIST_WAITING
+
+    parts = raw.split(maxsplit=2)
+    if len(parts) < 2:
+        await safe_send(update, "❌ Неверный формат.")
+        return ADMIN_BLACKLIST_WAITING
+
+    action, user_id_raw = parts[0].lower(), parts[1]
+    if not user_id_raw.isdigit():
+        await safe_send(update, "❌ USER_ID должен быть числом.")
+        return ADMIN_BLACKLIST_WAITING
+    target_id = int(user_id_raw)
+
+    if action == "add":
+        reason = parts[2] if len(parts) > 2 else ""
+        cursor.execute(
+            """
+            INSERT INTO blacklist (user_id, reason, added_at, added_by)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET reason = EXCLUDED.reason, added_at = EXCLUDED.added_at, added_by = EXCLUDED.added_by
+            """,
+            (target_id, reason, now_iso(), update.effective_user.id),
+        )
+        conn.commit()
+        log_action(update.effective_user.id, "blacklist_add", f"user={target_id};reason={reason}")
+        await safe_send(update, f"✅ Пользователь {target_id} добавлен в ЧС.")
+        return ADMIN_BLACKLIST_WAITING
+
+    if action == "remove":
+        cursor.execute("DELETE FROM blacklist WHERE user_id = ?", (target_id,))
+        conn.commit()
+        log_action(update.effective_user.id, "blacklist_remove", f"user={target_id}")
+        await safe_send(update, f"✅ Пользователь {target_id} удалён из ЧС.")
+        return ADMIN_BLACKLIST_WAITING
+
+    await safe_send(update, "❌ Используй add/remove/list.")
+    return ADMIN_BLACKLIST_WAITING
+
+
+async def admin_category_discount_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    text = "🏷 Формат:\nКАТЕГОРИЯ = 20\nили\nКАТЕГОРИЯ = off\n\nДоступно:\n"
+    text += "\n".join([f"• {v}" for v in CATEGORY_LABELS.values()])
+    await safe_send(update, text)
+    return ADMIN_CATEGORY_DISCOUNT_WAITING
+
+
+async def admin_category_discount_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    if "=" not in raw:
+        await safe_send(update, "❌ Формат: КАТЕГОРИЯ = 20 / off")
+        return ADMIN_CATEGORY_DISCOUNT_WAITING
+    label, value = [x.strip() for x in raw.split("=", 1)]
+    category_key = parse_category_from_label(label)
+    if not category_key:
+        await safe_send(update, "❌ Категория не найдена.")
+        return ADMIN_CATEGORY_DISCOUNT_WAITING
+
+    if value.lower() == "off":
+        percent = 0
+    elif value.isdigit() and 0 <= int(value) <= 95:
+        percent = int(value)
+    else:
+        await safe_send(update, "❌ Процент должен быть 0..95 или off.")
+        return ADMIN_CATEGORY_DISCOUNT_WAITING
+
+    cursor.execute(
+        """
+        INSERT INTO category_discounts (category_key, discount_percent, updated_at, updated_by)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(category_key) DO UPDATE SET
+            discount_percent = EXCLUDED.discount_percent,
+            updated_at = EXCLUDED.updated_at,
+            updated_by = EXCLUDED.updated_by
+        """,
+        (category_key, percent, now_iso(), update.effective_user.id),
+    )
+    conn.commit()
+    await safe_send(update, f"✅ Акция для {CATEGORY_LABELS[category_key]}: -{percent}%")
+    return ADMIN_CATEGORY_DISCOUNT_WAITING
 
 
 async def admin_create_giveaway_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2726,36 +3129,53 @@ async def admin_ref_giveaway_pick(update: Update, context: ContextTypes.DEFAULT_
 async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-    await safe_send(update, "📢 Отправь текст рассылки одним сообщением. /cancel для отмены")
+    await safe_send(update, "📢 Отправь пост рассылки: текст или фото с подписью. /cancel для отмены")
     return ADMIN_BROADCAST_WAITING
 
 
 async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+    if not update.message:
+        return ADMIN_BROADCAST_WAITING
+    text = update.message.text or update.message.caption or ""
+    photo = update.message.photo[-1].file_id if update.message.photo else ""
+    if not text and not photo:
+        await safe_send(update, "❌ Нужен текст или фото.")
+        return ADMIN_BROADCAST_WAITING
     cursor.execute("SELECT user_id FROM users")
     user_ids = [row[0] for row in cursor.fetchall()]
 
     sent = 0
     failed = 0
+    blocked = 0
+    reason_stats = {}
     for user_id in user_ids:
         try:
-            await context.bot.send_message(chat_id=user_id, text=text)
+            if photo:
+                await context.bot.send_photo(chat_id=user_id, photo=photo, caption=text or None)
+            else:
+                await context.bot.send_message(chat_id=user_id, text=text)
             sent += 1
-        except Exception:
+        except Exception as e:
             failed += 1
+            msg = str(e).lower()
+            if "blocked" in msg or "forbidden" in msg:
+                blocked += 1
+            reason = str(e).split(":", 1)[0][:80]
+            reason_stats[reason] = reason_stats.get(reason, 0) + 1
 
     cursor.execute(
         """
-        INSERT INTO broadcast_logs (kind, post_id, sent, failed, created_at, created_by)
-        VALUES ('manual', NULL, ?, ?, ?, ?)
+        INSERT INTO broadcast_logs (kind, post_id, sent, failed, blocked, details, created_at, created_by)
+        VALUES ('manual', NULL, ?, ?, ?, ?, ?, ?)
         """,
-        (sent, failed, now_iso(), update.effective_user.id),
+        (sent, failed, blocked, "; ".join([f"{k}={v}" for k, v in reason_stats.items()]), now_iso(), update.effective_user.id),
     )
     conn.commit()
+    log_action(update.effective_user.id, "broadcast_manual", f"sent={sent};failed={failed};blocked={blocked}")
 
     await safe_send(
         update,
-        f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}",
+        f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}\nБлокировок: {blocked}",
         reply_markup=admin_keyboard(),
     )
     return ConversationHandler.END
@@ -2783,6 +3203,8 @@ async def process_auto_posts(context: ContextTypes.DEFAULT_TYPE):
     for post_id, text_value, photo, button_text, button_url, interval_hours in posts:
         sent = 0
         failed = 0
+        blocked = 0
+        reason_stats = {}
         markup = autopost_button_markup(button_text, button_url)
 
         for user_id in user_ids:
@@ -2792,8 +3214,13 @@ async def process_auto_posts(context: ContextTypes.DEFAULT_TYPE):
                 else:
                     await context.bot.send_message(chat_id=user_id, text=text_value, reply_markup=markup)
                 sent += 1
-            except Exception:
+            except Exception as e:
                 failed += 1
+                msg = str(e).lower()
+                if "blocked" in msg or "forbidden" in msg:
+                    blocked += 1
+                reason = str(e).split(":", 1)[0][:80]
+                reason_stats[reason] = reason_stats.get(reason, 0) + 1
 
         next_send = (datetime.now() + timedelta(hours=interval_hours)).isoformat()
         cursor.execute(
@@ -2806,10 +3233,10 @@ async def process_auto_posts(context: ContextTypes.DEFAULT_TYPE):
         )
         cursor.execute(
             """
-            INSERT INTO broadcast_logs (kind, post_id, sent, failed, created_at, created_by)
-            VALUES ('auto', ?, ?, ?, ?, NULL)
+            INSERT INTO broadcast_logs (kind, post_id, sent, failed, blocked, details, created_at, created_by)
+            VALUES ('auto', ?, ?, ?, ?, ?, ?, NULL)
             """,
-            (post_id, sent, failed, now_iso()),
+            (post_id, sent, failed, blocked, "; ".join([f"{k}={v}" for k, v in reason_stats.items()]), now_iso()),
         )
         conn.commit()
 
@@ -3530,6 +3957,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("check", check_code))
     app.add_handler(CommandHandler("use", use_code))
+    app.add_handler(CommandHandler("ratecomment", rate_comment))
     app.add_handler(CommandHandler("cancel", cancel))
 
     # ВАЖНО: conversation handlers должны регистрироваться раньше обычных MessageHandler.
@@ -3543,6 +3971,7 @@ def main():
         )
     )
     app.add_handler(CallbackQueryHandler(order_status_callback, pattern=r"^order_status:\d+:[a-z_]+$"))
+    app.add_handler(CallbackQueryHandler(order_rate_callback, pattern=r"^order_rate:\d+:\d+$"))
 
     checkout_conv = ConversationHandler(
         entry_points=[
@@ -3572,7 +4001,10 @@ def main():
 
     broadcast_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^📢 Рассылка$"), admin_broadcast_start)],
-        states={ADMIN_BROADCAST_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_send)]},
+        states={ADMIN_BROADCAST_WAITING: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_send),
+            MessageHandler(filters.PHOTO, admin_broadcast_send),
+        ]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
@@ -3771,6 +4203,18 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    blacklist_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🚫 Черный список$"), admin_blacklist_start)],
+        states={ADMIN_BLACKLIST_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_blacklist_manage)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    category_discount_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🏷 Акции категорий$"), admin_category_discount_start)],
+        states={ADMIN_CATEGORY_DISCOUNT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_category_discount_save)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     app.add_handler(checkout_conv)
     app.add_handler(info_blocks_conv)
     app.add_handler(broadcast_conv)
@@ -3795,6 +4239,8 @@ def main():
     app.add_handler(create_giveaway_conv)
     app.add_handler(finish_giveaway_conv)
     app.add_handler(autopost_conv)
+    app.add_handler(blacklist_conv)
+    app.add_handler(category_discount_conv)
 
     app.add_handler(MessageHandler(filters.Regex(r"^🛍 Ассортимент$"), assortment))
     app.add_handler(MessageHandler(filters.Regex(r"^🛒 Корзина$"), show_cart))
@@ -3807,6 +4253,13 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^🚀 Наши проекты$"), projects))
     app.add_handler(MessageHandler(filters.Regex(r"^🎁 Розыгрыши$"), giveaways))
     app.add_handler(MessageHandler(filters.Regex(r"^⚙️ Админка$"), admin_panel))
+    app.add_handler(MessageHandler(filters.Regex(r"^↩️ Админка$"), admin_panel))
+    app.add_handler(MessageHandler(filters.Regex(r"^🛍 Редактор каталога$"), admin_open_catalog))
+    app.add_handler(MessageHandler(filters.Regex(r"^📣 Рассылки$"), admin_open_broadcasts))
+    app.add_handler(MessageHandler(filters.Regex(r"^🎁 Розыгрыши \(админ\)$"), admin_open_giveaways))
+    app.add_handler(MessageHandler(filters.Regex(r"^👥 Клиенты$"), admin_open_clients))
+    app.add_handler(MessageHandler(filters.Regex(r"^🔗 Ссылки и инфо$"), admin_open_links))
+    app.add_handler(MessageHandler(filters.Regex(r"^📊 Аналитика$"), admin_open_analytics))
     app.add_handler(MessageHandler(filters.Regex(r"^📍 Точки самовывоза$"), admin_pickup_panel))
     app.add_handler(MessageHandler(filters.Regex(r"^📊 Статистика$"), admin_stats))
     app.add_handler(MessageHandler(filters.Regex(r"^📈 Аналитика PRO$"), admin_advanced_stats))
