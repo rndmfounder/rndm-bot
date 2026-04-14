@@ -146,6 +146,7 @@ ADMIN_REORDER_PICKUP_WAITING = next(_state)
 
 ADMIN_SET_CATEGORY_PHOTO_CATEGORY_WAITING = next(_state)
 ADMIN_SET_CATEGORY_PHOTO_IMAGE_WAITING = next(_state)
+ADMIN_CLEAR_CATEGORY_PHOTO_CATEGORY_WAITING = next(_state)
 
 ADMIN_INFO_BLOCK_SELECT_WAITING = next(_state)
 ADMIN_INFO_BLOCK_ACTION_WAITING = next(_state)
@@ -965,6 +966,7 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
             ["📝 Изменить описание", "🖼 Изменить фото"],
             ["💰 Изменить цену", "🗑 Удалить кнопку"],
             ["🖼 Фото категорий", "🗂 Инфо-блоки"],
+            ["🗑 Удалить фото категории"],
             ["📍 Точки самовывоза", "↕️ Порядок кнопок"],
             ["📢 Рассылка", "📊 Статистика"],
             ["🎁 Реф. розыгрыш"],
@@ -2620,6 +2622,33 @@ async def admin_set_category_photo_image(update: Update, context: ContextTypes.D
     return ConversationHandler.END
 
 
+async def admin_clear_category_photo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    await safe_send(
+        update,
+        "🗑 Выбери категорию, у которой нужно удалить фото.",
+        reply_markup=admin_category_choice_keyboard(),
+    )
+    return ADMIN_CLEAR_CATEGORY_PHOTO_CATEGORY_WAITING
+
+
+async def admin_clear_category_photo_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    category_key = parse_category_from_label(update.message.text.strip())
+    if not category_key:
+        await safe_send(update, "❌ Выбери категорию кнопкой ниже.", reply_markup=admin_category_choice_keyboard())
+        return ADMIN_CLEAR_CATEGORY_PHOTO_CATEGORY_WAITING
+
+    clear_category_image(category_key)
+    await safe_send(
+        update,
+        f"✅ Фото для категории {CATEGORY_LABELS[category_key]} удалено.",
+        reply_markup=admin_keyboard(),
+    )
+    return ConversationHandler.END
+
+
 async def check_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await safe_send(update, "Использование: /check RNDM-XXXXXX")
@@ -2815,6 +2844,16 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    clear_category_photo_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🗑 Удалить фото категории$"), admin_clear_category_photo_start)],
+        states={
+            ADMIN_CLEAR_CATEGORY_PHOTO_CATEGORY_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_clear_category_photo_category)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     edit_price_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^💰 Изменить цену$"), admin_edit_price_start)],
         states={
@@ -2902,6 +2941,7 @@ def main():
     app.add_handler(edit_desc_conv)
     app.add_handler(edit_image_conv)
     app.add_handler(category_photo_conv)
+    app.add_handler(clear_category_photo_conv)
     app.add_handler(edit_price_conv)
     app.add_handler(delete_item_conv)
     app.add_handler(reorder_item_conv)
