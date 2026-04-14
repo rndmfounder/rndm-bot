@@ -438,6 +438,9 @@ def init_database() -> None:
     conn.commit()
     ensure_column("items", "price", "INTEGER NOT NULL DEFAULT 0")
     ensure_column("users", "referred_by", "INTEGER")
+ensure_column("orders", "status", "TEXT NOT NULL DEFAULT 'new'")
+ensure_column("orders", "status_updated_at", "TEXT")
+ensure_column("orders", "status_updated_by", "INTEGER")
 
 
 init_database()
@@ -1195,6 +1198,35 @@ def pickup_points_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+ORDER_STATUS_META = {
+    "new": ("🆕", "НОВЫЙ"),
+    "accepted": ("✅", "ПРИНЯТ"),
+    "in_progress": ("🚚", "В РАБОТЕ"),
+    "done": ("🎉", "ВЫДАН"),
+    "canceled": ("❌", "ОТМЕНЁН"),
+}
+
+
+def order_status_keyboard(order_id: int, client_user_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("✅ Принят", callback_data=f"order_status:{order_id}:accepted"),
+            InlineKeyboardButton("🚚 В работе", callback_data=f"order_status:{order_id}:in_progress"),
+        ],
+        [
+            InlineKeyboardButton("🎉 Выдан", callback_data=f"order_status:{order_id}:done"),
+            InlineKeyboardButton("❌ Отменён", callback_data=f"order_status:{order_id}:canceled"),
+        ],
+        [InlineKeyboardButton("👤 Профиль клиента", url=f"tg://user?id={client_user_id}")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def render_order_title(order_id: int, status: str) -> str:
+    icon, title = ORDER_STATUS_META.get(status, ORDER_STATUS_META["new"])
+    return f"{icon} {title} ЗАКАЗ #{order_id}"
+
+
 async def open_category_view(target_message, category_key: str):
     category_title = CATEGORY_LABELS.get(category_key, "КАТЕГОРИЯ")
     caption = f"📂 *{category_title}*\n\nВыбирай позицию ниже 👇"
@@ -1523,7 +1555,7 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
     final_line = format_price(final_sum) if final_sum > 0 else "цена уточняется"
 
     manager_text = (
-        f"🆕 НОВЫЙ ЗАКАЗ #{order_id}\n\n"
+        f"{render_order_title(order_id, 'new')}\n\n"
         f"Тип: {'Доставка' if order_type == 'delivery' else 'Самовывоз'}\n"
         f"Клиент: {user.first_name or '-'}\n"
         f"Username: {username_line}\n"
@@ -1550,8 +1582,67 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
         f"Время заказа: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
     )
 
-    await context.bot.send_message(chat_id=ORDER_GROUP_ID, text=manager_text)
+    await context.bot.send_message(
+        chat_id=ORDER_GROUP_ID,
+        text=manager_text,
+        reply_markup=order_status_keyboard(order_id, user.id),
+    )
     return order_id
+
+
+async def order_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+
+    await query.answer()
+    parts = query.data.split(":")
+    if len(parts) != 3:
+        return
+
+    _, order_id_raw, new_status = parts
+    if new_status not in ORDER_STATUS_META:
+        await query.answer("Неизвестный статус", show_alert=True)
+        return
+
+    if not order_id_raw.isdigit():
+        return
+
+    order_id = int(order_id_raw)
+    manager_id = query.from_user.id if query.from_user else 0
+
+    cursor.execute("SELECT user_id FROM orders WHERE order_id = ?", (order_id,))
+    row = cursor.fetchone()
+    if not row:
+        await query.answer("Заказ не найден", show_alert=True)
+        return
+    client_user_id = row[0]
+
+    cursor.execute(
+        "UPDATE orders SET status = ?, status_updated_at = ?, status_updated_by = ? WHERE order_id = ?",
+        (new_status, now_iso(), manager_id, order_id),
+    )
+    conn.commit()
+
+    message = query.message
+    if not message or not message.text:
+        await query.answer("Статус обновлён")
+        return
+
+    lines = message.text.splitlines()
+    if lines:
+        lines[0] = render_order_title(order_id, new_status)
+    updated_text = "\n".join(lines)
+
+    try:
+        await message.edit_text(
+            updated_text,
+            reply_markup=order_status_keyboard(order_id, client_user_id),
+        )
+    except Exception:
+        logger.exception("Не удалось обновить сообщение заказа order_id=%s", order_id)
+
+    await query.answer("Статус обновлён")
 
 
 async def begin_checkout(query, context: ContextTypes.DEFAULT_TYPE, buy_now_item_id=None):
@@ -2935,6 +3026,7 @@ def main():
             pattern=r"^(category:.+|item:\d+|open_category:.+|assortment_menu|add_to_cart:\d+|cart_open|cart_remove:\d+|cart_clear)$",
         )
     )
+    app.add_handler(CallbackQueryHandler(order_status_callback, pattern=r"^order_status:\d+:[a-z_]+$"))
 
     checkout_conv = ConversationHandler(
         entry_points=[
