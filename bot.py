@@ -1547,6 +1547,7 @@ def admin_welcome_keyboard() -> ReplyKeyboardMarkup:
             ["📝 Текст приветствия", "🖼 Фото приветствия"],
             ["🔗 Кнопки под постом", "🗑 Убрать фото"],
             ["👁 Предпросмотр", "↩️ Админка"],
+            ["🛑 Прервать сценарий"],
         ],
         resize_keyboard=True,
     )
@@ -1573,6 +1574,7 @@ def admin_broadcast_keyboard() -> ReplyKeyboardMarkup:
         [
             ["📢 Рассылка", "🤖 Авто-рассылки"],
             ["📋 Активные авто-рассылки"],
+            ["🛑 Прервать сценарий"],
             ["↩️ Админка"],
         ],
         resize_keyboard=True,
@@ -3080,13 +3082,21 @@ async def admin_finish_giveaway_pick(update: Update, context: ContextTypes.DEFAU
 async def admin_autopost_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-    await safe_send(update, "🤖 Отправь текст автопоста.")
+    await safe_send(
+        update,
+        "🤖 Отправь текст автопоста.\n\n"
+        "Выйти из сценария: /cancel, /stop, /admin_stop или кнопка «🛑 Прервать сценарий».",
+    )
     return ADMIN_AUTOPOST_TEXT_WAITING
 
 
 async def admin_autopost_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["autopost_text"] = update.message.text
-    await safe_send(update, "🖼 Отправь фото для поста или напиши `skip`.")
+    await safe_send(
+        update,
+        "🖼 Отправь фото для поста или напиши `skip`.\n"
+        "Выйти: /cancel, /stop или «🛑 Прервать сценарий».",
+    )
     return ADMIN_AUTOPOST_PHOTO_WAITING
 
 
@@ -3099,7 +3109,12 @@ async def admin_autopost_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         await safe_send(update, "❌ Отправь фото или `skip`.")
         return ADMIN_AUTOPOST_PHOTO_WAITING
 
-    await safe_send(update, "🔗 Отправь кнопку в формате: Текст | URL\nИли `skip`.")
+    await safe_send(
+        update,
+        "🔗 Отправь кнопку в формате: Текст | URL\n"
+        "Или `skip`.\n"
+        "Выйти: /cancel, /stop или «🛑 Прервать сценарий».",
+    )
     return ADMIN_AUTOPOST_BUTTON_WAITING
 
 
@@ -3379,7 +3394,11 @@ async def admin_ref_giveaway_pick(update: Update, context: ContextTypes.DEFAULT_
 async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-    await safe_send(update, "📢 Отправь пост рассылки: текст или фото с подписью. /cancel для отмены")
+    await safe_send(
+        update,
+        "📢 Отправь пост рассылки: текст или фото с подписью.\n"
+        "Отмена: /cancel, /stop, /admin_stop или «🛑 Прервать сценарий».",
+    )
     return ADMIN_BROADCAST_WAITING
 
 
@@ -4161,6 +4180,8 @@ async def admin_welcome_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await safe_send(update, "Выбери пункт меню кнопкой ниже.", reply_markup=admin_welcome_keyboard())
         return ADMIN_WELCOME_MENU_WAITING
     text = update.message.text.strip()
+    if text in ADMIN_ESCAPE_LABELS:
+        return await admin_escape_conversation(update, context)
     if text == "📝 Текст приветствия":
         await safe_send(
             update,
@@ -4193,8 +4214,6 @@ async def admin_welcome_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await send_welcome_screen(update.message, update.effective_user.id)
         await safe_send(update, "Выше — предпросмотр.", reply_markup=admin_welcome_keyboard())
         return ADMIN_WELCOME_MENU_WAITING
-    if text in ("↩️ Админка", "⤴️ Админка"):
-        return await admin_submenu_back(update, context)
     await safe_send(update, "Выбери пункт меню кнопкой ниже.", reply_markup=admin_welcome_keyboard())
     return ADMIN_WELCOME_MENU_WAITING
 
@@ -4203,6 +4222,8 @@ async def admin_welcome_save_text(update: Update, context: ContextTypes.DEFAULT_
     if not update.message or not update.message.text:
         await safe_send(update, "Нужен текст сообщением.")
         return ADMIN_WELCOME_TEXT_WAITING
+    if update.message.text.strip() in ADMIN_ESCAPE_LABELS:
+        return await admin_escape_conversation(update, context)
     set_welcome_caption_value(update.message.text.strip())
     await safe_send(update, "✅ Текст приветствия сохранён.", reply_markup=admin_welcome_keyboard())
     return ADMIN_WELCOME_MENU_WAITING
@@ -4213,6 +4234,8 @@ async def admin_welcome_save_photo(update: Update, context: ContextTypes.DEFAULT
         set_welcome_photo_value(update.message.photo[-1].file_id)
         await safe_send(update, "✅ Фото приветствия сохранено.", reply_markup=admin_welcome_keyboard())
         return ADMIN_WELCOME_MENU_WAITING
+    if update.message and update.message.text and update.message.text.strip() in ADMIN_ESCAPE_LABELS:
+        return await admin_escape_conversation(update, context)
     await safe_send(update, "❌ Нужно отправить фото (или «↩️ Админка» / /cancel для выхода).")
     return ADMIN_WELCOME_PHOTO_WAITING
 
@@ -4222,6 +4245,8 @@ async def admin_welcome_save_buttons(update: Update, context: ContextTypes.DEFAU
         await safe_send(update, "Нужен текст со списком кнопок.")
         return ADMIN_WELCOME_BUTTONS_WAITING
     body = update.message.text.strip()
+    if body in ADMIN_ESCAPE_LABELS:
+        return await admin_escape_conversation(update, context)
     if body.lower() == "пусто":
         set_welcome_buttons_raw([])
         await safe_send(update, "✅ Все кнопки убраны.", reply_markup=admin_welcome_keyboard())
@@ -4316,7 +4341,16 @@ async def use_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await safe_send(update, "❌ Действие отменено.", reply_markup=main_keyboard(update.effective_user.id))
+    uid = update.effective_user.id
+    if is_admin(uid):
+        await safe_send(
+            update,
+            "❌ Сценарий отменён.\n"
+            "Повторно: /cancel, /stop или /admin_stop — выход в корень админки.",
+            reply_markup=admin_keyboard(),
+        )
+    else:
+        await safe_send(update, "❌ Действие отменено.", reply_markup=main_keyboard(uid))
     return ConversationHandler.END
 
 
@@ -4324,6 +4358,105 @@ async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await safe_send(update, "⬅️ Возвращаю в главное меню.", reply_markup=main_keyboard(update.effective_user.id))
     return ConversationHandler.END
+
+
+ADMIN_ESCAPE_LABELS = frozenset(
+    {
+        "⬅️ Назад",
+        "📣 Рассылки",
+        "🛍 Редактор каталога",
+        "🎁 Розыгрыши (админ)",
+        "👥 Клиенты",
+        "🔗 Ссылки и инфо",
+        "📊 Аналитика",
+        "👋 Экран приветствия",
+        "↩️ Админка",
+        "⤴️ Админка",
+        "⚙️ Админка",
+        "📢 Рассылка",
+        "🤖 Авто-рассылки",
+        "📋 Активные авто-рассылки",
+        "🛑 Прервать сценарий",
+        "📍 Точки самовывоза",
+    }
+)
+
+
+class _AdminEscapeNavFilter(filters.MessageFilter):
+    def filter(self, message):
+        if message is None or getattr(message, "text", None) is None:
+            return False
+        user = getattr(message, "from_user", None)
+        if user is None or not is_admin(user.id):
+            return False
+        return message.text.strip() in ADMIN_ESCAPE_LABELS
+
+
+async def admin_escape_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return ConversationHandler.END
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    text = update.message.text.strip()
+    if text not in ADMIN_ESCAPE_LABELS:
+        return ConversationHandler.END
+    if text == "📋 Активные авто-рассылки":
+        context.user_data.clear()
+        return await admin_autopost_list_screen(update, context)
+    context.user_data.clear()
+    if text == "⬅️ Назад":
+        await safe_send(update, "⬅️ Возвращаю в главное меню.", reply_markup=main_keyboard(update.effective_user.id))
+        return ConversationHandler.END
+    if text in ("🛑 Прервать сценарий", "↩️ Админка", "⤴️ Админка", "⚙️ Админка"):
+        await safe_send(
+            update,
+            "⚙️ *Админка*\n\nВыбери раздел управления.",
+            parse_mode="Markdown",
+            reply_markup=admin_keyboard(),
+        )
+        return ConversationHandler.END
+    if text == "📣 Рассылки":
+        await safe_send(update, "📣 Раздел: рассылки", reply_markup=admin_broadcast_keyboard())
+        return ConversationHandler.END
+    if text in ("📢 Рассылка", "🤖 Авто-рассылки"):
+        await safe_send(update, "📣 Раздел: рассылки", reply_markup=admin_broadcast_keyboard())
+        return ConversationHandler.END
+    if text == "🛍 Редактор каталога":
+        await admin_open_catalog(update, context)
+        return ConversationHandler.END
+    if text == "🎁 Розыгрыши (админ)":
+        await admin_open_giveaways(update, context)
+        return ConversationHandler.END
+    if text == "👥 Клиенты":
+        await admin_open_clients(update, context)
+        return ConversationHandler.END
+    if text == "🔗 Ссылки и инфо":
+        await admin_open_links(update, context)
+        return ConversationHandler.END
+    if text == "📊 Аналитика":
+        await admin_open_analytics(update, context)
+        return ConversationHandler.END
+    if text == "👋 Экран приветствия":
+        await safe_send(
+            update,
+            "👋 Нажми снова «👋 Экран приветствия» в корне админки.",
+            reply_markup=admin_keyboard(),
+        )
+        return ConversationHandler.END
+    if text == "📍 Точки самовывоза":
+        await admin_pickup_panel(update, context)
+        return ConversationHandler.END
+    return ConversationHandler.END
+
+
+admin_escape_fallback = MessageHandler(_AdminEscapeNavFilter(), admin_escape_conversation)
+
+ADMIN_CONV_FALLBACKS = [
+    CommandHandler("cancel", cancel),
+    CommandHandler("stop", cancel),
+    CommandHandler("admin_stop", cancel),
+    admin_escape_fallback,
+]
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4381,12 +4514,7 @@ def main():
             ORDER_PICKUP_TIME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_pickup_time)],
             ORDER_PICKUP_USERNAME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_pickup_username)],
         },
-        fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main)],
-    )
-
-    admin_root_nav_fallback = MessageHandler(
-        filters.Regex(r"^(↩️|⤴️) Админка$|^⚙️ Админка$"),
-        admin_submenu_back,
+        fallbacks=[*ADMIN_CONV_FALLBACKS, MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main)],
     )
 
     broadcast_conv = ConversationHandler(
@@ -4395,31 +4523,31 @@ def main():
             MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_send),
             MessageHandler(filters.PHOTO, admin_broadcast_send),
         ]},
-        fallbacks=[CommandHandler("cancel", cancel), admin_root_nav_fallback],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     baraholki_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🛒 Ссылка на барахолки$"), admin_baraholki_start)],
         states={ADMIN_BARAHOLKI_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_baraholki_save)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     projects_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🚀 Ссылка на проекты$"), admin_projects_start)],
         states={ADMIN_PROJECTS_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_projects_save)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     giveaways_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🎁 Ссылка на розыгрыши$"), admin_giveaways_start)],
         states={ADMIN_GIVEAWAYS_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_giveaways_save)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     manager_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^💬 Ссылка на менеджера$"), admin_manager_start)],
         states={ADMIN_MANAGER_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_manager_save)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     add_item_conv = ConversationHandler(
@@ -4431,7 +4559,7 @@ def main():
             ADMIN_ADD_ITEM_PRICE_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_item_price)],
             ADMIN_ADD_ITEM_IMAGE_WAITING: [MessageHandler(filters.PHOTO, admin_add_item_image)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     rename_item_conv = ConversationHandler(
@@ -4441,7 +4569,7 @@ def main():
             ADMIN_RENAME_ITEM_SELECT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_rename_item_select)],
             ADMIN_RENAME_ITEM_NEW_NAME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_rename_item_new_name)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     edit_desc_conv = ConversationHandler(
@@ -4451,7 +4579,7 @@ def main():
             ADMIN_EDIT_DESC_SELECT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_desc_select)],
             ADMIN_EDIT_DESC_NEW_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_desc_new)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     edit_image_conv = ConversationHandler(
@@ -4461,7 +4589,7 @@ def main():
             ADMIN_EDIT_IMAGE_SELECT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_image_select)],
             ADMIN_EDIT_IMAGE_NEW_WAITING: [MessageHandler(filters.PHOTO, admin_edit_image_new)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     category_photo_conv = ConversationHandler(
@@ -4473,7 +4601,7 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_set_category_photo_image_text),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     clear_category_photo_conv = ConversationHandler(
@@ -4483,7 +4611,7 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_clear_category_photo_category)
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     edit_price_conv = ConversationHandler(
@@ -4493,7 +4621,7 @@ def main():
             ADMIN_EDIT_PRICE_SELECT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_price_select)],
             ADMIN_EDIT_PRICE_NEW_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_price_new)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     delete_item_conv = ConversationHandler(
@@ -4502,7 +4630,7 @@ def main():
             ADMIN_DELETE_ITEM_CATEGORY_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_delete_item_category)],
             ADMIN_DELETE_ITEM_SELECT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_delete_item_select)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     reorder_item_conv = ConversationHandler(
@@ -4511,7 +4639,7 @@ def main():
             ADMIN_REORDER_ITEM_CATEGORY_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_reorder_item_category)],
             ADMIN_REORDER_ITEM_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_reorder_item_save)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     info_blocks_conv = ConversationHandler(
@@ -4525,13 +4653,13 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_info_blocks_save_photo),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS, MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main)],
     )
 
     add_pickup_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^➕ Добавить точку$"), admin_add_pickup_start)],
         states={ADMIN_ADD_PICKUP_NAME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_pickup_name)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     rename_pickup_conv = ConversationHandler(
@@ -4540,25 +4668,25 @@ def main():
             ADMIN_RENAME_PICKUP_SELECT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_rename_pickup_select)],
             ADMIN_RENAME_PICKUP_NEW_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_rename_pickup_new)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     delete_pickup_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🗑 Удалить точку$"), admin_delete_pickup_start)],
         states={ADMIN_DELETE_PICKUP_SELECT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_delete_pickup_select)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     reorder_pickup_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^↕️ Порядок точек$"), admin_reorder_pickup_start)],
         states={ADMIN_REORDER_PICKUP_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_reorder_pickup_save)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     ref_giveaway_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🎁 Реф. розыгрыш$"), admin_ref_giveaway_start)],
         states={ADMIN_REF_GIVEAWAY_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_ref_giveaway_pick)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     create_giveaway_conv = ConversationHandler(
@@ -4570,16 +4698,15 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_create_giveaway_photo),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     finish_giveaway_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🏁 Завершить розыгрыш$"), admin_finish_giveaway_start)],
         states={ADMIN_GIVEAWAY_FINISH_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_finish_giveaway_pick)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
-    autopost_list_fallback = MessageHandler(filters.Regex(r"^📋 Активные авто-рассылки$"), admin_autopost_list_screen)
     autopost_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🤖 Авто-рассылки$"), admin_autopost_start)],
         states={
@@ -4591,19 +4718,19 @@ def main():
             ADMIN_AUTOPOST_BUTTON_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_autopost_button)],
             ADMIN_AUTOPOST_INTERVAL_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_autopost_interval)],
         },
-        fallbacks=[CommandHandler("cancel", cancel), autopost_list_fallback, admin_root_nav_fallback],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     blacklist_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🚫 Черный список$"), admin_blacklist_start)],
         states={ADMIN_BLACKLIST_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_blacklist_manage)]},
-        fallbacks=[CommandHandler("cancel", cancel), admin_root_nav_fallback],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     category_discount_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🏷 Акции категорий$"), admin_category_discount_start)],
         states={ADMIN_CATEGORY_DISCOUNT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_category_discount_save)]},
-        fallbacks=[CommandHandler("cancel", cancel), admin_root_nav_fallback],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     welcome_screen_conv = ConversationHandler(
@@ -4623,7 +4750,7 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_welcome_save_buttons),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel), admin_root_nav_fallback],
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
     app.add_handler(checkout_conv)
@@ -4653,6 +4780,10 @@ def main():
     app.add_handler(blacklist_conv)
     app.add_handler(category_discount_conv)
     app.add_handler(welcome_screen_conv)
+
+    # Срабатывают, когда пользователь не в активном ConversationHandler (внутри сценария — fallbacks).
+    app.add_handler(CommandHandler("stop", cancel))
+    app.add_handler(CommandHandler("admin_stop", cancel))
 
     app.add_handler(MessageHandler(filters.Regex(r"^🛍 Ассортимент$"), assortment))
     app.add_handler(MessageHandler(filters.Regex(r"^🛒 Корзина$"), show_cart))
