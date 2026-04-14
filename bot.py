@@ -1,4 +1,4 @@
-import os
+шь?шь?import os
 import re
 import random
 import sqlite3
@@ -386,8 +386,10 @@ def set_info_block_photo(block_key: str, file_id: str) -> None:
 
 
 def parse_info_block_from_label(label: str):
+    cleaned = label.strip()
+    cleaned_simple = simplify_menu_label(cleaned)
     for key, value in INFO_BLOCK_LABELS.items():
-        if value == label:
+        if value == cleaned or simplify_menu_label(value) == cleaned_simple:
             return key
     return None
 
@@ -610,6 +612,12 @@ def slugify_name(name: str) -> str:
     return cleaned or "item"
 
 
+def simplify_menu_label(value: str) -> str:
+    cleaned = re.sub(r"^[^\wА-Яа-яЁё0-9]+", "", value.strip(), flags=re.UNICODE)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.lower()
+
+
 def generate_unique_item_key(label: str) -> str:
     base = slugify_name(label)
     candidate = base
@@ -623,8 +631,10 @@ def generate_unique_item_key(label: str) -> str:
 
 
 def parse_category_from_label(label: str):
+    cleaned = label.strip()
+    cleaned_simple = simplify_menu_label(cleaned)
     for key, value in CATEGORY_LABELS.items():
-        if value == label:
+        if value == cleaned or simplify_menu_label(value) == cleaned_simple:
             return key
     return None
 
@@ -1922,8 +1932,10 @@ async def admin_ref_giveaway_start(update: Update, context: ContextTypes.DEFAULT
 
     lines = ["🎁 *Реферальный рейтинг (топ-20)*\n"]
     for idx, (inviter_id, username, first_name, invites_count) in enumerate(top_rows, start=1):
-        uname = f"@{username}" if username else "-"
-        name = first_name or "-"
+        safe_username = re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", username or "")
+        safe_first_name = re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", first_name or "")
+        uname = f"@{safe_username}" if safe_username else "-"
+        name = safe_first_name or "-"
         lines.append(f"{idx}. {name} ({uname}) — ID `{inviter_id}` — приглашений: *{invites_count}*")
 
     lines.append(
@@ -1979,8 +1991,10 @@ async def admin_ref_giveaway_pick(update: Update, context: ContextTypes.DEFAULT_
         conn.commit()
 
         username, first_name = user_row
-        uname = f"@{username}" if username else "-"
-        result_lines.append(f"• {first_name or '-'} ({uname}) — ID {winner_id}, приглашений: {invites_count}")
+        safe_username = re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", username or "")
+        safe_first_name = re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", first_name or "")
+        uname = f"@{safe_username}" if safe_username else "-"
+        result_lines.append(f"• {safe_first_name or '-'} ({uname}) — ID {winner_id}, приглашений: {invites_count}")
 
         try:
             await context.bot.send_message(
@@ -2622,6 +2636,14 @@ async def admin_set_category_photo_image(update: Update, context: ContextTypes.D
     return ConversationHandler.END
 
 
+async def admin_set_category_photo_image_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_send(
+        update,
+        "❌ Нужно отправить именно фото категории (не текст).",
+    )
+    return ADMIN_SET_CATEGORY_PHOTO_IMAGE_WAITING
+
+
 async def admin_clear_category_photo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
@@ -2839,7 +2861,10 @@ def main():
         entry_points=[MessageHandler(filters.Regex(r"^🖼 Фото категорий$"), admin_set_category_photo_start)],
         states={
             ADMIN_SET_CATEGORY_PHOTO_CATEGORY_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_set_category_photo_category)],
-            ADMIN_SET_CATEGORY_PHOTO_IMAGE_WAITING: [MessageHandler(filters.PHOTO, admin_set_category_photo_image)],
+            ADMIN_SET_CATEGORY_PHOTO_IMAGE_WAITING: [
+                MessageHandler(filters.PHOTO, admin_set_category_photo_image),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_set_category_photo_image_text),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
