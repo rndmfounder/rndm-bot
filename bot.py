@@ -342,6 +342,36 @@ def ensure_postgres_cart_items_primary_key() -> None:
         logger.exception("cart_items: не удалось восстановить PRIMARY KEY")
 
 
+def ensure_postgres_orders_status_updated_by_bigint() -> None:
+    """status_updated_by был INTEGER — Telegram user_id часто > 2^31-1, UPDATE статуса заказа падал."""
+    if not USE_POSTGRES:
+        return
+    try:
+        cursor.execute(
+            """
+            SELECT data_type
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'orders'
+              AND column_name = 'status_updated_by'
+            """
+        )
+        row = cursor.fetchone()
+        if not row:
+            return
+        dt = (row[0] or "").lower()
+        if dt == "bigint":
+            return
+        if dt in ("integer", "smallint"):
+            cursor.execute(
+                "ALTER TABLE orders ALTER COLUMN status_updated_by TYPE BIGINT USING status_updated_by::bigint"
+            )
+            conn.commit()
+            logger.info("orders.status_updated_by → BIGINT (для больших Telegram user_id)")
+    except Exception:
+        logger.exception("Не удалось привести orders.status_updated_by к BIGINT")
+
+
 def init_database() -> None:
     if USE_POSTGRES:
         statements = [
@@ -718,10 +748,11 @@ def init_database() -> None:
     ensure_column("users", "referred_by", "INTEGER")
     ensure_column("orders", "status", "TEXT NOT NULL DEFAULT 'new'")
     ensure_column("orders", "status_updated_at", "TEXT")
-    ensure_column("orders", "status_updated_by", "INTEGER")
+    ensure_column("orders", "status_updated_by", "BIGINT")
     ensure_column("broadcast_logs", "blocked", "INTEGER NOT NULL DEFAULT 0")
     ensure_column("broadcast_logs", "details", "TEXT")
     ensure_postgres_cart_items_primary_key()
+    ensure_postgres_orders_status_updated_by_bigint()
 
 
 init_database()
@@ -2305,12 +2336,17 @@ async def order_status_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
     client_user_id = row[0]
 
-    cursor.execute(
-        "UPDATE orders SET status = ?, status_updated_at = ?, status_updated_by = ? WHERE order_id = ?",
-        (new_status, now_iso(), manager_id, order_id),
-    )
-    conn.commit()
-    log_action(manager_id, "order_status", f"order={order_id};status={new_status}")
+    try:
+        cursor.execute(
+            "UPDATE orders SET status = ?, status_updated_at = ?, status_updated_by = ? WHERE order_id = ?",
+            (new_status, now_iso(), manager_id, order_id),
+        )
+        conn.commit()
+        log_action(manager_id, "order_status", f"order={order_id};status={new_status}")
+    except Exception:
+        logger.exception("order_status: ошибка UPDATE orders order_id=%s", order_id)
+        await answer_once("Не удалось сохранить статус в БД. Напиши разработчику.", show_alert=True)
+        return
 
     message = query.message
     toast = "Статус обновлён"
