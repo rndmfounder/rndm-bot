@@ -2275,17 +2275,24 @@ async def order_status_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if not query:
         return
 
-    await query.answer()
-    parts = query.data.split(":")
+    async def answer_once(text: str | None = None, *, show_alert: bool = False):
+        try:
+            await query.answer(text=text, show_alert=show_alert)
+        except Exception:
+            logger.exception("order_status: answerCallbackQuery")
+
+    parts = query.data.split(":") if isinstance(query.data, str) else []
     if len(parts) != 3:
+        await answer_once("Некорректные данные кнопки", show_alert=True)
         return
 
     _, order_id_raw, new_status = parts
     if new_status not in ORDER_STATUS_META:
-        await query.answer("Неизвестный статус", show_alert=True)
+        await answer_once("Неизвестный статус", show_alert=True)
         return
 
     if not order_id_raw.isdigit():
+        await answer_once("Некорректный номер заказа", show_alert=True)
         return
 
     order_id = int(order_id_raw)
@@ -2294,7 +2301,7 @@ async def order_status_callback(update: Update, context: ContextTypes.DEFAULT_TY
     cursor.execute("SELECT user_id FROM orders WHERE order_id = ?", (order_id,))
     row = cursor.fetchone()
     if not row:
-        await query.answer("Заказ не найден", show_alert=True)
+        await answer_once("Заказ не найден", show_alert=True)
         return
     client_user_id = row[0]
 
@@ -2306,49 +2313,55 @@ async def order_status_callback(update: Update, context: ContextTypes.DEFAULT_TY
     log_action(manager_id, "order_status", f"order={order_id};status={new_status}")
 
     message = query.message
-    if not message or not message.text:
-        await query.answer("Статус обновлён")
-        return
+    toast = "Статус обновлён"
+    if message and message.text:
+        lines = message.text.splitlines()
+        if lines:
+            lines[0] = render_order_title(order_id, new_status)
+        updated_text = "\n".join(lines)
+        try:
+            await message.edit_text(
+                updated_text,
+                reply_markup=order_status_keyboard(order_id, client_user_id),
+            )
+        except Exception:
+            logger.exception("Не удалось обновить сообщение заказа order_id=%s", order_id)
+            toast = "Статус сохранён. Не удалось обновить текст в чате."
 
-    lines = message.text.splitlines()
-    if lines:
-        lines[0] = render_order_title(order_id, new_status)
-    updated_text = "\n".join(lines)
-
-    try:
-        await message.edit_text(
-            updated_text,
-            reply_markup=order_status_keyboard(order_id, client_user_id),
-        )
-    except Exception:
-        logger.exception("Не удалось обновить сообщение заказа order_id=%s", order_id)
-
-    await query.answer("Статус обновлён")
+    await answer_once(toast[:200] if toast else None)
 
 
 async def order_rate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
         return
-    await query.answer()
 
-    parts = query.data.split(":")
+    async def answer_once(text: str | None = None, *, show_alert: bool = False):
+        try:
+            await query.answer(text=text, show_alert=show_alert)
+        except Exception:
+            logger.exception("order_rate: answerCallbackQuery")
+
+    parts = query.data.split(":") if isinstance(query.data, str) else []
     if len(parts) != 3:
+        await answer_once("Некорректные данные кнопки", show_alert=True)
         return
     _, order_id_raw, rating_raw = parts
     if not order_id_raw.isdigit() or not rating_raw.isdigit():
+        await answer_once("Некорректные данные оценки", show_alert=True)
         return
 
     order_id = int(order_id_raw)
     rating = int(rating_raw)
     if rating < 1 or rating > 5:
+        await answer_once("Некорректная оценка", show_alert=True)
         return
 
     manager_id = query.from_user.id if query.from_user else 0
     cursor.execute("SELECT user_id FROM orders WHERE order_id = ?", (order_id,))
     row = cursor.fetchone()
     if not row:
-        await query.answer("Заказ не найден", show_alert=True)
+        await answer_once("Заказ не найден", show_alert=True)
         return
     client_user_id = row[0]
     cursor.execute(
@@ -2361,7 +2374,8 @@ async def order_rate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     conn.commit()
     log_action(manager_id, "order_rate", f"order={order_id};client={client_user_id};rating={rating}")
     avg_value, cnt_value = rating_summary_for_user(client_user_id)
-    await query.answer(f"Оценка сохранена: {rating}/5. Ср: {avg_value:.2f} ({cnt_value})")
+    msg = f"Оценка сохранена: {rating}/5. Ср: {avg_value:.2f} ({cnt_value})"
+    await answer_once(msg[:200])
 
 
 async def rate_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
