@@ -1858,10 +1858,13 @@ async def open_cart_message(target_message, user_id: int):
 
 async def _callback_text_or_dm(context: ContextTypes.DEFAULT_TYPE, query, text: str, **kwargs):
     """Если сообщение с кнопкой удалено — пишем в личку, иначе ответом в чат."""
-    if query.message:
-        await query.message.reply_text(text, **kwargs)
-    elif query.from_user:
-        await context.bot.send_message(chat_id=query.from_user.id, text=text, **kwargs)
+    try:
+        if query.message:
+            await query.message.reply_text(text, **kwargs)
+        elif query.from_user:
+            await context.bot.send_message(chat_id=query.from_user.id, text=text, **kwargs)
+    except Exception:
+        logger.exception("Не удалось отправить ответ по callback (reply/DM)")
 
 
 async def assortment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1869,8 +1872,30 @@ async def assortment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not query:
         return
 
-    await query.answer()
+    raw = query.data
+    if not isinstance(raw, str):
+        try:
+            await query.answer("Открой товар заново из меню 🛍 Ассортимент.", show_alert=True)
+        except Exception:
+            logger.exception("answer callback (невалидные callback_data)")
+        return
+
+    # Для add_to_cart отвечаем на query один раз — с текстом в toast (answer нельзя вызывать дважды).
+    skip_early_answer = raw.startswith("add_to_cart:")
+    if not skip_early_answer:
+        try:
+            await query.answer()
+        except Exception:
+            logger.exception("assortment_callback: ранний query.answer")
+
     user = update.effective_user
+    if not user:
+        if skip_early_answer:
+            try:
+                await query.answer("Не удалось определить профиль. Открой бота заново.", show_alert=True)
+            except Exception:
+                logger.exception("assortment_callback: answer без user")
+        return
 
     if query.data == "assortment_menu":
         await query.message.reply_text(
@@ -1911,8 +1936,20 @@ async def assortment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if query.data.startswith("add_to_cart:"):
-        item_id = int(query.data.split(":", 1)[1])
+        suffix = query.data.split(":", 1)[-1].strip()
+        try:
+            item_id = int(suffix)
+        except ValueError:
+            try:
+                await query.answer("Кнопка устарела. Зайди в 🛍 Ассортимент и открой товар снова.", show_alert=True)
+            except Exception:
+                logger.exception("add_to_cart: answer после ValueError")
+            return
         if not get_item(item_id):
+            try:
+                await query.answer("Позиции нет в каталоге. Открой ассортимент заново.", show_alert=True)
+            except Exception:
+                logger.exception("add_to_cart: answer item missing")
             await _callback_text_or_dm(
                 context,
                 query,
@@ -1923,12 +1960,20 @@ async def assortment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             add_to_cart(user.id, item_id)
         except Exception:
             logger.exception("Ошибка add_to_cart user=%s item=%s", user.id, item_id)
+            try:
+                await query.answer("Не удалось сохранить корзину.", show_alert=True)
+            except Exception:
+                logger.exception("add_to_cart: answer после ошибки БД")
             await _callback_text_or_dm(
                 context,
                 query,
                 "❌ Не удалось сохранить корзину. Попробуй ещё раз или напиши менеджеру.",
             )
             return
+        try:
+            await query.answer("✅ В корзине", show_alert=False)
+        except Exception:
+            logger.exception("add_to_cart: answer после успеха")
         await _callback_text_or_dm(context, query, "✅ Товар добавлен в корзину.")
         return
 
