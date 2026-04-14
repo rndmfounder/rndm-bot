@@ -37,7 +37,9 @@ DEFAULT_MANAGER_URL = f"tg://user?id={MANAGER_USER_ID}"
 # ВАЖНО: замени на реальный chat_id группы менеджеров
 ORDER_GROUP_ID = int(os.getenv("ORDER_GROUP_ID", "-1003913158040"))
 
-DB_PATH = "rndm.db"
+# Для Railway лучше указывать путь на volume, например: /data/rndm.db
+DB_PATH = os.getenv("SQLITE_PATH", "rndm.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 DEFAULT_BARAHOLKI_URL = "https://t.me/your_channel/1"
 DEFAULT_PROJECTS_URL = "https://t.me/your_channel/2"
@@ -166,14 +168,57 @@ ORDER_PICKUP_PHONE_WAITING = next(_state)
 ORDER_PICKUP_TIME_WAITING = next(_state)
 ORDER_PICKUP_USERNAME_WAITING = next(_state)
 
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-cursor = conn.cursor()
-
 logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+
+USE_POSTGRES = bool(DATABASE_URL)
+if USE_POSTGRES:
+    try:
+        import psycopg
+    except Exception as e:
+        raise RuntimeError(
+            "DATABASE_URL задан, но модуль psycopg не установлен. "
+            "Добавь зависимость psycopg[binary] в requirements и задеплой заново."
+        ) from e
+
+
+class DBCursor:
+    def __init__(self, raw_cursor, use_postgres: bool):
+        self.raw_cursor = raw_cursor
+        self.use_postgres = use_postgres
+
+    def execute(self, query: str, params: tuple | list | None = None):
+        sql = query.replace("?", "%s") if self.use_postgres else query
+        if params is None:
+            self.raw_cursor.execute(sql)
+        else:
+            self.raw_cursor.execute(sql, params)
+        return self
+
+    def fetchone(self):
+        return self.raw_cursor.fetchone()
+
+    def fetchall(self):
+        return self.raw_cursor.fetchall()
+
+    @property
+    def lastrowid(self):
+        return getattr(self.raw_cursor, "lastrowid", None)
+
+
+if USE_POSTGRES:
+    conn = psycopg.connect(DATABASE_URL)
+    conn.autocommit = False
+    cursor = DBCursor(conn.cursor(), use_postgres=True)
+    logger.info("Подключение к PostgreSQL активно")
+else:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    cursor = DBCursor(conn.cursor(), use_postgres=False)
+    logger.info("Используется SQLite база: %s", DB_PATH)
 
 
 def now_iso() -> str:
@@ -185,135 +230,228 @@ def is_admin(user_id: int) -> bool:
 
 
 def ensure_column(table_name: str, column_name: str, column_def: str) -> None:
-    cursor.execute(f"PRAGMA table_info({table_name})")
-    columns = [row[1] for row in cursor.fetchall()]
-    if column_name not in columns:
+    if USE_POSTGRES:
+        cursor.execute(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_name = %s AND column_name = %s
+            """,
+            (table_name, column_name),
+        )
+        exists = cursor.fetchone() is not None
+    else:
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        columns = [row[1] for row in cursor.fetchall()]
+        exists = column_name in columns
+
+    if not exists:
         cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
         conn.commit()
 
 
-cursor.execute(
-    """
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        last_seen TEXT,
-        last_spin TEXT,
-        referred_by INTEGER
-    )
-    """
-)
+def init_database() -> None:
+    if USE_POSTGRES:
+        statements = [
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_seen TEXT,
+                last_spin TEXT,
+                referred_by BIGINT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS promocodes (
+                code TEXT PRIMARY KEY,
+                discount INTEGER NOT NULL,
+                used INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                used_at TEXT,
+                owner_user_id BIGINT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS items (
+                item_id BIGSERIAL PRIMARY KEY,
+                item_key TEXT UNIQUE NOT NULL,
+                category_key TEXT NOT NULL,
+                label TEXT NOT NULL,
+                description TEXT NOT NULL,
+                image TEXT NOT NULL,
+                sort_order INTEGER NOT NULL,
+                price INTEGER NOT NULL DEFAULT 0
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS pickup_points (
+                pickup_id BIGSERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                sort_order INTEGER NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS cart_items (
+                user_id BIGINT NOT NULL,
+                item_id BIGINT NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (user_id, item_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS orders (
+                order_id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                username TEXT,
+                first_name TEXT,
+                order_type TEXT NOT NULL,
+                pickup_point TEXT,
+                phone TEXT,
+                contact_username TEXT,
+                address TEXT,
+                delivery_time TEXT,
+                items_text TEXT NOT NULL,
+                total_sum INTEGER NOT NULL DEFAULT 0,
+                comment TEXT,
+                created_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS referrals (
+                inviter_id BIGINT NOT NULL,
+                invited_id BIGINT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (inviter_id, invited_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS referral_winners (
+                winner_id BIGINT NOT NULL,
+                invites_count INTEGER NOT NULL DEFAULT 0,
+                selected_at TEXT NOT NULL,
+                selected_by BIGINT NOT NULL
+            )
+            """,
+        ]
+    else:
+        statements = [
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_seen TEXT,
+                last_spin TEXT,
+                referred_by INTEGER
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS promocodes (
+                code TEXT PRIMARY KEY,
+                discount INTEGER NOT NULL,
+                used INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                used_at TEXT,
+                owner_user_id INTEGER
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS items (
+                item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_key TEXT UNIQUE NOT NULL,
+                category_key TEXT NOT NULL,
+                label TEXT NOT NULL,
+                description TEXT NOT NULL,
+                image TEXT NOT NULL,
+                sort_order INTEGER NOT NULL,
+                price INTEGER NOT NULL DEFAULT 0
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS pickup_points (
+                pickup_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                sort_order INTEGER NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS cart_items (
+                user_id INTEGER NOT NULL,
+                item_id INTEGER NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (user_id, item_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS orders (
+                order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                first_name TEXT,
+                order_type TEXT NOT NULL,
+                pickup_point TEXT,
+                phone TEXT,
+                contact_username TEXT,
+                address TEXT,
+                delivery_time TEXT,
+                items_text TEXT NOT NULL,
+                total_sum INTEGER NOT NULL DEFAULT 0,
+                comment TEXT,
+                created_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS referrals (
+                inviter_id INTEGER NOT NULL,
+                invited_id INTEGER NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (inviter_id, invited_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS referral_winners (
+                winner_id INTEGER NOT NULL,
+                invites_count INTEGER NOT NULL DEFAULT 0,
+                selected_at TEXT NOT NULL,
+                selected_by INTEGER NOT NULL
+            )
+            """,
+        ]
 
-cursor.execute(
-    """
-    CREATE TABLE IF NOT EXISTS promocodes (
-        code TEXT PRIMARY KEY,
-        discount INTEGER NOT NULL,
-        used INTEGER DEFAULT 0,
-        created_at TEXT NOT NULL,
-        used_at TEXT,
-        owner_user_id INTEGER
-    )
-    """
-)
+    for statement in statements:
+        cursor.execute(statement)
 
-cursor.execute(
-    """
-    CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-    )
-    """
-)
+    conn.commit()
+    ensure_column("items", "price", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column("users", "referred_by", "INTEGER")
 
-cursor.execute(
-    """
-    CREATE TABLE IF NOT EXISTS items (
-        item_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        item_key TEXT UNIQUE NOT NULL,
-        category_key TEXT NOT NULL,
-        label TEXT NOT NULL,
-        description TEXT NOT NULL,
-        image TEXT NOT NULL,
-        sort_order INTEGER NOT NULL,
-        price INTEGER NOT NULL DEFAULT 0
-    )
-    """
-)
 
-cursor.execute(
-    """
-    CREATE TABLE IF NOT EXISTS pickup_points (
-        pickup_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        sort_order INTEGER NOT NULL
-    )
-    """
-)
-
-cursor.execute(
-    """
-    CREATE TABLE IF NOT EXISTS cart_items (
-        user_id INTEGER NOT NULL,
-        item_id INTEGER NOT NULL,
-        quantity INTEGER NOT NULL DEFAULT 1,
-        PRIMARY KEY (user_id, item_id)
-    )
-    """
-)
-
-cursor.execute(
-    """
-    CREATE TABLE IF NOT EXISTS orders (
-        order_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        username TEXT,
-        first_name TEXT,
-        order_type TEXT NOT NULL,
-        pickup_point TEXT,
-        phone TEXT,
-        contact_username TEXT,
-        address TEXT,
-        delivery_time TEXT,
-        items_text TEXT NOT NULL,
-        total_sum INTEGER NOT NULL DEFAULT 0,
-        comment TEXT,
-        created_at TEXT NOT NULL
-    )
-    """
-)
-
-cursor.execute(
-    """
-    CREATE TABLE IF NOT EXISTS referrals (
-        inviter_id INTEGER NOT NULL,
-        invited_id INTEGER NOT NULL UNIQUE,
-        created_at TEXT NOT NULL,
-        PRIMARY KEY (inviter_id, invited_id)
-    )
-    """
-)
-
-cursor.execute(
-    """
-    CREATE TABLE IF NOT EXISTS referral_winners (
-        winner_id INTEGER NOT NULL,
-        invites_count INTEGER NOT NULL DEFAULT 0,
-        selected_at TEXT NOT NULL,
-        selected_by INTEGER NOT NULL
-    )
-    """
-)
-
-conn.commit()
-
-ensure_column("items", "price", "INTEGER NOT NULL DEFAULT 0")
-ensure_column("users", "referred_by", "INTEGER")
+init_database()
 
 
 def set_setting(key: str, value: str) -> None:
-    cursor.execute("REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    cursor.execute(
+        """
+        INSERT INTO settings (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value
+        """,
+        (key, value),
+    )
     conn.commit()
 
 
@@ -708,15 +846,27 @@ def get_next_item_order(category_key: str) -> int:
 def add_item(category_key: str, label: str, description: str, image: str, price: int) -> int:
     item_key = generate_unique_item_key(label)
     sort_order = get_next_item_order(category_key)
-    cursor.execute(
-        """
-        INSERT INTO items (item_key, category_key, label, description, image, sort_order, price)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (item_key, category_key, label, description, image, sort_order, price),
-    )
+    if USE_POSTGRES:
+        cursor.execute(
+            """
+            INSERT INTO items (item_key, category_key, label, description, image, sort_order, price)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            RETURNING item_id
+            """,
+            (item_key, category_key, label, description, image, sort_order, price),
+        )
+        new_item_id = cursor.fetchone()[0]
+    else:
+        cursor.execute(
+            """
+            INSERT INTO items (item_key, category_key, label, description, image, sort_order, price)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (item_key, category_key, label, description, image, sort_order, price),
+        )
+        new_item_id = cursor.lastrowid
     conn.commit()
-    return cursor.lastrowid
+    return new_item_id
 
 
 def update_item_label(item_id: int, new_label: str) -> None:
@@ -957,12 +1107,11 @@ def manager_keyboard() -> InlineKeyboardMarkup:
 
 def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     keyboard = [
-        ["🛍 Ассортимент", "🛒 Корзина"],
-        ["📦 История заказов", "🎰 Крутить скидку"],
-        ["👥 Пригласить друзей"],
+        ["🛍 Ассортимент", "🎰 Крутить скидку"],
+        ["📦 История заказов", "💬 Менеджер"],
         ["🛒 Наши барахолки", "🚀 Наши проекты"],
-        ["🎁 Розыгрыши", "💬 Менеджер"],
-        ["📱 Наш VK"],
+        ["🎁 Розыгрыши", "📱 Наш VK"],
+        ["🛒 Корзина", "👥 Пригласить друзей"],
     ]
     if is_admin(user_id):
         keyboard.append(["⚙️ Админка"])
@@ -972,16 +1121,15 @@ def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
 def admin_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
+            ["📊 Статистика", "📢 Рассылка"],
+            ["🎁 Реф. розыгрыш", "🗂 Инфо-блоки"],
+            ["💬 Ссылка на менеджера", "🎁 Ссылка на розыгрыши"],
+            ["🛒 Ссылка на барахолки", "🚀 Ссылка на проекты"],
             ["➕ Добавить кнопку", "✏️ Переименовать кнопку"],
             ["📝 Изменить описание", "🖼 Изменить фото"],
             ["💰 Изменить цену", "🗑 Удалить кнопку"],
-            ["🖼 Фото категорий", "🗂 Инфо-блоки"],
-            ["🗑 Удалить фото категории"],
             ["📍 Точки самовывоза", "↕️ Порядок кнопок"],
-            ["📢 Рассылка", "📊 Статистика"],
-            ["🎁 Реф. розыгрыш"],
-            ["💬 Ссылка на менеджера", "🛒 Ссылка на барахолки"],
-            ["🚀 Ссылка на проекты", "🎁 Ссылка на розыгрыши"],
+            ["🖼 Фото категорий", "🗑 Удалить фото категории"],
             ["⬅️ Назад"],
         ],
         resize_keyboard=True,
@@ -1317,31 +1465,58 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
     total_sum = build_total_sum(items)
     final_sum, discount_amount = apply_discount_to_total(total_sum, discount_percent)
 
-    cursor.execute(
-        """
-        INSERT INTO orders (
-            user_id, username, first_name, order_type, pickup_point, phone,
-            contact_username, address, delivery_time, items_text, total_sum, created_at
+    if USE_POSTGRES:
+        cursor.execute(
+            """
+            INSERT INTO orders (
+                user_id, username, first_name, order_type, pickup_point, phone,
+                contact_username, address, delivery_time, items_text, total_sum, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING order_id
+            """,
+            (
+                user.id,
+                user.username,
+                user.first_name,
+                order_type,
+                pickup_point,
+                phone,
+                contact_username,
+                address,
+                delivery_time,
+                items_text,
+                final_sum,
+                now_iso(),
+            ),
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            user.id,
-            user.username,
-            user.first_name,
-            order_type,
-            pickup_point,
-            phone,
-            contact_username,
-            address,
-            delivery_time,
-            items_text,
-            final_sum,
-            now_iso(),
-        ),
-    )
+        order_id = cursor.fetchone()[0]
+    else:
+        cursor.execute(
+            """
+            INSERT INTO orders (
+                user_id, username, first_name, order_type, pickup_point, phone,
+                contact_username, address, delivery_time, items_text, total_sum, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user.id,
+                user.username,
+                user.first_name,
+                order_type,
+                pickup_point,
+                phone,
+                contact_username,
+                address,
+                delivery_time,
+                items_text,
+                final_sum,
+                now_iso(),
+            ),
+        )
+        order_id = cursor.lastrowid
     conn.commit()
-    order_id = cursor.lastrowid
 
     username_line = f"@{user.username}" if user.username else "нет username"
     total_line = format_price(total_sum) if total_sum > 0 else "цена уточняется"
