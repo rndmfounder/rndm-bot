@@ -151,6 +151,7 @@ ADMIN_INFO_BLOCK_SELECT_WAITING = next(_state)
 ADMIN_INFO_BLOCK_ACTION_WAITING = next(_state)
 ADMIN_INFO_BLOCK_TEXT_WAITING = next(_state)
 ADMIN_INFO_BLOCK_PHOTO_WAITING = next(_state)
+ADMIN_REF_GIVEAWAY_WAITING = next(_state)
 
 ORDER_PROMOCODE_WAITING = next(_state)
 ORDER_CHOICE_WAITING = next(_state)
@@ -197,7 +198,8 @@ cursor.execute(
         username TEXT,
         first_name TEXT,
         last_seen TEXT,
-        last_spin TEXT
+        last_spin TEXT,
+        referred_by INTEGER
     )
     """
 )
@@ -281,9 +283,32 @@ cursor.execute(
     """
 )
 
+cursor.execute(
+    """
+    CREATE TABLE IF NOT EXISTS referrals (
+        inviter_id INTEGER NOT NULL,
+        invited_id INTEGER NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (inviter_id, invited_id)
+    )
+    """
+)
+
+cursor.execute(
+    """
+    CREATE TABLE IF NOT EXISTS referral_winners (
+        winner_id INTEGER NOT NULL,
+        invites_count INTEGER NOT NULL DEFAULT 0,
+        selected_at TEXT NOT NULL,
+        selected_by INTEGER NOT NULL
+    )
+    """
+)
+
 conn.commit()
 
 ensure_column("items", "price", "INTEGER NOT NULL DEFAULT 0")
+ensure_column("users", "referred_by", "INTEGER")
 
 
 def set_setting(key: str, value: str) -> None:
@@ -459,11 +484,13 @@ for block_key, default_text in INFO_BLOCK_DEFAULTS.items():
         set_info_block_text(block_key, default_text)
 
 
-def save_user(user) -> None:
+def save_user(user) -> bool:
+    cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user.id,))
+    is_new_user = cursor.fetchone() is None
     cursor.execute(
         """
-        INSERT INTO users (user_id, username, first_name, last_seen, last_spin)
-        VALUES (?, ?, ?, ?, NULL)
+        INSERT INTO users (user_id, username, first_name, last_seen, last_spin, referred_by)
+        VALUES (?, ?, ?, ?, NULL, NULL)
         ON CONFLICT(user_id) DO UPDATE SET
             username = excluded.username,
             first_name = excluded.first_name,
@@ -472,6 +499,77 @@ def save_user(user) -> None:
         (user.id, user.username, user.first_name, now_iso()),
     )
     conn.commit()
+    return is_new_user
+
+
+def parse_referrer_id(raw_ref: str):
+    if not raw_ref:
+        return None
+    match = re.fullmatch(r"(?:ref_)?(\d+)", raw_ref.strip().lower())
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def register_referral_if_valid(invited_user_id: int, raw_ref: str) -> bool:
+    referrer_id = parse_referrer_id(raw_ref)
+    if not referrer_id or referrer_id == invited_user_id:
+        return False
+
+    cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (referrer_id,))
+    if not cursor.fetchone():
+        return False
+
+    cursor.execute("SELECT referred_by FROM users WHERE user_id = ?", (invited_user_id,))
+    row = cursor.fetchone()
+    if not row or row[0]:
+        return False
+
+    cursor.execute("SELECT 1 FROM referrals WHERE invited_id = ?", (invited_user_id,))
+    if cursor.fetchone():
+        return False
+
+    cursor.execute(
+        "INSERT INTO referrals (inviter_id, invited_id, created_at) VALUES (?, ?, ?)",
+        (referrer_id, invited_user_id, now_iso()),
+    )
+    cursor.execute("UPDATE users SET referred_by = ? WHERE user_id = ?", (referrer_id, invited_user_id))
+    conn.commit()
+    return True
+
+
+def get_referrals_count(user_id: int) -> int:
+    cursor.execute("SELECT COUNT(*) FROM referrals WHERE inviter_id = ?", (user_id,))
+    return cursor.fetchone()[0]
+
+
+def get_referral_top(limit: int = 20):
+    cursor.execute(
+        """
+        SELECT
+            r.inviter_id,
+            COALESCE(u.username, ''),
+            COALESCE(u.first_name, ''),
+            COUNT(r.invited_id) AS invites_count
+        FROM referrals r
+        LEFT JOIN users u ON u.user_id = r.inviter_id
+        GROUP BY r.inviter_id
+        ORDER BY invites_count DESC, r.inviter_id ASC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    return cursor.fetchall()
+
+
+def build_ref_link(bot_username: str, user_id: int) -> str:
+    if not bot_username:
+        return ""
+    return f"https://t.me/{bot_username}?start={user_id}"
+
+
+def my_referrals_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup([["⬅️ Назад"]], resize_keyboard=True)
 
 
 def update_last_spin(user_id: int) -> None:
@@ -850,6 +948,7 @@ def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     keyboard = [
         ["🛍 Ассортимент", "🛒 Корзина"],
         ["📦 История заказов", "🎰 Крутить скидку"],
+        ["👥 Пригласить друзей"],
         ["🛒 Наши барахолки", "🚀 Наши проекты"],
         ["🎁 Розыгрыши", "💬 Менеджер"],
         ["📱 Наш VK"],
@@ -868,6 +967,7 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
             ["🖼 Фото категорий", "🗂 Инфо-блоки"],
             ["📍 Точки самовывоза", "↕️ Порядок кнопок"],
             ["📢 Рассылка", "📊 Статистика"],
+            ["🎁 Реф. розыгрыш"],
             ["💬 Ссылка на менеджера", "🛒 Ссылка на барахолки"],
             ["🚀 Ссылка на проекты", "🎁 Ссылка на розыгрыши"],
             ["⬅️ Назад"],
@@ -967,7 +1067,9 @@ async def safe_send(update: Update, text: str, **kwargs):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    save_user(user)
+    is_new_user = save_user(user)
+    if is_new_user and context.args:
+        register_referral_if_valid(user.id, context.args[0])
     await safe_send(
         update,
         "🔥 *Добро пожаловать в RNDM SHOP!*\n\nВыбирай нужный раздел ниже 👇",
@@ -1652,6 +1754,30 @@ async def manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def my_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    save_user(user)
+    invites_count = get_referrals_count(user.id)
+    ref_link = build_ref_link(context.bot.username, user.id)
+
+    text = (
+        "👥 *Твоя реферальная программа*\n\n"
+        "Приглашай друзей в бота по своей ссылке и участвуй в розыгрышах.\n\n"
+        f"Твои приглашения: *{invites_count}*\n\n"
+    )
+    if ref_link:
+        text += f"Твоя ссылка:\n`{ref_link}`"
+    else:
+        text += "Ссылка временно недоступна, попробуй позже."
+
+    await safe_send(
+        update,
+        text,
+        parse_mode="Markdown",
+        reply_markup=my_referrals_keyboard(),
+    )
+
+
 async def admin_info_blocks_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
@@ -1763,6 +1889,10 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     orders_count = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM pickup_points")
     pickup_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM referrals")
+    referrals_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(DISTINCT inviter_id) FROM referrals")
+    inviters_count = cursor.fetchone()[0]
 
     await safe_send(
         update,
@@ -1770,11 +1900,96 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Пользователей: *{users_count}*\n"
         f"Товарных кнопок: *{items_count}*\n"
         f"Точек самовывоза: *{pickup_count}*\n"
+        f"Реф. приглашений: *{referrals_count}*\n"
+        f"Активных рефереров: *{inviters_count}*\n"
         f"Выдано промокодов: *{codes_count}*\n"
         f"Использовано промокодов: *{used_count}*\n"
         f"Заказов: *{orders_count}*",
         parse_mode="Markdown",
     )
+
+
+async def admin_ref_giveaway_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    top_rows = get_referral_top(limit=20)
+    if not top_rows:
+        await safe_send(update, "Пока нет приглашений.", reply_markup=admin_keyboard())
+        return ConversationHandler.END
+
+    lines = ["🎁 *Реферальный рейтинг (топ-20)*\n"]
+    for idx, (inviter_id, username, first_name, invites_count) in enumerate(top_rows, start=1):
+        uname = f"@{username}" if username else "-"
+        name = first_name or "-"
+        lines.append(f"{idx}. {name} ({uname}) — ID `{inviter_id}` — приглашений: *{invites_count}*")
+
+    lines.append(
+        "\nОтправь ID победителя или несколько ID через запятую/пробел.\n"
+        "Пример: `123456789, 987654321`\n\n/cancel — отмена"
+    )
+    await safe_send(update, "\n".join(lines), parse_mode="Markdown")
+    return ADMIN_REF_GIVEAWAY_WAITING
+
+
+async def admin_ref_giveaway_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    raw_text = update.message.text.strip()
+    parts = [p for p in re.split(r"[\s,;]+", raw_text) if p]
+    if not parts:
+        await safe_send(update, "❌ Отправь хотя бы один числовой user_id.")
+        return ADMIN_REF_GIVEAWAY_WAITING
+
+    winner_ids = []
+    for part in parts:
+        if not part.isdigit():
+            await safe_send(update, f"❌ Некорректный ID: {part}")
+            return ADMIN_REF_GIVEAWAY_WAITING
+        winner_ids.append(int(part))
+
+    winner_ids = list(dict.fromkeys(winner_ids))
+    result_lines = ["✅ Победители зафиксированы:\n"]
+
+    for winner_id in winner_ids:
+        cursor.execute(
+            """
+            SELECT COALESCE(username, ''), COALESCE(first_name, '')
+            FROM users
+            WHERE user_id = ?
+            """,
+            (winner_id,),
+        )
+        user_row = cursor.fetchone()
+        if not user_row:
+            result_lines.append(f"• ID {winner_id}: пользователь не найден")
+            continue
+
+        invites_count = get_referrals_count(winner_id)
+        cursor.execute(
+            """
+            INSERT INTO referral_winners (winner_id, invites_count, selected_at, selected_by)
+            VALUES (?, ?, ?, ?)
+            """,
+            (winner_id, invites_count, now_iso(), update.effective_user.id),
+        )
+        conn.commit()
+
+        username, first_name = user_row
+        uname = f"@{username}" if username else "-"
+        result_lines.append(f"• {first_name or '-'} ({uname}) — ID {winner_id}, приглашений: {invites_count}")
+
+        try:
+            await context.bot.send_message(
+                chat_id=winner_id,
+                text="🎉 Поздравляем! Ты выбран победителем реферального розыгрыша. Скоро свяжется менеджер.",
+            )
+        except Exception:
+            logger.exception("Не удалось отправить уведомление победителю %s", winner_id)
+
+    await safe_send(update, "\n".join(result_lines), reply_markup=admin_keyboard())
+    return ConversationHandler.END
 
 
 async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2669,6 +2884,12 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    ref_giveaway_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🎁 Реф. розыгрыш$"), admin_ref_giveaway_start)],
+        states={ADMIN_REF_GIVEAWAY_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_ref_giveaway_pick)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     app.add_handler(checkout_conv)
     app.add_handler(info_blocks_conv)
     app.add_handler(broadcast_conv)
@@ -2688,11 +2909,13 @@ def main():
     app.add_handler(rename_pickup_conv)
     app.add_handler(delete_pickup_conv)
     app.add_handler(reorder_pickup_conv)
+    app.add_handler(ref_giveaway_conv)
 
     app.add_handler(MessageHandler(filters.Regex(r"^🛍 Ассортимент$"), assortment))
     app.add_handler(MessageHandler(filters.Regex(r"^🛒 Корзина$"), show_cart))
     app.add_handler(MessageHandler(filters.Regex(r"^📦 История заказов$"), show_order_history))
     app.add_handler(MessageHandler(filters.Regex(r"^🎰 Крутить скидку$"), spin))
+    app.add_handler(MessageHandler(filters.Regex(r"^👥 Пригласить друзей$"), my_referrals))
     app.add_handler(MessageHandler(filters.Regex(r"^💬 Менеджер$"), manager))
     app.add_handler(MessageHandler(filters.Regex(r"^📱 Наш VK$"), vk))
     app.add_handler(MessageHandler(filters.Regex(r"^🛒 Наши барахолки$"), baraholki))
