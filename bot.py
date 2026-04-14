@@ -447,9 +447,9 @@ def init_database() -> None:
     conn.commit()
     ensure_column("items", "price", "INTEGER NOT NULL DEFAULT 0")
     ensure_column("users", "referred_by", "INTEGER")
-ensure_column("orders", "status", "TEXT NOT NULL DEFAULT 'new'")
-ensure_column("orders", "status_updated_at", "TEXT")
-ensure_column("orders", "status_updated_by", "INTEGER")
+    ensure_column("orders", "status", "TEXT NOT NULL DEFAULT 'new'")
+    ensure_column("orders", "status_updated_at", "TEXT")
+    ensure_column("orders", "status_updated_by", "INTEGER")
 
 
 init_database()
