@@ -155,6 +155,13 @@ ADMIN_INFO_BLOCK_ACTION_WAITING = next(_state)
 ADMIN_INFO_BLOCK_TEXT_WAITING = next(_state)
 ADMIN_INFO_BLOCK_PHOTO_WAITING = next(_state)
 ADMIN_REF_GIVEAWAY_WAITING = next(_state)
+ADMIN_GIVEAWAY_CREATE_TEXT_WAITING = next(_state)
+ADMIN_GIVEAWAY_CREATE_PHOTO_WAITING = next(_state)
+ADMIN_GIVEAWAY_FINISH_WAITING = next(_state)
+ADMIN_AUTOPOST_TEXT_WAITING = next(_state)
+ADMIN_AUTOPOST_PHOTO_WAITING = next(_state)
+ADMIN_AUTOPOST_BUTTON_WAITING = next(_state)
+ADMIN_AUTOPOST_INTERVAL_WAITING = next(_state)
 
 ORDER_PROMOCODE_WAITING = next(_state)
 ORDER_CHOICE_WAITING = next(_state)
@@ -349,6 +356,63 @@ def init_database() -> None:
                 selected_by BIGINT NOT NULL
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS giveaways (
+                giveaway_id BIGSERIAL PRIMARY KEY,
+                title TEXT NOT NULL,
+                text_value TEXT NOT NULL,
+                photo TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                created_by BIGINT NOT NULL,
+                finished_at TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS giveaway_referrals (
+                giveaway_id BIGINT NOT NULL,
+                inviter_id BIGINT NOT NULL,
+                invited_id BIGINT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (giveaway_id, invited_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS giveaway_winners (
+                giveaway_id BIGINT NOT NULL,
+                winner_id BIGINT NOT NULL,
+                invites_count INTEGER NOT NULL DEFAULT 0,
+                selected_at TEXT NOT NULL,
+                selected_by BIGINT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS auto_posts (
+                post_id BIGSERIAL PRIMARY KEY,
+                text_value TEXT NOT NULL,
+                photo TEXT,
+                button_text TEXT,
+                button_url TEXT,
+                interval_hours INTEGER NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                last_sent_at TEXT,
+                next_send_at TEXT,
+                sent_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                created_by BIGINT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS broadcast_logs (
+                log_id BIGSERIAL PRIMARY KEY,
+                kind TEXT NOT NULL,
+                post_id BIGINT,
+                sent INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                created_by BIGINT
+            )
+            """,
         ]
     else:
         statements = [
@@ -437,6 +501,63 @@ def init_database() -> None:
                 invites_count INTEGER NOT NULL DEFAULT 0,
                 selected_at TEXT NOT NULL,
                 selected_by INTEGER NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS giveaways (
+                giveaway_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                text_value TEXT NOT NULL,
+                photo TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                created_by INTEGER NOT NULL,
+                finished_at TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS giveaway_referrals (
+                giveaway_id INTEGER NOT NULL,
+                inviter_id INTEGER NOT NULL,
+                invited_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (giveaway_id, invited_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS giveaway_winners (
+                giveaway_id INTEGER NOT NULL,
+                winner_id INTEGER NOT NULL,
+                invites_count INTEGER NOT NULL DEFAULT 0,
+                selected_at TEXT NOT NULL,
+                selected_by INTEGER NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS auto_posts (
+                post_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text_value TEXT NOT NULL,
+                photo TEXT,
+                button_text TEXT,
+                button_url TEXT,
+                interval_hours INTEGER NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                last_sent_at TEXT,
+                next_send_at TEXT,
+                sent_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                created_by INTEGER NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS broadcast_logs (
+                log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                post_id INTEGER,
+                sent INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                created_by INTEGER
             )
             """,
         ]
@@ -688,6 +809,7 @@ def register_referral_if_valid(invited_user_id: int, raw_ref: str) -> bool:
     )
     cursor.execute("UPDATE users SET referred_by = ? WHERE user_id = ?", (referrer_id, invited_user_id))
     conn.commit()
+    track_giveaway_referral_if_active(referrer_id, invited_user_id)
     return True
 
 
@@ -713,6 +835,70 @@ def get_referral_top(limit: int = 20):
         (limit,),
     )
     return cursor.fetchall()
+
+
+def get_active_giveaway():
+    cursor.execute(
+        """
+        SELECT giveaway_id, title, text_value, photo, created_at
+        FROM giveaways
+        WHERE is_active = 1
+        ORDER BY giveaway_id DESC
+        LIMIT 1
+        """
+    )
+    return cursor.fetchone()
+
+
+def get_giveaway_top(giveaway_id: int, limit: int = 20):
+    cursor.execute(
+        """
+        SELECT
+            gr.inviter_id,
+            COALESCE(u.username, ''),
+            COALESCE(u.first_name, ''),
+            COUNT(gr.invited_id) AS invites_count
+        FROM giveaway_referrals gr
+        LEFT JOIN users u ON u.user_id = gr.inviter_id
+        WHERE gr.giveaway_id = ?
+        GROUP BY gr.inviter_id, u.username, u.first_name
+        ORDER BY invites_count DESC, gr.inviter_id ASC
+        LIMIT ?
+        """,
+        (giveaway_id, limit),
+    )
+    return cursor.fetchall()
+
+
+def get_giveaway_referrals_count(giveaway_id: int, inviter_id: int) -> int:
+    cursor.execute(
+        "SELECT COUNT(*) FROM giveaway_referrals WHERE giveaway_id = ? AND inviter_id = ?",
+        (giveaway_id, inviter_id),
+    )
+    return cursor.fetchone()[0]
+
+
+def track_giveaway_referral_if_active(inviter_id: int, invited_id: int) -> None:
+    giveaway = get_active_giveaway()
+    if not giveaway:
+        return
+
+    giveaway_id = giveaway[0]
+    cursor.execute(
+        """
+        INSERT INTO giveaway_referrals (giveaway_id, inviter_id, invited_id, created_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(giveaway_id, invited_id) DO NOTHING
+        """,
+        (giveaway_id, inviter_id, invited_id, now_iso()),
+    )
+    conn.commit()
+
+
+def autopost_button_markup(button_text: str, button_url: str):
+    if not button_text or not button_url:
+        return None
+    return InlineKeyboardMarkup([[InlineKeyboardButton(button_text, url=button_url)]])
 
 
 def build_ref_link(bot_username: str, user_id: int) -> str:
@@ -747,7 +933,8 @@ def generate_code() -> str:
 
 
 def get_discount() -> int:
-    return 10 if random.random() < 0.05 else 5
+    # 10% шанс = 5%; остальные 95% распределяем поровну между 1/2/3/5/7.
+    return random.choices([1, 2, 3, 5, 7, 10], weights=[19, 19, 19, 19, 19, 5], k=1)[0]
 
 
 def is_code_active(created_at: str) -> bool:
@@ -1134,6 +1321,8 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["📊 Статистика", "📢 Рассылка"],
+            ["📈 Аналитика PRO", "🤖 Авто-рассылки"],
+            ["🎯 Создать розыгрыш", "🏁 Завершить розыгрыш"],
             ["🎁 Реф. розыгрыш", "🗂 Инфо-блоки"],
             ["💬 Ссылка на менеджера", "🎁 Ссылка на розыгрыши"],
             ["🛒 Ссылка на барахолки", "🚀 Ссылка на проекты"],
@@ -2028,7 +2217,29 @@ async def projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def giveaways(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await open_info_block(update, "giveaways")
+    save_user(update.effective_user)
+    active = get_active_giveaway()
+    if not active:
+        await open_info_block(update, "giveaways")
+        return
+
+    giveaway_id, title, text_value, photo, _ = active
+    ref_link = build_ref_link(context.bot.username, update.effective_user.id)
+    my_count = get_giveaway_referrals_count(giveaway_id, update.effective_user.id)
+    text = (
+        f"🎁 *{title}*\n\n"
+        f"{text_value}\n\n"
+        f"Твои приглашения в этом розыгрыше: *{my_count}*\n"
+        f"Твоя ссылка для участия:\n`{ref_link}`"
+    )
+    if update.message:
+        if photo:
+            try:
+                await update.message.reply_photo(photo=photo, caption=text, parse_mode="Markdown")
+                return
+            except Exception:
+                logger.exception("Ошибка отправки фото активного розыгрыша")
+        await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2196,6 +2407,235 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def admin_advanced_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    cursor.execute("SELECT COUNT(*) FROM orders")
+    orders_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COALESCE(SUM(total_sum), 0) FROM orders WHERE total_sum > 0")
+    total_revenue = cursor.fetchone()[0] or 0
+    cursor.execute("SELECT COUNT(*) FROM auto_posts")
+    auto_posts_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM auto_posts WHERE is_active = 1")
+    auto_posts_active = cursor.fetchone()[0]
+    cursor.execute("SELECT COALESCE(SUM(sent), 0), COALESCE(SUM(failed), 0) FROM broadcast_logs")
+    sent_sum, failed_sum = cursor.fetchone()
+
+    cursor.execute("SELECT item_id, label FROM items")
+    items = cursor.fetchall()
+    top_pairs = []
+    for item_id, label in items:
+        cursor.execute("SELECT COUNT(*) FROM orders WHERE items_text LIKE ?", (f"%{label}%",))
+        count_value = cursor.fetchone()[0]
+        if count_value > 0:
+            top_pairs.append((label, count_value))
+    top_pairs.sort(key=lambda x: (-x[1], x[0]))
+    top_pairs = top_pairs[:5]
+    top_text = "\n".join([f"• {label}: {cnt}" for label, cnt in top_pairs]) if top_pairs else "• Пока нет данных"
+
+    await safe_send(
+        update,
+        f"📈 *Аналитика PRO*\n\n"
+        f"Заказов: *{orders_count}*\n"
+        f"Общая прибыль: *{total_revenue} ₽*\n"
+        f"Автопостов всего: *{auto_posts_count}*\n"
+        f"Автопостов активных: *{auto_posts_active}*\n"
+        f"Доставлено рассылок: *{sent_sum}*\n"
+        f"Ошибок рассылок: *{failed_sum}*\n\n"
+        f"*Топ товаров по заказам:*\n{top_text}",
+        parse_mode="Markdown",
+    )
+
+
+async def admin_create_giveaway_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    await safe_send(update, "🎯 Отправь название розыгрыша.")
+    return ADMIN_GIVEAWAY_CREATE_TEXT_WAITING
+
+
+async def admin_create_giveaway_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_giveaway_title"] = update.message.text.strip()
+    await safe_send(update, "📝 Отправь описание розыгрыша.")
+    return ADMIN_GIVEAWAY_CREATE_PHOTO_WAITING
+
+
+async def admin_create_giveaway_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    title = context.user_data.get("new_giveaway_title")
+    if not title:
+        return ConversationHandler.END
+    if not update.message:
+        return ADMIN_GIVEAWAY_CREATE_PHOTO_WAITING
+
+    text_value = update.message.caption.strip() if update.message and update.message.caption else update.message.text.strip() if update.message and update.message.text else ""
+    if not text_value:
+        await safe_send(update, "❌ Нужно отправить текст описания (можно с фото и подписью).")
+        return ADMIN_GIVEAWAY_CREATE_PHOTO_WAITING
+
+    photo = ""
+    if update.message and update.message.photo:
+        photo = update.message.photo[-1].file_id
+
+    cursor.execute("UPDATE giveaways SET is_active = 0 WHERE is_active = 1")
+    if USE_POSTGRES:
+        cursor.execute(
+            """
+            INSERT INTO giveaways (title, text_value, photo, is_active, created_at, created_by, finished_at)
+            VALUES (?, ?, ?, 1, ?, ?, NULL)
+            RETURNING giveaway_id
+            """,
+            (title, text_value, photo, now_iso(), update.effective_user.id),
+        )
+        giveaway_id = cursor.fetchone()[0]
+    else:
+        cursor.execute(
+            """
+            INSERT INTO giveaways (title, text_value, photo, is_active, created_at, created_by, finished_at)
+            VALUES (?, ?, ?, 1, ?, ?, NULL)
+            """,
+            (title, text_value, photo, now_iso(), update.effective_user.id),
+        )
+        giveaway_id = cursor.lastrowid
+    conn.commit()
+
+    context.user_data.pop("new_giveaway_title", None)
+    await safe_send(update, f"✅ Розыгрыш создан и активирован. ID: {giveaway_id}", reply_markup=admin_keyboard())
+    return ConversationHandler.END
+
+
+async def admin_finish_giveaway_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    active = get_active_giveaway()
+    if not active:
+        await safe_send(update, "❌ Сейчас нет активного розыгрыша.", reply_markup=admin_keyboard())
+        return ConversationHandler.END
+
+    giveaway_id, title, _, _, _ = active
+    context.user_data["finish_giveaway_id"] = giveaway_id
+    top_rows = get_giveaway_top(giveaway_id, limit=20)
+    lines = [f"🏁 Завершение розыгрыша: *{title}* (ID {giveaway_id})\n", "Топ участников:"]
+    for idx, (inviter_id, username, first_name, invites_count) in enumerate(top_rows, start=1):
+        uname = f"@{username}" if username else "-"
+        lines.append(f"{idx}. {first_name or '-'} ({uname}) — ID `{inviter_id}` — *{invites_count}*")
+    lines.append("\nОтправь ID победителя (или несколько через запятую).")
+    await safe_send(update, "\n".join(lines), parse_mode="Markdown")
+    return ADMIN_GIVEAWAY_FINISH_WAITING
+
+
+async def admin_finish_giveaway_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    giveaway_id = context.user_data.get("finish_giveaway_id")
+    if not giveaway_id:
+        return ConversationHandler.END
+
+    winner_ids = [int(x) for x in re.findall(r"\d+", update.message.text)]
+    if not winner_ids:
+        await safe_send(update, "❌ Отправь хотя бы один корректный user_id.")
+        return ADMIN_GIVEAWAY_FINISH_WAITING
+
+    winner_ids = list(dict.fromkeys(winner_ids))
+    for winner_id in winner_ids:
+        invites_count = get_giveaway_referrals_count(giveaway_id, winner_id)
+        cursor.execute(
+            """
+            INSERT INTO giveaway_winners (giveaway_id, winner_id, invites_count, selected_at, selected_by)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (giveaway_id, winner_id, invites_count, now_iso(), update.effective_user.id),
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=winner_id,
+                text="🎉 Ты выбран победителем розыгрыша! Скоро с тобой свяжется менеджер.",
+            )
+        except Exception:
+            logger.exception("Не удалось уведомить победителя giveaway winner_id=%s", winner_id)
+
+    cursor.execute("UPDATE giveaways SET is_active = 0, finished_at = ? WHERE giveaway_id = ?", (now_iso(), giveaway_id))
+    conn.commit()
+    context.user_data.pop("finish_giveaway_id", None)
+    await safe_send(update, "✅ Розыгрыш завершён, победители зафиксированы.", reply_markup=admin_keyboard())
+    return ConversationHandler.END
+
+
+async def admin_autopost_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    await safe_send(update, "🤖 Отправь текст автопоста.")
+    return ADMIN_AUTOPOST_TEXT_WAITING
+
+
+async def admin_autopost_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["autopost_text"] = update.message.text
+    await safe_send(update, "🖼 Отправь фото для поста или напиши `skip`.")
+    return ADMIN_AUTOPOST_PHOTO_WAITING
+
+
+async def admin_autopost_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.photo:
+        context.user_data["autopost_photo"] = update.message.photo[-1].file_id
+    elif update.message.text.strip().lower() == "skip":
+        context.user_data["autopost_photo"] = ""
+    else:
+        await safe_send(update, "❌ Отправь фото или `skip`.")
+        return ADMIN_AUTOPOST_PHOTO_WAITING
+
+    await safe_send(update, "🔗 Отправь кнопку в формате: Текст | URL\nИли `skip`.")
+    return ADMIN_AUTOPOST_BUTTON_WAITING
+
+
+async def admin_autopost_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    if raw.lower() == "skip":
+        context.user_data["autopost_button_text"] = ""
+        context.user_data["autopost_button_url"] = ""
+    else:
+        if "|" not in raw:
+            await safe_send(update, "❌ Формат: Текст | URL")
+            return ADMIN_AUTOPOST_BUTTON_WAITING
+        button_text, button_url = [x.strip() for x in raw.split("|", 1)]
+        if not button_text or not button_url.startswith("http"):
+            await safe_send(update, "❌ URL должен начинаться с http/https")
+            return ADMIN_AUTOPOST_BUTTON_WAITING
+        context.user_data["autopost_button_text"] = button_text
+        context.user_data["autopost_button_url"] = button_url
+
+    await safe_send(update, "⏱ Интервал в часах (например 24):")
+    return ADMIN_AUTOPOST_INTERVAL_WAITING
+
+
+async def admin_autopost_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    if not raw.isdigit() or int(raw) <= 0:
+        await safe_send(update, "❌ Укажи целое число часов (1, 6, 24...).")
+        return ADMIN_AUTOPOST_INTERVAL_WAITING
+
+    interval_hours = int(raw)
+    next_send_at = now_iso()
+    text_value = context.user_data.get("autopost_text", "")
+    photo = context.user_data.get("autopost_photo", "")
+    button_text = context.user_data.get("autopost_button_text", "")
+    button_url = context.user_data.get("autopost_button_url", "")
+
+    cursor.execute(
+        """
+        INSERT INTO auto_posts (
+            text_value, photo, button_text, button_url, interval_hours, is_active,
+            last_sent_at, next_send_at, sent_count, created_at, created_by
+        )
+        VALUES (?, ?, ?, ?, ?, 1, NULL, ?, 0, ?, ?)
+        """,
+        (text_value, photo, button_text, button_url, interval_hours, next_send_at, now_iso(), update.effective_user.id),
+    )
+    conn.commit()
+
+    for key in ["autopost_text", "autopost_photo", "autopost_button_text", "autopost_button_url"]:
+        context.user_data.pop(key, None)
+    await safe_send(update, "✅ Авто-рассылка создана и активирована.", reply_markup=admin_keyboard())
+    return ConversationHandler.END
+
+
 async def admin_ref_giveaway_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
@@ -2304,12 +2744,74 @@ async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception:
             failed += 1
 
+    cursor.execute(
+        """
+        INSERT INTO broadcast_logs (kind, post_id, sent, failed, created_at, created_by)
+        VALUES ('manual', NULL, ?, ?, ?, ?)
+        """,
+        (sent, failed, now_iso(), update.effective_user.id),
+    )
+    conn.commit()
+
     await safe_send(
         update,
         f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}",
         reply_markup=admin_keyboard(),
     )
     return ConversationHandler.END
+
+
+async def process_auto_posts(context: ContextTypes.DEFAULT_TYPE):
+    cursor.execute(
+        """
+        SELECT post_id, text_value, photo, button_text, button_url, interval_hours
+        FROM auto_posts
+        WHERE is_active = 1 AND (next_send_at IS NULL OR next_send_at <= ?)
+        ORDER BY post_id ASC
+        """,
+        (now_iso(),),
+    )
+    posts = cursor.fetchall()
+    if not posts:
+        return
+
+    cursor.execute("SELECT user_id FROM users")
+    user_ids = [row[0] for row in cursor.fetchall()]
+    if not user_ids:
+        return
+
+    for post_id, text_value, photo, button_text, button_url, interval_hours in posts:
+        sent = 0
+        failed = 0
+        markup = autopost_button_markup(button_text, button_url)
+
+        for user_id in user_ids:
+            try:
+                if photo:
+                    await context.bot.send_photo(chat_id=user_id, photo=photo, caption=text_value, reply_markup=markup)
+                else:
+                    await context.bot.send_message(chat_id=user_id, text=text_value, reply_markup=markup)
+                sent += 1
+            except Exception:
+                failed += 1
+
+        next_send = (datetime.now() + timedelta(hours=interval_hours)).isoformat()
+        cursor.execute(
+            """
+            UPDATE auto_posts
+            SET last_sent_at = ?, next_send_at = ?, sent_count = sent_count + ?
+            WHERE post_id = ?
+            """,
+            (now_iso(), next_send, sent, post_id),
+        )
+        cursor.execute(
+            """
+            INSERT INTO broadcast_logs (kind, post_id, sent, failed, created_at, created_by)
+            VALUES ('auto', ?, ?, ?, ?, NULL)
+            """,
+            (post_id, sent, failed, now_iso()),
+        )
+        conn.commit()
 
 
 async def admin_baraholki_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3237,6 +3739,38 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    create_giveaway_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🎯 Создать розыгрыш$"), admin_create_giveaway_start)],
+        states={
+            ADMIN_GIVEAWAY_CREATE_TEXT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_create_giveaway_text)],
+            ADMIN_GIVEAWAY_CREATE_PHOTO_WAITING: [
+                MessageHandler(filters.PHOTO, admin_create_giveaway_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_create_giveaway_photo),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    finish_giveaway_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🏁 Завершить розыгрыш$"), admin_finish_giveaway_start)],
+        states={ADMIN_GIVEAWAY_FINISH_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_finish_giveaway_pick)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    autopost_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🤖 Авто-рассылки$"), admin_autopost_start)],
+        states={
+            ADMIN_AUTOPOST_TEXT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_autopost_text)],
+            ADMIN_AUTOPOST_PHOTO_WAITING: [
+                MessageHandler(filters.PHOTO, admin_autopost_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_autopost_photo),
+            ],
+            ADMIN_AUTOPOST_BUTTON_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_autopost_button)],
+            ADMIN_AUTOPOST_INTERVAL_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_autopost_interval)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     app.add_handler(checkout_conv)
     app.add_handler(info_blocks_conv)
     app.add_handler(broadcast_conv)
@@ -3258,6 +3792,9 @@ def main():
     app.add_handler(delete_pickup_conv)
     app.add_handler(reorder_pickup_conv)
     app.add_handler(ref_giveaway_conv)
+    app.add_handler(create_giveaway_conv)
+    app.add_handler(finish_giveaway_conv)
+    app.add_handler(autopost_conv)
 
     app.add_handler(MessageHandler(filters.Regex(r"^🛍 Ассортимент$"), assortment))
     app.add_handler(MessageHandler(filters.Regex(r"^🛒 Корзина$"), show_cart))
@@ -3272,7 +3809,11 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^⚙️ Админка$"), admin_panel))
     app.add_handler(MessageHandler(filters.Regex(r"^📍 Точки самовывоза$"), admin_pickup_panel))
     app.add_handler(MessageHandler(filters.Regex(r"^📊 Статистика$"), admin_stats))
+    app.add_handler(MessageHandler(filters.Regex(r"^📈 Аналитика PRO$"), admin_advanced_stats))
     app.add_handler(MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main))
+
+    if app.job_queue:
+        app.job_queue.run_repeating(process_auto_posts, interval=60, first=20)
 
     app.add_error_handler(error_handler)
 
