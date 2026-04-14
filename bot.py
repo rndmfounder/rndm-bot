@@ -1773,7 +1773,10 @@ def order_type_keyboard() -> InlineKeyboardMarkup:
 
 
 def pickup_points_keyboard() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(name, callback_data=f"pickup_select:{pickup_id}")] for pickup_id, name, _ in get_pickup_points()]
+    rows = [
+        [InlineKeyboardButton(name, callback_data=f"pickup_select:{int(pickup_id)}")]
+        for pickup_id, name, _ in get_pickup_points()
+    ]
     return InlineKeyboardMarkup(rows)
 
 
@@ -1922,6 +1925,17 @@ async def _callback_text_or_dm(context: ContextTypes.DEFAULT_TYPE, query, text: 
             await context.bot.send_message(chat_id=query.from_user.id, text=text, **kwargs)
     except Exception:
         logger.exception("Не удалось отправить ответ по callback (reply/DM)")
+
+
+async def _checkout_reply_after_query(context: ContextTypes.DEFAULT_TYPE, query, text: str, **kwargs):
+    """Ответ в чат после callback; если сообщение с кнопкой недоступно — в личку."""
+    try:
+        if query.message:
+            await query.message.reply_text(text, **kwargs)
+        elif query.from_user:
+            await context.bot.send_message(chat_id=query.from_user.id, text=text, **kwargs)
+    except Exception:
+        logger.exception("Не удалось отправить сообщение шага checkout")
 
 
 async def assortment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2380,7 +2394,7 @@ async def rate_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def begin_checkout(query, context: ContextTypes.DEFAULT_TYPE, buy_now_item_id=None):
     items = collect_checkout_items(query.from_user.id, buy_now_item_id)
     if not items:
-        await query.message.reply_text("🛒 Корзина пустая.")
+        await _checkout_reply_after_query(context, query, "🛒 Корзина пустая.")
         return ConversationHandler.END
 
     clear_order_context(context)
@@ -2396,7 +2410,9 @@ async def begin_checkout(query, context: ContextTypes.DEFAULT_TYPE, buy_now_item
     context.user_data["checkout_total_before_discount"] = total_sum
     context.user_data["checkout_total_after_discount"] = total_sum
 
-    await query.message.reply_text(
+    await _checkout_reply_after_query(
+        context,
+        query,
         f"🧾 ОФОРМЛЕНИЕ ЗАКАЗА\n\n"
         f"Товары:\n{items_text}\n\n"
         f"Итого без скидки: {total_line}\n\n"
@@ -2455,7 +2471,9 @@ async def checkout_skip_promocode(update: Update, context: ContextTypes.DEFAULT_
     context.user_data["checkout_total_before_discount"] = total_sum
     context.user_data["checkout_total_after_discount"] = total_sum
 
-    await query.message.reply_text(
+    await _checkout_reply_after_query(
+        context,
+        query,
         "Ок, продолжаем без промокода.\n\nВыбери тип заказа:",
         reply_markup=order_type_keyboard(),
     )
@@ -2479,7 +2497,7 @@ async def checkout_choose_delivery(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
     context.user_data["checkout_mode"] = "delivery"
-    await query.message.reply_text("1) Ваш телефон в формате +7XXXXXXXXXX")
+    await _checkout_reply_after_query(context, query, "1) Ваш телефон в формате +7XXXXXXXXXX")
     return ORDER_DELIVERY_PHONE_WAITING
 
 
@@ -2561,11 +2579,13 @@ async def checkout_choose_pickup(update: Update, context: ContextTypes.DEFAULT_T
 
     points = get_pickup_points()
     if not points:
-        await query.message.reply_text("❌ Нет доступных точек самовывоза.")
+        await _checkout_reply_after_query(context, query, "❌ Нет доступных точек самовывоза.")
         clear_order_context(context)
         return ConversationHandler.END
 
-    await query.message.reply_text("Выбери точку самовывоза:", reply_markup=pickup_points_keyboard())
+    await _checkout_reply_after_query(
+        context, query, "Выбери точку самовывоза:", reply_markup=pickup_points_keyboard()
+    )
     return ORDER_PICKUP_POINT_WAITING
 
 
@@ -2573,14 +2593,23 @@ async def checkout_pickup_point(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
 
-    pickup_id = int(query.data.split(":", 1)[1])
+    raw = query.data
+    if not isinstance(raw, str):
+        await _checkout_reply_after_query(context, query, "❌ Устаревшая кнопка. Начни оформление заново из корзины.")
+        return ORDER_PICKUP_POINT_WAITING
+    try:
+        pickup_id = int(raw.split(":", 1)[1].strip())
+    except (ValueError, IndexError):
+        await _checkout_reply_after_query(context, query, "❌ Некорректные данные точки. Выбери точку снова.")
+        return ORDER_PICKUP_POINT_WAITING
+
     pickup_point = get_pickup_point(pickup_id)
     if not pickup_point:
-        await query.message.reply_text("❌ Точка не найдена.")
+        await _checkout_reply_after_query(context, query, "❌ Точка не найдена.")
         return ORDER_PICKUP_POINT_WAITING
 
     context.user_data["checkout_pickup_point"] = pickup_point[1]
-    await query.message.reply_text("1) Ваш номер телефона в формате +7XXXXXXXXXX")
+    await _checkout_reply_after_query(context, query, "1) Ваш номер телефона в формате +7XXXXXXXXXX")
     return ORDER_PICKUP_PHONE_WAITING
 
 
@@ -4622,6 +4651,20 @@ ADMIN_CONV_FALLBACKS = [
 ]
 
 
+async def pickup_select_stale_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Если checkout не обработал pickup_select (нет сессии) — отвечаем на callback, иначе крутится загрузка."""
+    query = update.callback_query
+    if not query:
+        return
+    try:
+        await query.answer(
+            "Сессия оформления сброшена. Открой 🛒 Корзина → Оформить заказ снова.",
+            show_alert=True,
+        )
+    except Exception:
+        logger.exception("pickup_select_stale_fallback: answer")
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if USE_POSTGRES:
         try:
@@ -4677,6 +4720,8 @@ def main():
             ORDER_PICKUP_USERNAME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_pickup_username)],
         },
         fallbacks=[*ADMIN_CONV_FALLBACKS, MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main)],
+        per_chat=False,
+        per_user=True,
     )
 
     broadcast_conv = ConversationHandler(
@@ -4916,6 +4961,7 @@ def main():
     )
 
     app.add_handler(checkout_conv)
+    app.add_handler(CallbackQueryHandler(pickup_select_stale_fallback, pattern=r"^pickup_select:\d+$"))
     app.add_handler(info_blocks_conv)
     app.add_handler(broadcast_conv)
     app.add_handler(baraholki_conv)
