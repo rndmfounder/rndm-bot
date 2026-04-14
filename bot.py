@@ -187,16 +187,24 @@ if USE_POSTGRES:
 
 
 class DBCursor:
-    def __init__(self, raw_cursor, use_postgres: bool):
+    def __init__(self, raw_cursor, use_postgres: bool, connection):
         self.raw_cursor = raw_cursor
         self.use_postgres = use_postgres
+        self.connection = connection
 
     def execute(self, query: str, params: tuple | list | None = None):
         sql = query.replace("?", "%s") if self.use_postgres else query
-        if params is None:
-            self.raw_cursor.execute(sql)
-        else:
-            self.raw_cursor.execute(sql, params)
+        try:
+            if params is None:
+                self.raw_cursor.execute(sql)
+            else:
+                self.raw_cursor.execute(sql, params)
+        except Exception:
+            # Для PostgreSQL откатываем текущую транзакцию, иначе соединение
+            # остаётся в aborted-состоянии и следующие запросы "зависают"/падают.
+            if self.use_postgres:
+                self.connection.rollback()
+            raise
         return self
 
     def fetchone(self):
@@ -212,12 +220,13 @@ class DBCursor:
 
 if USE_POSTGRES:
     conn = psycopg.connect(DATABASE_URL)
-    conn.autocommit = False
-    cursor = DBCursor(conn.cursor(), use_postgres=True)
+    # Автокоммит снижает риск зависания сценариев при единичных ошибках запросов.
+    conn.autocommit = True
+    cursor = DBCursor(conn.cursor(), use_postgres=True, connection=conn)
     logger.info("Подключение к PostgreSQL активно")
 else:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    cursor = DBCursor(conn.cursor(), use_postgres=False)
+    cursor = DBCursor(conn.cursor(), use_postgres=False, connection=conn)
     logger.info("Используется SQLite база: %s", DB_PATH)
 
 
@@ -3005,11 +3014,16 @@ async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if USE_POSTGRES:
+        try:
+            conn.rollback()
+        except Exception:
+            logger.exception("Не удалось откатить транзакцию PostgreSQL после ошибки")
     logger.exception("Ошибка в обработке апдейта:", exc_info=context.error)
 
 
 def main():
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).concurrent_updates(False).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("check", check_code))
