@@ -38,7 +38,8 @@ DEFAULT_MANAGER_URL = f"tg://user?id={MANAGER_USER_ID}"
 # ВАЖНО: замени на реальный chat_id группы менеджеров
 ORDER_GROUP_ID = int(os.getenv("ORDER_GROUP_ID", "-1003913158040"))
 
-# Для Railway лучше указывать путь на volume, например: /data/rndm.db
+# SQLite в каталоге контейнера без постоянного диска = после каждого деплоя НОВАЯ пустая база
+# (весь каталог, настройки, ссылки, file_id фото). Прод: DATABASE_URL (Postgres) или volume + SQLITE_PATH.
 DB_PATH = os.getenv("SQLITE_PATH", "rndm.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
@@ -47,10 +48,20 @@ DEFAULT_PROJECTS_URL = "https://t.me/your_channel/2"
 DEFAULT_GIVEAWAYS_URL = "https://t.me/your_channel/3"
 DEFAULT_VK_URL = "https://vk.ru/rndm196"
 
+# Дефолты для *первого* запуска (пустая БД). После деплоя без сохранённой БД снова подтянутся отсюда.
+# Стабильное фото: задай WELCOME_PHOTO_URL (https://…) в переменных окружения на сервере.
 DEFAULT_WELCOME_CAPTION = (
-    "🔥 Добро пожаловать в RNDM SHOP!\n\n"
-    "Здесь ты найдёшь жидкости, одноразки и устройства.\n"
-    "Используй кнопки меню ниже для навигации 👇"
+    "🔥 Добро пожаловать в RNDM SHOP\n\n"
+    "Мы на рынке уже более года и собрали 1000+ отзывов от наших клиентов 💬\n\n"
+    "У нас ты найдёшь:\n"
+    "💨 одноразки\n"
+    "🧪 жидкости\n"
+    "⚡ pod-системы\n"
+    "⚙️ расходники и многое другое\n\n"
+    "💸 по доступным ценам и с быстрым оформлением\n\n"
+    "🚚 Доставка по Екатеринбургу\n"
+    "⌚ Работаем 24/7\n\n"
+    "👇 Используй кнопки ниже для навигации"
 )
 
 CATEGORY_ORDER = [
@@ -244,10 +255,20 @@ if USE_POSTGRES:
     conn.autocommit = True
     cursor = DBCursor(conn.cursor(), use_postgres=True, connection=conn)
     logger.info("Подключение к PostgreSQL активно")
+    logger.info(
+        "Данные в PostgreSQL не в образе бота. Если после деплоя всё обнуляется — "
+        "проверь, что DATABASE_URL один и тот же и это не одноразовый/ephemeral Postgres."
+    )
 else:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     cursor = DBCursor(conn.cursor(), use_postgres=False, connection=conn)
-    logger.info("Используется SQLite база: %s", DB_PATH)
+    _db_abs = os.path.abspath(DB_PATH)
+    logger.info("Используется SQLite: %s", _db_abs)
+    logger.warning(
+        "БД: SQLite на диске приложения. При деплое на Railway/Fly и т.п. без постоянного тома "
+        "файл базы каждый раз новый — пропадают товары, фото, ссылки, пользователи, заказы. "
+        "Для продакшена: задай DATABASE_URL (Postgres плагин) ИЛИ Railway Volume + SQLITE_PATH вроде /data/rndm.db"
+    )
 
 
 def now_iso() -> str:
@@ -681,6 +702,12 @@ def get_setting(key: str, default: str = "") -> str:
     return row[0] if row else default
 
 
+def is_valid_inline_button_url(url: str) -> bool:
+    """Telegram принимает для url-кнопок только http(s) и tg://."""
+    u = (url or "").strip()
+    return u.startswith(("http://", "https://", "tg://"))
+
+
 def category_image_setting_key(category_key: str) -> str:
     return f"category_image:{category_key}"
 
@@ -776,12 +803,12 @@ def get_info_block_url(block_key: str) -> str:
 
 
 def get_info_block_reply_markup(block_key: str):
-    url = get_info_block_url(block_key)
-    if not url:
+    url = get_info_block_url(block_key).strip()
+    if not is_valid_inline_button_url(url):
         return None
 
     button_label = INFO_BLOCK_BUTTON_LABELS.get(block_key, "🔗 Открыть")
-    return InlineKeyboardMarkup([[InlineKeyboardButton(button_label, url=url)]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton(button_label, url=url[:2000])]])
 
 
 async def show_info_block_message(target_message, block_key: str):
@@ -847,9 +874,12 @@ for block_key, default_text in INFO_BLOCK_DEFAULTS.items():
 if not get_setting("welcome_caption"):
     set_setting("welcome_caption", DEFAULT_WELCOME_CAPTION)
 if not get_setting("welcome_photo"):
-    set_setting("welcome_photo", "")
+    _welcome_photo_default = os.getenv("WELCOME_PHOTO_URL", "").strip()
+    set_setting("welcome_photo", _welcome_photo_default)
 if not get_setting("welcome_buttons_json"):
-    set_setting("welcome_buttons_json", "[]")
+    _reviews_url = os.getenv("WELCOME_REVIEWS_URL", "").strip() or get_setting("vk_url", DEFAULT_VK_URL)
+    _default_btns = [{"text": "💜Наши отзывы", "url": _reviews_url}]
+    set_setting("welcome_buttons_json", json.dumps(_default_btns, ensure_ascii=False))
 
 
 def get_welcome_caption() -> str:
@@ -896,9 +926,7 @@ def build_welcome_inline_keyboard() -> InlineKeyboardMarkup | None:
             url = (item.get("url") or "").strip()
         else:
             continue
-        if not text or not url:
-            continue
-        if not (url.startswith("http://") or url.startswith("https://") or url.startswith("tg://")):
+        if not text or not is_valid_inline_button_url(url):
             continue
         keyboard.append([InlineKeyboardButton(text[:64], url=url[:2000])])
     return InlineKeyboardMarkup(keyboard) if keyboard else None
@@ -923,8 +951,12 @@ async def send_welcome_screen(target_message, user_id: int) -> None:
     try:
         await welcome_msg.reply_text("\u2060", reply_markup=kb)
     except Exception:
-        logger.exception("Ошибка установки главной клавиатуры")
-        await target_message.reply_text("\u2060", reply_markup=kb)
+        logger.exception("Ошибка установки главной клавиатуры (невидимый текст)")
+        try:
+            await welcome_msg.reply_text("⌨️ Главное меню", reply_markup=kb)
+        except Exception:
+            logger.exception("Ошибка установки главной клавиатуры (запасной текст)")
+            await target_message.reply_text("⌨️ Главное меню", reply_markup=kb)
 
 
 def save_user(user) -> bool:
@@ -1065,9 +1097,11 @@ def track_giveaway_referral_if_active(inviter_id: int, invited_id: int) -> None:
 
 
 def autopost_button_markup(button_text: str, button_url: str):
-    if not button_text or not button_url:
+    text = (button_text or "").strip()
+    url = (button_url or "").strip()
+    if not text or not is_valid_inline_button_url(url):
         return None
-    return InlineKeyboardMarkup([[InlineKeyboardButton(button_text, url=button_url)]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton(text[:64], url=url[:2000])]])
 
 
 def log_action(user_id: int | None, action_type: str, payload: str = "") -> None:
@@ -1510,9 +1544,9 @@ def cart_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 
 def manager_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("💬 Написать менеджеру", url=get_setting("manager_url", DEFAULT_MANAGER_URL))]]
-    )
+    configured = get_setting("manager_url", DEFAULT_MANAGER_URL).strip()
+    url = configured if is_valid_inline_button_url(configured) else DEFAULT_MANAGER_URL
+    return InlineKeyboardMarkup([[InlineKeyboardButton("💬 Написать менеджеру", url=url)]])
 
 
 def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
@@ -1774,6 +1808,9 @@ async def assortment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_item(query, item_id: int):
+    if not query.message:
+        logger.warning("show_item: callback без message (item_id=%s)", item_id)
+        return
     item = get_item(item_id)
     if not item:
         await query.message.reply_text("❌ Позиция не найдена.")
@@ -1817,6 +1854,14 @@ async def open_cart_message(target_message, user_id: int):
         parse_mode="Markdown",
         reply_markup=cart_keyboard(user_id),
     )
+
+
+async def _callback_text_or_dm(context: ContextTypes.DEFAULT_TYPE, query, text: str, **kwargs):
+    """Если сообщение с кнопкой удалено — пишем в личку, иначе ответом в чат."""
+    if query.message:
+        await query.message.reply_text(text, **kwargs)
+    elif query.from_user:
+        await context.bot.send_message(chat_id=query.from_user.id, text=text, **kwargs)
 
 
 async def assortment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1867,8 +1912,24 @@ async def assortment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if query.data.startswith("add_to_cart:"):
         item_id = int(query.data.split(":", 1)[1])
-        add_to_cart(user.id, item_id)
-        await query.message.reply_text("✅ Товар добавлен в корзину.")
+        if not get_item(item_id):
+            await _callback_text_or_dm(
+                context,
+                query,
+                "❌ Этой позиции нет в каталоге (после обновления базы открой ассортимент заново из меню 🛍).",
+            )
+            return
+        try:
+            add_to_cart(user.id, item_id)
+        except Exception:
+            logger.exception("Ошибка add_to_cart user=%s item=%s", user.id, item_id)
+            await _callback_text_or_dm(
+                context,
+                query,
+                "❌ Не удалось сохранить корзину. Попробуй ещё раз или напиши менеджеру.",
+            )
+            return
+        await _callback_text_or_dm(context, query, "✅ Товар добавлен в корзину.")
         return
 
 
@@ -3128,8 +3189,8 @@ async def admin_autopost_button(update: Update, context: ContextTypes.DEFAULT_TY
             await safe_send(update, "❌ Формат: Текст | URL")
             return ADMIN_AUTOPOST_BUTTON_WAITING
         button_text, button_url = [x.strip() for x in raw.split("|", 1)]
-        if not button_text or not button_url.startswith("http"):
-            await safe_send(update, "❌ URL должен начинаться с http/https")
+        if not button_text or not is_valid_inline_button_url(button_url):
+            await safe_send(update, "❌ URL должен начинаться с http://, https:// или tg://")
             return ADMIN_AUTOPOST_BUTTON_WAITING
         context.user_data["autopost_button_text"] = button_text
         context.user_data["autopost_button_url"] = button_url
@@ -4470,7 +4531,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main():
     app = Application.builder().token(TOKEN).concurrent_updates(False).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("check", check_code))
     app.add_handler(CommandHandler("use", use_code))
@@ -4814,7 +4874,16 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    print("RNDM SHOP bot запущен...")
+    # В логах Railway «верх» часто обрезан — дублируем режим БД рядом с финальным сообщением.
+    if USE_POSTGRES:
+        logger.info("Старт бота: режим БД = PostgreSQL")
+        print("Старт бота: режим БД = PostgreSQL", flush=True)
+    else:
+        _p = os.path.abspath(DB_PATH)
+        logger.warning("Старт бота: режим БД = SQLite (%s)", _p)
+        print(f"Старт бота: режим БД = SQLite ({_p})", flush=True)
+
+    print("RNDM SHOP bot запущен...", flush=True)
     app.run_polling(poll_interval=1, timeout=10, drop_pending_updates=True)
 
 
