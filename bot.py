@@ -1467,6 +1467,7 @@ def admin_broadcast_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["📢 Рассылка", "🤖 Авто-рассылки"],
+            ["📋 Активные авто-рассылки"],
             ["↩️ Админка"],
         ],
         resize_keyboard=True,
@@ -3035,8 +3036,143 @@ async def admin_autopost_interval(update: Update, context: ContextTypes.DEFAULT_
 
     for key in ["autopost_text", "autopost_photo", "autopost_button_text", "autopost_button_url"]:
         context.user_data.pop(key, None)
-    await safe_send(update, "✅ Авто-рассылка создана и активирована.", reply_markup=admin_keyboard())
+    await safe_send(update, "✅ Авто-рассылка создана и активирована.", reply_markup=admin_broadcast_keyboard())
     return ConversationHandler.END
+
+
+def _build_autopost_card_text(row) -> str:
+    post_id, text_value, photo, interval_hours, is_active, next_send_at, last_sent_at, sent_count = row
+    preview = (text_value or "").replace("\n", " ").strip()
+    if len(preview) > 100:
+        preview = preview[:100] + "…"
+    status = "▶ Активна" if is_active else "⏸ На паузе"
+    photo_mark = "🖼 фото" if photo else "📄 только текст"
+    return (
+        f"📌 Пост #{post_id} ({photo_mark})\n"
+        f"Статус: {status}\n"
+        f"Интервал: {interval_hours} ч.\n"
+        f"Циклов отправки: {sent_count}\n"
+        f"Следующая: {next_send_at or '—'}\n"
+        f"Последняя: {last_sent_at or '—'}\n"
+        f"Текст: {preview or '—'}"
+    )
+
+
+def _autopost_card_markup(post_id: int, is_active: int) -> InlineKeyboardMarkup:
+    if is_active:
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("⏸ Пауза", callback_data=f"autopost_pause:{post_id}"),
+                    InlineKeyboardButton("🗑 Удалить", callback_data=f"autopost_delete:{post_id}"),
+                ],
+            ]
+        )
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("▶ Возобновить", callback_data=f"autopost_resume:{post_id}"),
+                InlineKeyboardButton("🗑 Удалить", callback_data=f"autopost_delete:{post_id}"),
+            ],
+        ]
+    )
+
+
+def _fetch_autopost_row(post_id: int):
+    cursor.execute(
+        """
+        SELECT post_id, text_value, photo, interval_hours, is_active, next_send_at, last_sent_at, sent_count
+        FROM auto_posts
+        WHERE post_id = ?
+        """,
+        (post_id,),
+    )
+    return cursor.fetchone()
+
+
+async def admin_autopost_list_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    if not update.message:
+        return ConversationHandler.END
+
+    cursor.execute(
+        """
+        SELECT post_id, text_value, photo, interval_hours, is_active, next_send_at, last_sent_at, sent_count
+        FROM auto_posts
+        ORDER BY post_id DESC
+        """
+    )
+    rows = cursor.fetchall()
+    if not rows:
+        await safe_send(update, "📋 Авто-рассылок пока нет.", reply_markup=admin_broadcast_keyboard())
+        return ConversationHandler.END
+
+    await safe_send(update, f"📋 Всего автопостов: {len(rows)}", reply_markup=admin_broadcast_keyboard())
+
+    for row in rows:
+        text = _build_autopost_card_text(row)
+        markup = _autopost_card_markup(row[0], row[4])
+        await update.message.reply_text(text, reply_markup=markup)
+
+    return ConversationHandler.END
+
+
+async def autopost_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    await query.answer()
+
+    parts = query.data.split(":")
+    if len(parts) != 2:
+        return
+    action, pid_raw = parts[0], parts[1]
+    if not pid_raw.isdigit():
+        return
+    post_id = int(pid_raw)
+
+    if action == "autopost_pause":
+        cursor.execute("UPDATE auto_posts SET is_active = 0 WHERE post_id = ?", (post_id,))
+        conn.commit()
+        log_action(query.from_user.id, "autopost_pause", f"post_id={post_id}")
+    elif action == "autopost_resume":
+        cursor.execute(
+            "UPDATE auto_posts SET is_active = 1, next_send_at = COALESCE(next_send_at, ?) WHERE post_id = ?",
+            (now_iso(), post_id),
+        )
+        conn.commit()
+        log_action(query.from_user.id, "autopost_resume", f"post_id={post_id}")
+    elif action == "autopost_delete":
+        cursor.execute("DELETE FROM auto_posts WHERE post_id = ?", (post_id,))
+        conn.commit()
+        log_action(query.from_user.id, "autopost_delete", f"post_id={post_id}")
+        try:
+            await query.edit_message_text(f"🗑 Пост #{post_id} удалён.")
+        except Exception:
+            logger.exception("Не удалось обновить сообщение после удаления автопоста")
+        return
+    else:
+        return
+
+    row = _fetch_autopost_row(post_id)
+    if not row:
+        try:
+            await query.edit_message_text("❌ Пост не найден (возможно удалён).")
+        except Exception:
+            pass
+        return
+
+    try:
+        await query.edit_message_text(
+            _build_autopost_card_text(row),
+            reply_markup=_autopost_card_markup(row[0], row[4]),
+        )
+    except Exception:
+        logger.exception("Не удалось обновить карточку автопоста post_id=%s", post_id)
 
 
 async def admin_ref_giveaway_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3972,6 +4108,7 @@ def main():
     )
     app.add_handler(CallbackQueryHandler(order_status_callback, pattern=r"^order_status:\d+:[a-z_]+$"))
     app.add_handler(CallbackQueryHandler(order_rate_callback, pattern=r"^order_rate:\d+:\d+$"))
+    app.add_handler(CallbackQueryHandler(autopost_manage_callback, pattern=r"^autopost_(pause|resume|delete):\d+$"))
 
     checkout_conv = ConversationHandler(
         entry_points=[
@@ -4189,6 +4326,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    autopost_list_fallback = MessageHandler(filters.Regex(r"^📋 Активные авто-рассылки$"), admin_autopost_list_screen)
     autopost_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🤖 Авто-рассылки$"), admin_autopost_start)],
         states={
@@ -4200,7 +4338,7 @@ def main():
             ADMIN_AUTOPOST_BUTTON_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_autopost_button)],
             ADMIN_AUTOPOST_INTERVAL_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_autopost_interval)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), autopost_list_fallback],
     )
 
     blacklist_conv = ConversationHandler(
@@ -4256,6 +4394,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^↩️ Админка$"), admin_panel))
     app.add_handler(MessageHandler(filters.Regex(r"^🛍 Редактор каталога$"), admin_open_catalog))
     app.add_handler(MessageHandler(filters.Regex(r"^📣 Рассылки$"), admin_open_broadcasts))
+    app.add_handler(MessageHandler(filters.Regex(r"^📋 Активные авто-рассылки$"), admin_autopost_list_screen))
     app.add_handler(MessageHandler(filters.Regex(r"^🎁 Розыгрыши \(админ\)$"), admin_open_giveaways))
     app.add_handler(MessageHandler(filters.Regex(r"^👥 Клиенты$"), admin_open_clients))
     app.add_handler(MessageHandler(filters.Regex(r"^🔗 Ссылки и инфо$"), admin_open_links))
