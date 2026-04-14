@@ -1,4 +1,4 @@
-шь?шь?import os
+import os
 import re
 import random
 import sqlite3
@@ -2631,8 +2631,10 @@ async def admin_set_category_photo_image(update: Update, context: ContextTypes.D
     await safe_send(
         update,
         f"✅ Фото для категории {CATEGORY_LABELS[category_key]} обновлено.",
-        reply_markup=admin_keyboard(),
     )
+    await safe_send(update, "Предпросмотр категории:")
+    await open_category_view(update.message, category_key)
+    await safe_send(update, "Возвращаю в админку.", reply_markup=admin_keyboard())
     return ConversationHandler.END
 
 
