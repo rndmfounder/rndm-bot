@@ -2628,6 +2628,19 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def admin_submenu_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выход из вложенного админ-сценария по «↩️/⤴️ Админка» или «⚙️ Админка»."""
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    await safe_send(
+        update,
+        "⚙️ *Админка*\n\nВыбери раздел управления.",
+        parse_mode="Markdown",
+        reply_markup=admin_keyboard(),
+    )
+    return ConversationHandler.END
+
+
 async def admin_open_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(update.effective_user.id):
         await safe_send(update, "🛍 Раздел: редактор каталога", reply_markup=admin_catalog_keyboard())
@@ -4136,13 +4149,18 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main)],
     )
 
+    admin_root_nav_fallback = MessageHandler(
+        filters.Regex(r"^(↩️|⤴️) Админка$|^⚙️ Админка$"),
+        admin_submenu_back,
+    )
+
     broadcast_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^📢 Рассылка$"), admin_broadcast_start)],
         states={ADMIN_BROADCAST_WAITING: [
             MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_send),
             MessageHandler(filters.PHOTO, admin_broadcast_send),
         ]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), admin_root_nav_fallback],
     )
 
     baraholki_conv = ConversationHandler(
@@ -4338,19 +4356,19 @@ def main():
             ADMIN_AUTOPOST_BUTTON_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_autopost_button)],
             ADMIN_AUTOPOST_INTERVAL_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_autopost_interval)],
         },
-        fallbacks=[CommandHandler("cancel", cancel), autopost_list_fallback],
+        fallbacks=[CommandHandler("cancel", cancel), autopost_list_fallback, admin_root_nav_fallback],
     )
 
     blacklist_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🚫 Черный список$"), admin_blacklist_start)],
         states={ADMIN_BLACKLIST_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_blacklist_manage)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), admin_root_nav_fallback],
     )
 
     category_discount_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🏷 Акции категорий$"), admin_category_discount_start)],
         states={ADMIN_CATEGORY_DISCOUNT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_category_discount_save)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), admin_root_nav_fallback],
     )
 
     app.add_handler(checkout_conv)
