@@ -174,8 +174,11 @@ ADMIN_INFO_BLOCK_TEXT_WAITING = next(_state)
 ADMIN_INFO_BLOCK_PHOTO_WAITING = next(_state)
 ADMIN_REF_GIVEAWAY_WAITING = next(_state)
 ADMIN_GIVEAWAY_CREATE_TEXT_WAITING = next(_state)
-ADMIN_GIVEAWAY_CREATE_PHOTO_WAITING = next(_state)
+ADMIN_GIVEAWAY_CREATE_DESC_WAITING = next(_state)
+ADMIN_GIVEAWAY_CREATE_IMAGE_WAITING = next(_state)
+ADMIN_GIVEAWAY_CREATE_BUTTONS_WAITING = next(_state)
 ADMIN_GIVEAWAY_FINISH_WAITING = next(_state)
+ADMIN_GIVEAWAY_AUTOBROADCAST_PER_DAY_WAITING = next(_state)
 ADMIN_AUTOPOST_TEXT_WAITING = next(_state)
 ADMIN_AUTOPOST_PHOTO_WAITING = next(_state)
 ADMIN_AUTOPOST_BUTTON_WAITING = next(_state)
@@ -757,6 +760,16 @@ def init_database() -> None:
 
 init_database()
 
+ensure_column("giveaways", "buttons_json", "TEXT NOT NULL DEFAULT '[]'")
+ensure_column("giveaways", "results_broadcast_at", "TEXT")
+ensure_column("giveaways", "autobroadcast_enabled", "INTEGER NOT NULL DEFAULT 0")
+ensure_column("giveaways", "autobroadcast_per_day", "INTEGER NOT NULL DEFAULT 2")
+ensure_column("giveaways", "autobroadcast_last_at", "TEXT")
+
+GIVEAWAY_AUTOBROADCAST_MIN_PER_DAY = 1
+GIVEAWAY_AUTOBROADCAST_MAX_PER_DAY = 48
+GIVEAWAY_AUTOBROADCAST_DEFAULT_PER_DAY = 2
+
 
 def set_setting(key: str, value: str) -> None:
     cursor.execute(
@@ -1115,14 +1128,126 @@ def get_referral_top(limit: int = 20):
 def get_active_giveaway():
     cursor.execute(
         """
-        SELECT giveaway_id, title, text_value, photo, created_at
+        SELECT
+            giveaway_id,
+            title,
+            text_value,
+            photo,
+            created_at,
+            COALESCE(buttons_json, '[]') AS buttons_json,
+            COALESCE(autobroadcast_enabled, 0) AS autobroadcast_enabled,
+            COALESCE(autobroadcast_per_day, ?) AS autobroadcast_per_day,
+            autobroadcast_last_at
         FROM giveaways
         WHERE is_active = 1
         ORDER BY giveaway_id DESC
         LIMIT 1
-        """
+        """,
+        (GIVEAWAY_AUTOBROADCAST_DEFAULT_PER_DAY,),
     )
     return cursor.fetchone()
+
+
+def get_giveaway_by_id(giveaway_id: int):
+    cursor.execute(
+        """
+        SELECT giveaway_id, title, text_value, photo, finished_at, COALESCE(buttons_json, '[]'), results_broadcast_at
+        FROM giveaways
+        WHERE giveaway_id = ?
+        """,
+        (giveaway_id,),
+    )
+    return cursor.fetchone()
+
+
+def get_broadcast_recipient_user_ids() -> list[int]:
+    cursor.execute(
+        """
+        SELECT u.user_id FROM users u
+        WHERE NOT EXISTS (SELECT 1 FROM blacklist b WHERE b.user_id = u.user_id)
+        """
+    )
+    return [row[0] for row in cursor.fetchall()]
+
+
+def giveaway_buttons_markup_from_json(buttons_json_raw: str | None) -> InlineKeyboardMarkup | None:
+    raw = (buttons_json_raw or "").strip() or "[]"
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list):
+        return None
+    rows = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        text = (item.get("text") or "").strip()
+        url = (item.get("url") or "").strip()
+        if not text or not is_valid_inline_button_url(url):
+            continue
+        rows.append([InlineKeyboardButton(text[:64], url=url[:2000])])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def parse_giveaway_buttons_lines(body: str) -> tuple[list[dict] | None, list[str]]:
+    raw_lines = body.splitlines()
+    parsed: list[dict] = []
+    errors: list[str] = []
+    for i, line in enumerate(raw_lines, 1):
+        line = line.strip()
+        if not line:
+            continue
+        if "|" not in line:
+            errors.append(f"Строка {i}: нет разделителя |")
+            continue
+        left, right = line.split("|", 1)
+        btn_text = left.strip()
+        url = right.strip()
+        if not btn_text or not url:
+            errors.append(f"Строка {i}: пустой текст или ссылка")
+            continue
+        if not is_valid_inline_button_url(url):
+            errors.append(f"Строка {i}: URL должен начинаться с http://, https:// или tg://")
+            continue
+        parsed.append({"text": btn_text, "url": url})
+    return parsed, errors
+
+
+def get_giveaway_winners_rows(giveaway_id: int):
+    cursor.execute(
+        """
+        SELECT gw.winner_id, gw.invites_count, COALESCE(u.username, ''), COALESCE(u.first_name, '')
+        FROM giveaway_winners gw
+        LEFT JOIN users u ON u.user_id = gw.winner_id
+        WHERE gw.giveaway_id = ?
+        ORDER BY gw.invites_count DESC, gw.winner_id ASC
+        """,
+        (giveaway_id,),
+    )
+    return cursor.fetchall()
+
+
+def build_giveaway_results_caption(giveaway_id: int) -> str | None:
+    row = get_giveaway_by_id(giveaway_id)
+    if not row:
+        return None
+    _, title, _, _, _, _, _ = row
+    winners = get_giveaway_winners_rows(giveaway_id)
+    lines = [
+        f"🏁 Итоги розыгрыша: {title}",
+        "",
+        "Победители:",
+    ]
+    if not winners:
+        lines.append("— список пуст")
+    else:
+        for winner_id, invites_count, username, first_name in winners:
+            uname = f"@{username}" if username else "—"
+            who = first_name or "—"
+            lines.append(f"• {who} ({uname}) — ID {winner_id}, приглашений: {invites_count}")
+    lines.extend(["", "Спасибо всем за участие! 💜"])
+    return "\n".join(lines)
 
 
 def get_giveaway_top(giveaway_id: int, limit: int = 20):
@@ -1216,6 +1341,35 @@ def build_ref_link(bot_username: str, user_id: int) -> str:
     if not bot_username:
         return ""
     return f"https://t.me/{bot_username}?start={user_id}"
+
+
+def build_giveaway_announce_caption(
+    bot_username: str, user_id: int, giveaway_id: int, title: str, text_value: str
+) -> str:
+    ref_link = build_ref_link(bot_username, user_id)
+    my_count = get_giveaway_referrals_count(giveaway_id, user_id)
+    return (
+        f"🎁 *{title}*\n\n"
+        f"{text_value}\n\n"
+        f"Твои приглашения в этом розыгрыше: *{my_count}*\n"
+        f"Твоя ссылка для участия:\n`{ref_link}`"
+    )
+
+
+def giveaway_autobroadcast_interval_seconds(per_day: int) -> float:
+    n = max(GIVEAWAY_AUTOBROADCAST_MIN_PER_DAY, min(int(per_day or GIVEAWAY_AUTOBROADCAST_DEFAULT_PER_DAY), GIVEAWAY_AUTOBROADCAST_MAX_PER_DAY))
+    return 86400.0 / n
+
+
+def format_giveaway_autobroadcast_interval_ru(per_day: int) -> str:
+    sec = giveaway_autobroadcast_interval_seconds(per_day)
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    if h and m:
+        return f"~{h} ч {m} мин"
+    if h:
+        return f"~{h} ч"
+    return f"~{m} мин"
 
 
 def my_referrals_keyboard() -> ReplyKeyboardMarkup:
@@ -1707,8 +1861,22 @@ def admin_giveaways_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["🎯 Создать розыгрыш", "🏁 Завершить розыгрыш"],
+            ["📣 Авторассылка анонса"],
             ["🎁 Реф. розыгрыш"],
             ["↩️ Админка"],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def admin_giveaway_autobroadcast_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["▶️ Включить авторассылку", "⏹ Выключить авторассылку"],
+            ["⚙ Раз в сутки"],
+            ["📤 Разослать анонс сейчас (1 раз)"],
+            ["📊 Статус авторассылки"],
+            ["↩️ К розыгрышам"],
         ],
         resize_keyboard=True,
     )
@@ -2836,23 +3004,21 @@ async def giveaways(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await open_info_block(update, "giveaways")
         return
 
-    giveaway_id, title, text_value, photo, _ = active
-    ref_link = build_ref_link(context.bot.username, update.effective_user.id)
-    my_count = get_giveaway_referrals_count(giveaway_id, update.effective_user.id)
-    text = (
-        f"🎁 *{title}*\n\n"
-        f"{text_value}\n\n"
-        f"Твои приглашения в этом розыгрыше: *{my_count}*\n"
-        f"Твоя ссылка для участия:\n`{ref_link}`"
+    giveaway_id, title, text_value, photo, _, buttons_json, _, _, _ = active
+    text = build_giveaway_announce_caption(
+        context.bot.username or "", update.effective_user.id, giveaway_id, title, text_value
     )
+    markup = giveaway_buttons_markup_from_json(buttons_json)
     if update.message:
         if photo:
             try:
-                await update.message.reply_photo(photo=photo, caption=text, parse_mode="Markdown")
+                await update.message.reply_photo(
+                    photo=photo, caption=text, parse_mode="Markdown", reply_markup=markup
+                )
                 return
             except Exception:
                 logger.exception("Ошибка отправки фото активного розыгрыша")
-        await update.message.reply_text(text, parse_mode="Markdown")
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
 
 
 async def manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2999,6 +3165,158 @@ async def admin_open_broadcasts(update: Update, context: ContextTypes.DEFAULT_TY
 async def admin_open_giveaways(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(update.effective_user.id):
         await safe_send(update, "🎁 Раздел: розыгрыши", reply_markup=admin_giveaways_keyboard())
+
+
+def _giveaway_autobroadcast_status_lines(active: tuple | None) -> list[str]:
+    if not active:
+        return ["❌ Нет активного розыгрыша — авторассылка недоступна."]
+    gid, title, _, _, _, _, en, per_day, last_at = active
+    per_day = max(
+        GIVEAWAY_AUTOBROADCAST_MIN_PER_DAY,
+        min(int(per_day or GIVEAWAY_AUTOBROADCAST_DEFAULT_PER_DAY), GIVEAWAY_AUTOBROADCAST_MAX_PER_DAY),
+    )
+    interval_hr = format_giveaway_autobroadcast_interval_ru(per_day)
+    lines = [
+        f"🎁 Активный розыгрыш: *{title}* (ID `{gid}`)",
+        f"📣 Авторассылка: *{'включена' if en else 'выключена'}*",
+        f"📅 Частота: *{per_day}* раз в сутки (интервал {interval_hr})",
+        "Текст и кнопки — как у пользователя в «🎁 Розыгрыши» (у каждого своя ссылка и счётчик).",
+    ]
+    if last_at:
+        lines.append(f"🕐 Последний автозапуск: `{last_at}`")
+    else:
+        lines.append("🕐 Последний автозапуск: ещё не было")
+    return lines
+
+
+async def admin_giveaway_autobroadcast_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    active = get_active_giveaway()
+    intro = (
+        "📣 *Авторассылка анонса розыгрыша*\n\n"
+        "Бот периодически рассылает **тот же пост**, что пользователь видит по кнопке «🎁 Розыгрыши» "
+        "(описание, фото, кнопки, персональная реферальная ссылка и число приглашений).\n\n"
+        "Получатели — все клиенты из базы, кроме чёрного списка.\n\n"
+        "Кнопка «📤 Разослать анонс сейчас» шлёт тот же пост *один раз сразу*, без ожидания таймера.\n"
+    )
+    body = "\n".join(_giveaway_autobroadcast_status_lines(active))
+    await safe_send(
+        update,
+        intro + "\n" + body,
+        parse_mode="Markdown",
+        reply_markup=admin_giveaway_autobroadcast_keyboard(),
+    )
+
+
+async def admin_giveaway_autobroadcast_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    active = get_active_giveaway()
+    if not active:
+        await safe_send(update, "❌ Нет активного розыгрыша.", reply_markup=admin_giveaways_keyboard())
+        return
+    gid = active[0]
+    cursor.execute(
+        """
+        UPDATE giveaways
+        SET autobroadcast_enabled = 1, autobroadcast_last_at = NULL
+        WHERE giveaway_id = ? AND is_active = 1
+        """,
+        (gid,),
+    )
+    conn.commit()
+    log_action(update.effective_user.id, "giveaway_autobroadcast_enable", f"giveaway_id={gid}")
+    await safe_send(
+        update,
+        "✅ Авторассылка включена. Первая рассылка — при ближайшей проверке (до ~1 мин), дальше по интервалу.",
+        reply_markup=admin_giveaway_autobroadcast_keyboard(),
+    )
+
+
+async def admin_giveaway_autobroadcast_disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    active = get_active_giveaway()
+    if not active:
+        await safe_send(update, "❌ Нет активного розыгрыша.", reply_markup=admin_giveaways_keyboard())
+        return
+    gid = active[0]
+    cursor.execute(
+        "UPDATE giveaways SET autobroadcast_enabled = 0 WHERE giveaway_id = ? AND is_active = 1",
+        (gid,),
+    )
+    conn.commit()
+    log_action(update.effective_user.id, "giveaway_autobroadcast_disable", f"giveaway_id={gid}")
+    await safe_send(update, "⏹ Авторассылка выключена.", reply_markup=admin_giveaway_autobroadcast_keyboard())
+
+
+async def admin_giveaway_autobroadcast_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    active = get_active_giveaway()
+    await safe_send(
+        update,
+        "\n".join(_giveaway_autobroadcast_status_lines(active)),
+        parse_mode="Markdown",
+        reply_markup=admin_giveaway_autobroadcast_keyboard(),
+    )
+
+
+async def admin_giveaway_autobroadcast_per_day_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    if not get_active_giveaway():
+        await safe_send(update, "❌ Нет активного розыгрыша.", reply_markup=admin_giveaways_keyboard())
+        return ConversationHandler.END
+    await safe_send(
+        update,
+        f"⚙ Введи число от {GIVEAWAY_AUTOBROADCAST_MIN_PER_DAY} до {GIVEAWAY_AUTOBROADCAST_MAX_PER_DAY} — "
+        "сколько раз в сутки отправлять анонс (равные интервалы).\n\n"
+        "Например: `2` — примерно дважды в сутки, `12` — каждые ~2 ч.\n\n/cancel — отмена.",
+        parse_mode="Markdown",
+        reply_markup=admin_giveaway_autobroadcast_keyboard(),
+    )
+    return ADMIN_GIVEAWAY_AUTOBROADCAST_PER_DAY_WAITING
+
+
+async def admin_giveaway_autobroadcast_per_day_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    active = get_active_giveaway()
+    if not active:
+        await safe_send(update, "❌ Нет активного розыгрыша.", reply_markup=admin_giveaways_keyboard())
+        return ConversationHandler.END
+    try:
+        n = int((update.message.text or "").strip())
+    except ValueError:
+        await safe_send(
+            update,
+            "❌ Нужно целое число. Попробуй ещё раз или /cancel.",
+            reply_markup=admin_giveaway_autobroadcast_keyboard(),
+        )
+        return ADMIN_GIVEAWAY_AUTOBROADCAST_PER_DAY_WAITING
+    if not GIVEAWAY_AUTOBROADCAST_MIN_PER_DAY <= n <= GIVEAWAY_AUTOBROADCAST_MAX_PER_DAY:
+        await safe_send(
+            update,
+            f"❌ Допустимо от {GIVEAWAY_AUTOBROADCAST_MIN_PER_DAY} до {GIVEAWAY_AUTOBROADCAST_MAX_PER_DAY}.",
+            reply_markup=admin_giveaway_autobroadcast_keyboard(),
+        )
+        return ADMIN_GIVEAWAY_AUTOBROADCAST_PER_DAY_WAITING
+    gid = active[0]
+    cursor.execute(
+        "UPDATE giveaways SET autobroadcast_per_day = ? WHERE giveaway_id = ? AND is_active = 1",
+        (n, gid),
+    )
+    conn.commit()
+    log_action(update.effective_user.id, "giveaway_autobroadcast_per_day", f"giveaway_id={gid};per_day={n}")
+    await safe_send(
+        update,
+        f"✅ Установлено: *{n}* раз в сутки (интервал {format_giveaway_autobroadcast_interval_ru(n)}).",
+        parse_mode="Markdown",
+        reply_markup=admin_giveaway_autobroadcast_keyboard(),
+    )
+    return ConversationHandler.END
 
 
 async def admin_open_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3219,49 +3537,86 @@ async def admin_create_giveaway_start(update: Update, context: ContextTypes.DEFA
 
 async def admin_create_giveaway_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_giveaway_title"] = update.message.text.strip()
-    await safe_send(update, "📝 Отправь описание розыгрыша.")
-    return ADMIN_GIVEAWAY_CREATE_PHOTO_WAITING
+    await safe_send(update, "📝 Отправь текст описания розыгрыша (без фото — фото добавим на следующем шаге).")
+    return ADMIN_GIVEAWAY_CREATE_DESC_WAITING
 
 
-async def admin_create_giveaway_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    title = context.user_data.get("new_giveaway_title")
-    if not title:
-        return ConversationHandler.END
+async def admin_create_giveaway_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        await safe_send(update, "❌ Нужен текст описания.")
+        return ADMIN_GIVEAWAY_CREATE_DESC_WAITING
+    context.user_data["new_giveaway_text"] = update.message.text.strip()
+    await safe_send(
+        update,
+        "🖼 Отправь *фото* для анонса розыгрыша или напиши `skip`, если фото не нужно.",
+    )
+    return ADMIN_GIVEAWAY_CREATE_IMAGE_WAITING
+
+
+async def admin_create_giveaway_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
-        return ADMIN_GIVEAWAY_CREATE_PHOTO_WAITING
+        return ADMIN_GIVEAWAY_CREATE_IMAGE_WAITING
+    t = (update.message.text or "").strip().lower()
+    if t == "skip":
+        context.user_data["new_giveaway_photo"] = ""
+    elif update.message.photo:
+        context.user_data["new_giveaway_photo"] = update.message.photo[-1].file_id
+    else:
+        await safe_send(update, "❌ Отправь фото или напиши `skip`.")
+        return ADMIN_GIVEAWAY_CREATE_IMAGE_WAITING
+    await safe_send(
+        update,
+        "🔗 Кнопки под постом: каждая строка «Текст | URL» (http/https/tg://).\n"
+        "Несколько кнопок — несколько строк. Напиши `skip`, если кнопки не нужны.",
+    )
+    return ADMIN_GIVEAWAY_CREATE_BUTTONS_WAITING
 
-    text_value = update.message.caption.strip() if update.message and update.message.caption else update.message.text.strip() if update.message and update.message.text else ""
-    if not text_value:
-        await safe_send(update, "❌ Нужно отправить текст описания (можно с фото и подписью).")
-        return ADMIN_GIVEAWAY_CREATE_PHOTO_WAITING
 
-    photo = ""
-    if update.message and update.message.photo:
-        photo = update.message.photo[-1].file_id
+async def admin_create_giveaway_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    title = context.user_data.get("new_giveaway_title")
+    text_value = context.user_data.get("new_giveaway_text")
+    if not title or not text_value:
+        return ConversationHandler.END
+    if not update.message or not update.message.text:
+        await safe_send(update, "❌ Отправь строки кнопок или `skip`.")
+        return ADMIN_GIVEAWAY_CREATE_BUTTONS_WAITING
+
+    body = update.message.text.strip()
+    if body.lower() == "skip":
+        buttons_json = "[]"
+    else:
+        parsed, errors = parse_giveaway_buttons_lines(body)
+        if errors:
+            await safe_send(update, "❌ Ошибки:\n" + "\n".join(errors) + "\n\nПопробуй ещё раз.")
+            return ADMIN_GIVEAWAY_CREATE_BUTTONS_WAITING
+        buttons_json = json.dumps(parsed, ensure_ascii=False)
+
+    photo = context.user_data.get("new_giveaway_photo") or ""
 
     cursor.execute("UPDATE giveaways SET is_active = 0 WHERE is_active = 1")
     if USE_POSTGRES:
         cursor.execute(
             """
-            INSERT INTO giveaways (title, text_value, photo, is_active, created_at, created_by, finished_at)
-            VALUES (?, ?, ?, 1, ?, ?, NULL)
+            INSERT INTO giveaways (title, text_value, photo, is_active, created_at, created_by, finished_at, buttons_json)
+            VALUES (?, ?, ?, 1, ?, ?, NULL, ?)
             RETURNING giveaway_id
             """,
-            (title, text_value, photo, now_iso(), update.effective_user.id),
+            (title, text_value, photo, now_iso(), update.effective_user.id, buttons_json),
         )
         giveaway_id = cursor.fetchone()[0]
     else:
         cursor.execute(
             """
-            INSERT INTO giveaways (title, text_value, photo, is_active, created_at, created_by, finished_at)
-            VALUES (?, ?, ?, 1, ?, ?, NULL)
+            INSERT INTO giveaways (title, text_value, photo, is_active, created_at, created_by, finished_at, buttons_json)
+            VALUES (?, ?, ?, 1, ?, ?, NULL, ?)
             """,
-            (title, text_value, photo, now_iso(), update.effective_user.id),
+            (title, text_value, photo, now_iso(), update.effective_user.id, buttons_json),
         )
         giveaway_id = cursor.lastrowid
     conn.commit()
 
-    context.user_data.pop("new_giveaway_title", None)
+    for key in ("new_giveaway_title", "new_giveaway_text", "new_giveaway_photo"):
+        context.user_data.pop(key, None)
     await safe_send(update, f"✅ Розыгрыш создан и активирован. ID: {giveaway_id}", reply_markup=admin_keyboard())
     return ConversationHandler.END
 
@@ -3274,7 +3629,7 @@ async def admin_finish_giveaway_start(update: Update, context: ContextTypes.DEFA
         await safe_send(update, "❌ Сейчас нет активного розыгрыша.", reply_markup=admin_keyboard())
         return ConversationHandler.END
 
-    giveaway_id, title, _, _, _ = active
+    giveaway_id, title, _, _, _, _, _, _, _ = active
     context.user_data["finish_giveaway_id"] = giveaway_id
     top_rows = get_giveaway_top(giveaway_id, limit=20)
     lines = [f"🏁 Завершение розыгрыша: *{title}* (ID {giveaway_id})\n", "Топ участников:"]
@@ -3317,8 +3672,148 @@ async def admin_finish_giveaway_pick(update: Update, context: ContextTypes.DEFAU
     cursor.execute("UPDATE giveaways SET is_active = 0, finished_at = ? WHERE giveaway_id = ?", (now_iso(), giveaway_id))
     conn.commit()
     context.user_data.pop("finish_giveaway_id", None)
-    await safe_send(update, "✅ Розыгрыш завершён, победители зафиксированы.", reply_markup=admin_keyboard())
+
+    caption_body = build_giveaway_results_caption(giveaway_id) or "Итоги розыгрыша"
+    g_row = get_giveaway_by_id(giveaway_id)
+    photo = (g_row[3] or "").strip() if g_row else ""
+    intro = (
+        "✅ Розыгрыш завершён, победители зафиксированы.\n\n"
+        "👁 Предпросмотр рассылки — так увидят сообщение пользователи (кроме чёрного списка):\n"
+        "────────"
+    )
+    tail = "────────\nНажми «Разослать» или «Без рассылки»."
+    full_text = f"{intro}\n\n{caption_body}\n\n{tail}"
+    link_mk = giveaway_buttons_markup_from_json(g_row[5] if g_row else None)
+    link_rows = list(link_mk.inline_keyboard) if link_mk else []
+    preview_kb = InlineKeyboardMarkup(
+        list(link_rows)
+        + [
+            [InlineKeyboardButton("📤 Разослать всем клиентам", callback_data=f"gwb:{giveaway_id}")],
+            [InlineKeyboardButton("❌ Без рассылки", callback_data=f"gwx:{giveaway_id}")],
+        ]
+    )
+    if update.message:
+        try:
+            if photo:
+                await update.message.reply_photo(photo=photo, caption=full_text, reply_markup=preview_kb)
+            else:
+                await update.message.reply_text(full_text, reply_markup=preview_kb)
+        except Exception:
+            logger.exception("Предпросмотр итогов розыгрыша")
+            await update.message.reply_text(f"{intro}\n\n{caption_body}\n\n{tail}", reply_markup=preview_kb)
+    await safe_send(update, "Кнопки под предпросмотром: разослать или отменить рассылку.", reply_markup=admin_keyboard())
     return ConversationHandler.END
+
+
+async def giveaway_results_broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.from_user or not is_admin(query.from_user.id):
+        return
+    raw = query.data
+    if not isinstance(raw, str) or not raw.startswith("gwb:"):
+        return
+    try:
+        gid = int(raw.split(":", 1)[1])
+    except (ValueError, IndexError):
+        try:
+            await query.answer("Некорректные данные", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    row = get_giveaway_by_id(gid)
+    if not row:
+        try:
+            await query.answer("Розыгрыш не найден.", show_alert=True)
+        except Exception:
+            pass
+        return
+    if row[6]:
+        try:
+            await query.answer("Рассылка уже была отправлена.", show_alert=True)
+        except Exception:
+            pass
+        return
+    if not row[4]:
+        try:
+            await query.answer("Розыгрыш ещё не завершён.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    caption = build_giveaway_results_caption(gid)
+    if not caption:
+        try:
+            await query.answer("Не удалось сформировать текст.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    try:
+        await query.answer("Рассылка выполняется…", show_alert=False)
+    except Exception:
+        logger.exception("giveaway broadcast: первый answer")
+
+    photo = (row[3] or "").strip()
+    btn_markup = giveaway_buttons_markup_from_json(row[5])
+    user_ids = get_broadcast_recipient_user_ids()
+    sent = failed = blocked = 0
+    reason_stats: dict[str, int] = {}
+    for uid in user_ids:
+        try:
+            if photo:
+                await context.bot.send_photo(chat_id=uid, photo=photo, caption=caption, reply_markup=btn_markup)
+            else:
+                await context.bot.send_message(chat_id=uid, text=caption, reply_markup=btn_markup)
+            sent += 1
+        except Exception as e:
+            failed += 1
+            msg = str(e).lower()
+            if "blocked" in msg or "forbidden" in msg:
+                blocked += 1
+            reason = str(e).split(":", 1)[0][:80]
+            reason_stats[reason] = reason_stats.get(reason, 0) + 1
+
+    now = now_iso()
+    cursor.execute(
+        "UPDATE giveaways SET results_broadcast_at = ? WHERE giveaway_id = ? AND results_broadcast_at IS NULL",
+        (now, gid),
+    )
+    conn.commit()
+    details = "; ".join(f"{k}={v}" for k, v in reason_stats.items()) if reason_stats else ""
+    cursor.execute(
+        """
+        INSERT INTO broadcast_logs (kind, post_id, sent, failed, blocked, details, created_at, created_by)
+        VALUES ('giveaway_results', ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (gid, sent, failed, blocked, details, now, query.from_user.id),
+    )
+    conn.commit()
+    log_action(query.from_user.id, "giveaway_results_broadcast", f"giveaway={gid};sent={sent};failed={failed}")
+
+    try:
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text=(
+                f"✅ Итоги розыгрыша #{gid} разосланы.\n"
+                f"Отправлено: {sent}\nОшибок: {failed}\nНедоставка/блок: {blocked}"
+            ),
+        )
+    except Exception:
+        logger.exception("Не удалось отправить отчёт админу о рассылке розыгрыша")
+
+
+async def giveaway_results_skip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.from_user or not is_admin(query.from_user.id):
+        return
+    raw = query.data
+    if not isinstance(raw, str) or not raw.startswith("gwx:"):
+        return
+    try:
+        await query.answer("Рассылка итогов отменена. Победители уже сохранены.", show_alert=False)
+    except Exception:
+        logger.exception("giveaway_results_skip answer")
 
 
 async def admin_autopost_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3692,6 +4187,125 @@ async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
+async def send_giveaway_announce_broadcast(
+    context: ContextTypes.DEFAULT_TYPE, row: tuple
+) -> tuple[int, int, int, dict[str, int]]:
+    """Один проход: анонс активного розыгрыша всем получателям (как «🎁 Розыгрыши»)."""
+    gid, title, text_value, photo, _, buttons_json, _, _, _ = row
+    bot_username = context.bot.username or ""
+    markup = giveaway_buttons_markup_from_json(buttons_json)
+    user_ids = get_broadcast_recipient_user_ids()
+    if not user_ids:
+        return 0, 0, 0, {}
+
+    sent = failed = blocked = 0
+    reason_stats: dict[str, int] = {}
+    for uid in user_ids:
+        caption = build_giveaway_announce_caption(bot_username, uid, gid, title, text_value)
+        try:
+            if (photo or "").strip():
+                await context.bot.send_photo(
+                    chat_id=uid, photo=photo, caption=caption, parse_mode="Markdown", reply_markup=markup
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=uid, text=caption, parse_mode="Markdown", reply_markup=markup
+                )
+            sent += 1
+        except Exception as e:
+            failed += 1
+            msg = str(e).lower()
+            if "blocked" in msg or "forbidden" in msg:
+                blocked += 1
+            reason = str(e).split(":", 1)[0][:80]
+            reason_stats[reason] = reason_stats.get(reason, 0) + 1
+    return sent, failed, blocked, reason_stats
+
+
+async def process_giveaway_autobroadcast(context: ContextTypes.DEFAULT_TYPE):
+    row = get_active_giveaway()
+    if not row:
+        return
+    gid, _, _, _, _, _, ab_en, ab_per_day, ab_last = row
+    if not ab_en:
+        return
+    per_day = max(
+        GIVEAWAY_AUTOBROADCAST_MIN_PER_DAY,
+        min(int(ab_per_day or GIVEAWAY_AUTOBROADCAST_DEFAULT_PER_DAY), GIVEAWAY_AUTOBROADCAST_MAX_PER_DAY),
+    )
+    need_sec = giveaway_autobroadcast_interval_seconds(per_day)
+    now = datetime.now()
+    if ab_last:
+        try:
+            last_dt = datetime.fromisoformat(ab_last)
+        except ValueError:
+            last_dt = None
+        if last_dt and (now - last_dt).total_seconds() < need_sec:
+            return
+
+    sent, failed, blocked, reason_stats = await send_giveaway_announce_broadcast(context, row)
+    if sent == 0 and failed == 0:
+        return
+
+    ts = now_iso()
+    cursor.execute(
+        "UPDATE giveaways SET autobroadcast_last_at = ? WHERE giveaway_id = ? AND is_active = 1",
+        (ts, gid),
+    )
+    cursor.execute(
+        """
+        INSERT INTO broadcast_logs (kind, post_id, sent, failed, blocked, details, created_at, created_by)
+        VALUES ('giveaway_auto', ?, ?, ?, ?, ?, ?, NULL)
+        """,
+        (gid, sent, failed, blocked, "; ".join(f"{k}={v}" for k, v in reason_stats.items()), ts),
+    )
+    conn.commit()
+
+
+async def admin_giveaway_autobroadcast_once_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    row = get_active_giveaway()
+    if not row:
+        await safe_send(update, "❌ Нет активного розыгрыша.", reply_markup=admin_giveaways_keyboard())
+        return
+    gid = row[0]
+    if not get_broadcast_recipient_user_ids():
+        await safe_send(
+            update,
+            "❌ Нет получателей: в базе нет пользователей или все в чёрном списке.",
+            reply_markup=admin_giveaway_autobroadcast_keyboard(),
+        )
+        return
+    await safe_send(
+        update,
+        "⏳ Рассылаю анонс всем клиентам (кроме чёрного списка)… Это может занять время.",
+        reply_markup=admin_giveaway_autobroadcast_keyboard(),
+    )
+    sent, failed, blocked, reason_stats = await send_giveaway_announce_broadcast(context, row)
+    ts = now_iso()
+    cursor.execute(
+        "UPDATE giveaways SET autobroadcast_last_at = ? WHERE giveaway_id = ? AND is_active = 1",
+        (ts, gid),
+    )
+    details = "; ".join(f"{k}={v}" for k, v in reason_stats.items())
+    cursor.execute(
+        """
+        INSERT INTO broadcast_logs (kind, post_id, sent, failed, blocked, details, created_at, created_by)
+        VALUES ('giveaway_once', ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (gid, sent, failed, blocked, details, ts, update.effective_user.id),
+    )
+    conn.commit()
+    log_action(update.effective_user.id, "giveaway_announce_once", f"giveaway_id={gid};sent={sent};failed={failed}")
+    await safe_send(
+        update,
+        f"✅ Разовая рассылка анонса завершена.\n"
+        f"Отправлено: {sent}\nОшибок: {failed}\nНедоставка/блок: {blocked}",
+        reply_markup=admin_giveaway_autobroadcast_keyboard(),
+    )
+
+
 async def process_auto_posts(context: ContextTypes.DEFAULT_TYPE):
     cursor.execute(
         """
@@ -3703,53 +4317,62 @@ async def process_auto_posts(context: ContextTypes.DEFAULT_TYPE):
         (now_iso(),),
     )
     posts = cursor.fetchall()
-    if not posts:
-        return
+    if posts:
+        cursor.execute("SELECT user_id FROM users")
+        user_ids = [row[0] for row in cursor.fetchall()]
+        if user_ids:
+            for post_id, text_value, photo, button_text, button_url, interval_hours in posts:
+                sent = 0
+                failed = 0
+                blocked = 0
+                reason_stats = {}
+                markup = autopost_button_markup(button_text, button_url)
 
-    cursor.execute("SELECT user_id FROM users")
-    user_ids = [row[0] for row in cursor.fetchall()]
-    if not user_ids:
-        return
+                for user_id in user_ids:
+                    try:
+                        if photo:
+                            await context.bot.send_photo(
+                                chat_id=user_id, photo=photo, caption=text_value, reply_markup=markup
+                            )
+                        else:
+                            await context.bot.send_message(
+                                chat_id=user_id, text=text_value, reply_markup=markup
+                            )
+                        sent += 1
+                    except Exception as e:
+                        failed += 1
+                        msg = str(e).lower()
+                        if "blocked" in msg or "forbidden" in msg:
+                            blocked += 1
+                        reason = str(e).split(":", 1)[0][:80]
+                        reason_stats[reason] = reason_stats.get(reason, 0) + 1
 
-    for post_id, text_value, photo, button_text, button_url, interval_hours in posts:
-        sent = 0
-        failed = 0
-        blocked = 0
-        reason_stats = {}
-        markup = autopost_button_markup(button_text, button_url)
+                next_send = (datetime.now() + timedelta(hours=interval_hours)).isoformat()
+                cursor.execute(
+                    """
+                    UPDATE auto_posts
+                    SET last_sent_at = ?, next_send_at = ?, sent_count = sent_count + ?
+                    WHERE post_id = ?
+                    """,
+                    (now_iso(), next_send, sent, post_id),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO broadcast_logs (kind, post_id, sent, failed, blocked, details, created_at, created_by)
+                    VALUES ('auto', ?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        post_id,
+                        sent,
+                        failed,
+                        blocked,
+                        "; ".join([f"{k}={v}" for k, v in reason_stats.items()]),
+                        now_iso(),
+                    ),
+                )
+                conn.commit()
 
-        for user_id in user_ids:
-            try:
-                if photo:
-                    await context.bot.send_photo(chat_id=user_id, photo=photo, caption=text_value, reply_markup=markup)
-                else:
-                    await context.bot.send_message(chat_id=user_id, text=text_value, reply_markup=markup)
-                sent += 1
-            except Exception as e:
-                failed += 1
-                msg = str(e).lower()
-                if "blocked" in msg or "forbidden" in msg:
-                    blocked += 1
-                reason = str(e).split(":", 1)[0][:80]
-                reason_stats[reason] = reason_stats.get(reason, 0) + 1
-
-        next_send = (datetime.now() + timedelta(hours=interval_hours)).isoformat()
-        cursor.execute(
-            """
-            UPDATE auto_posts
-            SET last_sent_at = ?, next_send_at = ?, sent_count = sent_count + ?
-            WHERE post_id = ?
-            """,
-            (now_iso(), next_send, sent, post_id),
-        )
-        cursor.execute(
-            """
-            INSERT INTO broadcast_logs (kind, post_id, sent, failed, blocked, details, created_at, created_by)
-            VALUES ('auto', ?, ?, ?, ?, ?, ?, NULL)
-            """,
-            (post_id, sent, failed, blocked, "; ".join([f"{k}={v}" for k, v in reason_stats.items()]), now_iso()),
-        )
-        conn.commit()
+    await process_giveaway_autobroadcast(context)
 
 
 async def admin_baraholki_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4620,6 +5243,8 @@ ADMIN_ESCAPE_LABELS = frozenset(
         "📋 Активные авто-рассылки",
         "🛑 Прервать сценарий",
         "📍 Точки самовывоза",
+        "↩️ К розыгрышам",
+        "📣 Авторассылка анонса",
     }
 )
 
@@ -4669,6 +5294,9 @@ async def admin_escape_conversation(update: Update, context: ContextTypes.DEFAUL
     if text == "🎁 Розыгрыши (админ)":
         await admin_open_giveaways(update, context)
         return ConversationHandler.END
+    if text == "📣 Авторассылка анонса":
+        await admin_giveaway_autobroadcast_panel(update, context)
+        return ConversationHandler.END
     if text == "👥 Клиенты":
         await admin_open_clients(update, context)
         return ConversationHandler.END
@@ -4687,6 +5315,9 @@ async def admin_escape_conversation(update: Update, context: ContextTypes.DEFAUL
         return ConversationHandler.END
     if text == "📍 Точки самовывоза":
         await admin_pickup_panel(update, context)
+        return ConversationHandler.END
+    if text == "↩️ К розыгрышам":
+        await admin_open_giveaways(update, context)
         return ConversationHandler.END
     return ConversationHandler.END
 
@@ -4744,6 +5375,8 @@ def main():
     )
     app.add_handler(CallbackQueryHandler(order_status_callback, pattern=r"^order_status:\d+:[a-z_]+$"))
     app.add_handler(CallbackQueryHandler(order_rate_callback, pattern=r"^order_rate:\d+:\d+$"))
+    app.add_handler(CallbackQueryHandler(giveaway_results_broadcast_callback, pattern=r"^gwb:\d+$"))
+    app.add_handler(CallbackQueryHandler(giveaway_results_skip_callback, pattern=r"^gwx:\d+$"))
     app.add_handler(CallbackQueryHandler(autopost_manage_callback, pattern=r"^autopost_(pause|resume|delete):\d+$"))
 
     checkout_conv = ConversationHandler(
@@ -4950,10 +5583,12 @@ def main():
         entry_points=[MessageHandler(filters.Regex(r"^🎯 Создать розыгрыш$"), admin_create_giveaway_start)],
         states={
             ADMIN_GIVEAWAY_CREATE_TEXT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_create_giveaway_text)],
-            ADMIN_GIVEAWAY_CREATE_PHOTO_WAITING: [
-                MessageHandler(filters.PHOTO, admin_create_giveaway_photo),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_create_giveaway_photo),
+            ADMIN_GIVEAWAY_CREATE_DESC_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_create_giveaway_desc)],
+            ADMIN_GIVEAWAY_CREATE_IMAGE_WAITING: [
+                MessageHandler(filters.PHOTO, admin_create_giveaway_image),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_create_giveaway_image),
             ],
+            ADMIN_GIVEAWAY_CREATE_BUTTONS_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_create_giveaway_buttons)],
         },
         fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
@@ -4961,6 +5596,16 @@ def main():
     finish_giveaway_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🏁 Завершить розыгрыш$"), admin_finish_giveaway_start)],
         states={ADMIN_GIVEAWAY_FINISH_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_finish_giveaway_pick)]},
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
+    )
+
+    giveaway_autobroadcast_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^⚙ Раз в сутки$"), admin_giveaway_autobroadcast_per_day_start)],
+        states={
+            ADMIN_GIVEAWAY_AUTOBROADCAST_PER_DAY_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_giveaway_autobroadcast_per_day_save),
+            ],
+        },
         fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
@@ -5034,6 +5679,7 @@ def main():
     app.add_handler(ref_giveaway_conv)
     app.add_handler(create_giveaway_conv)
     app.add_handler(finish_giveaway_conv)
+    app.add_handler(giveaway_autobroadcast_conv)
     app.add_handler(autopost_conv)
     app.add_handler(blacklist_conv)
     app.add_handler(category_discount_conv)
@@ -5059,6 +5705,13 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^📣 Рассылки$"), admin_open_broadcasts))
     app.add_handler(MessageHandler(filters.Regex(r"^📋 Активные авто-рассылки$"), admin_autopost_list_screen))
     app.add_handler(MessageHandler(filters.Regex(r"^🎁 Розыгрыши \(админ\)$"), admin_open_giveaways))
+    app.add_handler(MessageHandler(filters.Regex(r"^📣 Авторассылка анонса$"), admin_giveaway_autobroadcast_panel))
+    app.add_handler(MessageHandler(filters.Regex(r"^▶️ Включить авторассылку$"), admin_giveaway_autobroadcast_enable))
+    app.add_handler(MessageHandler(filters.Regex(r"^⏹ Выключить авторассылку$"), admin_giveaway_autobroadcast_disable))
+    app.add_handler(
+        MessageHandler(filters.Regex(r"^📤 Разослать анонс сейчас \(1 раз\)$"), admin_giveaway_autobroadcast_once_now)
+    )
+    app.add_handler(MessageHandler(filters.Regex(r"^📊 Статус авторассылки$"), admin_giveaway_autobroadcast_status))
     app.add_handler(MessageHandler(filters.Regex(r"^👥 Клиенты$"), admin_open_clients))
     app.add_handler(MessageHandler(filters.Regex(r"^🔗 Ссылки и инфо$"), admin_open_links))
     app.add_handler(MessageHandler(filters.Regex(r"^📊 Аналитика$"), admin_open_analytics))
