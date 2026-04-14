@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import random
 import sqlite3
 import string
@@ -45,6 +46,12 @@ DEFAULT_BARAHOLKI_URL = "https://t.me/your_channel/1"
 DEFAULT_PROJECTS_URL = "https://t.me/your_channel/2"
 DEFAULT_GIVEAWAYS_URL = "https://t.me/your_channel/3"
 DEFAULT_VK_URL = "https://vk.ru/rndm196"
+
+DEFAULT_WELCOME_CAPTION = (
+    "🔥 Добро пожаловать в RNDM SHOP!\n\n"
+    "Здесь ты найдёшь жидкости, одноразки и устройства.\n"
+    "Используй кнопки меню ниже для навигации 👇"
+)
 
 CATEGORY_ORDER = [
     "devices",
@@ -164,6 +171,10 @@ ADMIN_AUTOPOST_BUTTON_WAITING = next(_state)
 ADMIN_AUTOPOST_INTERVAL_WAITING = next(_state)
 ADMIN_BLACKLIST_WAITING = next(_state)
 ADMIN_CATEGORY_DISCOUNT_WAITING = next(_state)
+ADMIN_WELCOME_MENU_WAITING = next(_state)
+ADMIN_WELCOME_TEXT_WAITING = next(_state)
+ADMIN_WELCOME_PHOTO_WAITING = next(_state)
+ADMIN_WELCOME_BUTTONS_WAITING = next(_state)
 
 ORDER_PROMOCODE_WAITING = next(_state)
 ORDER_CHOICE_WAITING = next(_state)
@@ -833,6 +844,88 @@ for block_key, default_text in INFO_BLOCK_DEFAULTS.items():
     if not get_setting(f"info_text:{block_key}"):
         set_info_block_text(block_key, default_text)
 
+if not get_setting("welcome_caption"):
+    set_setting("welcome_caption", DEFAULT_WELCOME_CAPTION)
+if not get_setting("welcome_photo"):
+    set_setting("welcome_photo", "")
+if not get_setting("welcome_buttons_json"):
+    set_setting("welcome_buttons_json", "[]")
+
+
+def get_welcome_caption() -> str:
+    return get_setting("welcome_caption", DEFAULT_WELCOME_CAPTION)
+
+
+def set_welcome_caption_value(text: str) -> None:
+    set_setting("welcome_caption", text)
+
+
+def get_welcome_photo() -> str:
+    return get_setting("welcome_photo", "")
+
+
+def set_welcome_photo_value(file_id: str) -> None:
+    set_setting("welcome_photo", file_id)
+
+
+def clear_welcome_photo_value() -> None:
+    set_setting("welcome_photo", "")
+
+
+def get_welcome_buttons_raw() -> list:
+    raw = get_setting("welcome_buttons_json", "[]")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return data
+
+
+def set_welcome_buttons_raw(rows: list) -> None:
+    set_setting("welcome_buttons_json", json.dumps(rows, ensure_ascii=False))
+
+
+def build_welcome_inline_keyboard() -> InlineKeyboardMarkup | None:
+    rows = get_welcome_buttons_raw()
+    keyboard = []
+    for item in rows:
+        if isinstance(item, dict):
+            text = (item.get("text") or "").strip()
+            url = (item.get("url") or "").strip()
+        else:
+            continue
+        if not text or not url:
+            continue
+        if not (url.startswith("http://") or url.startswith("https://") or url.startswith("tg://")):
+            continue
+        keyboard.append([InlineKeyboardButton(text[:64], url=url[:2000])])
+    return InlineKeyboardMarkup(keyboard) if keyboard else None
+
+
+async def send_welcome_screen(target_message, user_id: int) -> None:
+    caption = get_welcome_caption() or "Добро пожаловать!"
+    photo = get_welcome_photo()
+    markup = build_welcome_inline_keyboard()
+    kb = main_keyboard(user_id)
+    try:
+        if photo:
+            welcome_msg = await target_message.reply_photo(
+                photo=photo, caption=caption, reply_markup=markup
+            )
+        else:
+            welcome_msg = await target_message.reply_text(caption, reply_markup=markup)
+    except Exception:
+        logger.exception("Ошибка отправки приветствия")
+        welcome_msg = await target_message.reply_text(caption, reply_markup=markup)
+    # В одном сообщении нельзя совместить inline-кнопки и reply-клавиатуру — второе сообщение без видимого текста.
+    try:
+        await welcome_msg.reply_text("\u2060", reply_markup=kb)
+    except Exception:
+        logger.exception("Ошибка установки главной клавиатуры")
+        await target_message.reply_text("\u2060", reply_markup=kb)
+
 
 def save_user(user) -> bool:
     cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user.id,))
@@ -1441,7 +1534,19 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
             ["🛍 Редактор каталога", "📣 Рассылки"],
             ["🎁 Розыгрыши (админ)", "👥 Клиенты"],
             ["🔗 Ссылки и инфо", "📊 Аналитика"],
+            ["👋 Экран приветствия"],
             ["⬅️ Назад"],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def admin_welcome_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["📝 Текст приветствия", "🖼 Фото приветствия"],
+            ["🔗 Кнопки под постом", "🗑 Убрать фото"],
+            ["👁 Предпросмотр", "↩️ Админка"],
         ],
         resize_keyboard=True,
     )
@@ -1652,12 +1757,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_new_user and context.args:
         register_referral_if_valid(user.id, context.args[0])
     log_action(user.id, "start", "entry")
-    await safe_send(
-        update,
-        "🔥 *Добро пожаловать в RNDM SHOP!*\n\nВыбирай нужный раздел ниже 👇",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard(user.id),
-    )
+    if update.message:
+        await send_welcome_screen(update.message, user.id)
 
 
 async def assortment(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4026,6 +4127,140 @@ async def admin_clear_category_photo_category(update: Update, context: ContextTy
     return ConversationHandler.END
 
 
+def _format_welcome_buttons_preview() -> str:
+    rows = get_welcome_buttons_raw()
+    if not rows:
+        return "— нет —"
+    lines = []
+    for item in rows:
+        if isinstance(item, dict):
+            t = (item.get("text") or "").strip()
+            u = (item.get("url") or "").strip()
+            if t or u:
+                lines.append(f"• {t} → {u}")
+    return "\n".join(lines) if lines else "— нет —"
+
+
+async def admin_welcome_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await safe_send(update, "⛔ У тебя нет доступа.")
+        return ConversationHandler.END
+    await safe_send(
+        update,
+        "👋 *Экран приветствия*\n\n"
+        "То, что пользователь видит по команде /start: фото (по желанию), подпись и кнопки-ссылки.\n"
+        "Настрой через меню ниже.",
+        parse_mode="Markdown",
+        reply_markup=admin_welcome_keyboard(),
+    )
+    return ADMIN_WELCOME_MENU_WAITING
+
+
+async def admin_welcome_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        await safe_send(update, "Выбери пункт меню кнопкой ниже.", reply_markup=admin_welcome_keyboard())
+        return ADMIN_WELCOME_MENU_WAITING
+    text = update.message.text.strip()
+    if text == "📝 Текст приветствия":
+        await safe_send(
+            update,
+            "Отправь текст подписи к приветственному сообщению (можно несколько строк).",
+        )
+        return ADMIN_WELCOME_TEXT_WAITING
+    if text == "🖼 Фото приветствия":
+        await safe_send(update, "Отправь фото для экрана приветствия.")
+        return ADMIN_WELCOME_PHOTO_WAITING
+    if text == "🔗 Кнопки под постом":
+        await safe_send(
+            update,
+            "Отправь список кнопок: каждая строка — одна кнопка:\n"
+            "Текст на кнопке | https://ссылка\n\n"
+            "Допустимы ссылки http://, https:// или tg:// (например tg://user?id=123).\n"
+            "Чтобы убрать все кнопки, отправь одно слово: пусто\n\n"
+            "Текущие кнопки:\n"
+            f"{_format_welcome_buttons_preview()}",
+        )
+        return ADMIN_WELCOME_BUTTONS_WAITING
+    if text == "🗑 Убрать фото":
+        clear_welcome_photo_value()
+        await safe_send(
+            update,
+            "✅ Фото приветствия убрано.",
+            reply_markup=admin_welcome_keyboard(),
+        )
+        return ADMIN_WELCOME_MENU_WAITING
+    if text == "👁 Предпросмотр":
+        await send_welcome_screen(update.message, update.effective_user.id)
+        await safe_send(update, "Выше — предпросмотр.", reply_markup=admin_welcome_keyboard())
+        return ADMIN_WELCOME_MENU_WAITING
+    if text in ("↩️ Админка", "⤴️ Админка"):
+        return await admin_submenu_back(update, context)
+    await safe_send(update, "Выбери пункт меню кнопкой ниже.", reply_markup=admin_welcome_keyboard())
+    return ADMIN_WELCOME_MENU_WAITING
+
+
+async def admin_welcome_save_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        await safe_send(update, "Нужен текст сообщением.")
+        return ADMIN_WELCOME_TEXT_WAITING
+    set_welcome_caption_value(update.message.text.strip())
+    await safe_send(update, "✅ Текст приветствия сохранён.", reply_markup=admin_welcome_keyboard())
+    return ADMIN_WELCOME_MENU_WAITING
+
+
+async def admin_welcome_save_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message and update.message.photo:
+        set_welcome_photo_value(update.message.photo[-1].file_id)
+        await safe_send(update, "✅ Фото приветствия сохранено.", reply_markup=admin_welcome_keyboard())
+        return ADMIN_WELCOME_MENU_WAITING
+    await safe_send(update, "❌ Нужно отправить фото (или «↩️ Админка» / /cancel для выхода).")
+    return ADMIN_WELCOME_PHOTO_WAITING
+
+
+async def admin_welcome_save_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        await safe_send(update, "Нужен текст со списком кнопок.")
+        return ADMIN_WELCOME_BUTTONS_WAITING
+    body = update.message.text.strip()
+    if body.lower() == "пусто":
+        set_welcome_buttons_raw([])
+        await safe_send(update, "✅ Все кнопки убраны.", reply_markup=admin_welcome_keyboard())
+        return ADMIN_WELCOME_MENU_WAITING
+    raw_lines = body.splitlines()
+    parsed = []
+    errors = []
+    for i, line in enumerate(raw_lines, 1):
+        line = line.strip()
+        if not line:
+            continue
+        if "|" not in line:
+            errors.append(f"Строка {i}: нет разделителя |")
+            continue
+        left, right = line.split("|", 1)
+        btn_text = left.strip()
+        url = right.strip()
+        if not btn_text or not url:
+            errors.append(f"Строка {i}: пустой текст или ссылка")
+            continue
+        if not (url.startswith("http://") or url.startswith("https://") or url.startswith("tg://")):
+            errors.append(f"Строка {i}: ссылка должна начинаться с http://, https:// или tg://")
+            continue
+        parsed.append({"text": btn_text, "url": url})
+    if errors:
+        await safe_send(
+            update,
+            "❌ Ошибки:\n" + "\n".join(errors) + "\n\nПопробуй ещё раз.",
+        )
+        return ADMIN_WELCOME_BUTTONS_WAITING
+    set_welcome_buttons_raw(parsed)
+    await safe_send(
+        update,
+        f"✅ Сохранено кнопок: {len(parsed)}.",
+        reply_markup=admin_welcome_keyboard(),
+    )
+    return ADMIN_WELCOME_MENU_WAITING
+
+
 async def check_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await safe_send(update, "Использование: /check RNDM-XXXXXX")
@@ -4371,6 +4606,26 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel), admin_root_nav_fallback],
     )
 
+    welcome_screen_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^👋 Экран приветствия$"), admin_welcome_open)],
+        states={
+            ADMIN_WELCOME_MENU_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_welcome_menu),
+            ],
+            ADMIN_WELCOME_TEXT_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_welcome_save_text),
+            ],
+            ADMIN_WELCOME_PHOTO_WAITING: [
+                MessageHandler(filters.PHOTO, admin_welcome_save_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_welcome_save_photo),
+            ],
+            ADMIN_WELCOME_BUTTONS_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_welcome_save_buttons),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel), admin_root_nav_fallback],
+    )
+
     app.add_handler(checkout_conv)
     app.add_handler(info_blocks_conv)
     app.add_handler(broadcast_conv)
@@ -4397,6 +4652,7 @@ def main():
     app.add_handler(autopost_conv)
     app.add_handler(blacklist_conv)
     app.add_handler(category_discount_conv)
+    app.add_handler(welcome_screen_conv)
 
     app.add_handler(MessageHandler(filters.Regex(r"^🛍 Ассортимент$"), assortment))
     app.add_handler(MessageHandler(filters.Regex(r"^🛒 Корзина$"), show_cart))
