@@ -50,7 +50,6 @@ DB_PATH = os.getenv("SQLITE_PATH", "rndm.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 DEFAULT_BARAHOLKI_URL = "https://t.me/your_channel/1"
-DEFAULT_PROJECTS_URL = "https://t.me/your_channel/2"
 DEFAULT_GIVEAWAYS_URL = "https://t.me/your_channel/3"
 DEFAULT_VK_URL = "https://vk.ru/rndm196"
 
@@ -877,14 +876,12 @@ INFO_BLOCK_DEFAULTS = {
 INFO_BLOCK_URL_SETTINGS = {
     "vk": "vk_url",
     "baraholki": "baraholki_url",
-    "projects": "projects_url",
     "giveaways": "giveaways_url",
 }
 
 INFO_BLOCK_BUTTON_LABELS = {
     "vk": "📱 Открыть VK",
     "baraholki": "🛒 Перейти в барахолки",
-    "projects": "🚀 Открыть проекты",
     "giveaways": "🎁 Смотреть розыгрыши",
 }
 
@@ -964,7 +961,6 @@ async def show_info_block_message(target_message, block_key: str):
 
 for key, value in {
     "baraholki_url": DEFAULT_BARAHOLKI_URL,
-    "projects_url": DEFAULT_PROJECTS_URL,
     "giveaways_url": DEFAULT_GIVEAWAYS_URL,
     "vk_url": DEFAULT_VK_URL,
     "manager_url": DEFAULT_MANAGER_URL,
@@ -2346,7 +2342,7 @@ def admin_links_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["🗂 Инфо-блоки", "💬 Ссылка на менеджера"],
-            ["🛒 Ссылка на барахолки", "🚀 Ссылка на проекты"],
+            ["🛒 Ссылка на барахолки", "🚀 Проекты: текст и фото"],
             ["🎁 Ссылка на розыгрыши"],
             ["🖼 Фото: Получить халяву"],
             ["↩️ Админка"],
@@ -3874,6 +3870,19 @@ async def admin_info_blocks_start(update: Update, context: ContextTypes.DEFAULT_
     return ADMIN_INFO_BLOCK_SELECT_WAITING
 
 
+async def admin_projects_content_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    context.user_data["info_block_key"] = "projects"
+    await safe_send(
+        update,
+        "🚀 Раздел «Наши проекты» у пользователей без кнопки-ссылки — только текст и фото.\n\nЧто изменить?",
+        reply_markup=info_block_action_keyboard(),
+    )
+    return ADMIN_INFO_BLOCK_ACTION_WAITING
+
+
 async def admin_info_blocks_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     block_key = parse_info_block_from_label(update.message.text.strip())
     if not block_key:
@@ -5234,19 +5243,6 @@ async def admin_baraholki_start(update: Update, context: ContextTypes.DEFAULT_TY
 async def admin_baraholki_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_setting("baraholki_url", update.message.text.strip())
     await safe_send(update, "✅ Ссылка на барахолки обновлена.", reply_markup=admin_keyboard())
-    return ConversationHandler.END
-
-
-async def admin_projects_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return ConversationHandler.END
-    await safe_send(update, "🚀 Отправь новую ссылку на проекты. /cancel для отмены")
-    return ADMIN_PROJECTS_WAITING
-
-
-async def admin_projects_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    set_setting("projects_url", update.message.text.strip())
-    await safe_send(update, "✅ Ссылка на проекты обновлена.", reply_markup=admin_keyboard())
     return ConversationHandler.END
 
 
@@ -6725,12 +6721,6 @@ def main():
         fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
-    projects_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^🚀 Ссылка на проекты$"), admin_projects_start)],
-        states={ADMIN_PROJECTS_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_projects_save)]},
-        fallbacks=[*ADMIN_CONV_FALLBACKS],
-    )
-
     giveaways_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🎁 Ссылка на розыгрыши$"), admin_giveaways_start)],
         states={ADMIN_GIVEAWAYS_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_giveaways_save)]},
@@ -6836,7 +6826,10 @@ def main():
     )
 
     info_blocks_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^🗂 Инфо-блоки$"), admin_info_blocks_start)],
+        entry_points=[
+            MessageHandler(filters.Regex(r"^🗂 Инфо-блоки$"), admin_info_blocks_start),
+            MessageHandler(filters.Regex(r"^🚀 Проекты: текст и фото$"), admin_projects_content_start),
+        ],
         states={
             ADMIN_INFO_BLOCK_SELECT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_info_blocks_select)],
             ADMIN_INFO_BLOCK_ACTION_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_info_blocks_action)],
@@ -7006,7 +6999,6 @@ def main():
     app.add_handler(revoke_promo_conv)
     app.add_handler(broadcast_conv)
     app.add_handler(baraholki_conv)
-    app.add_handler(projects_conv)
     app.add_handler(giveaways_conv)
     app.add_handler(manager_conv)
     app.add_handler(add_item_conv)
