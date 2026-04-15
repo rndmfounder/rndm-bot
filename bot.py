@@ -1375,6 +1375,80 @@ def build_giveaway_announce_caption(
     )
 
 
+GIVEAWAY_PHOTO_CAPTION_MAX = 1024
+GIVEAWAY_TEXT_MESSAGE_MAX = 4096
+
+
+def build_giveaway_announce_caption_plain(
+    bot_username: str, user_id: int, giveaway_id: int, title: str, text_value: str
+) -> str:
+    """Тот же смысл без HTML — если API отклоняет разметку или нужен запасной вариант."""
+    ref_link = build_ref_link(bot_username, user_id)
+    my_count = get_giveaway_referrals_count(giveaway_id, user_id)
+    t = str(title) if title is not None else ""
+    body = str(text_value) if text_value is not None else ""
+    link = ref_link or "—"
+    return (
+        f"🎁 {t}\n\n"
+        f"{body}\n\n"
+        f"Твои приглашения в этом розыгрыше: {my_count}\n"
+        f"Твоя ссылка для участия:\n{link}"
+    )
+
+
+def _fit_giveaway_caption(
+    bot_username: str,
+    user_id: int,
+    giveaway_id: int,
+    title: str,
+    text_value: str,
+    max_len: int,
+    *,
+    use_html: bool,
+) -> str:
+    """Укорачивает описание, затем заголовок, пока длина текста не станет ≤ max_len."""
+    t_raw = str(title) if title is not None else ""
+    tv_raw = str(text_value) if text_value is not None else ""
+
+    def build(t_part: str, tv_part: str) -> str:
+        if use_html:
+            return build_giveaway_announce_caption(bot_username, user_id, giveaway_id, t_part, tv_part)
+        return build_giveaway_announce_caption_plain(bot_username, user_id, giveaway_id, t_part, tv_part)
+
+    full = build(t_raw, tv_raw)
+    if len(full) <= max_len:
+        return full
+
+    lo, hi = 0, len(tv_raw)
+    best = None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        suffix = "…" if mid < len(tv_raw) else ""
+        cand = build(t_raw, tv_raw[:mid] + suffix)
+        if len(cand) <= max_len:
+            best = cand
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best is not None:
+        return best
+
+    lo, hi = 0, len(t_raw)
+    best = None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        suffix = "…" if mid < len(t_raw) else ""
+        cand = build(t_raw[:mid] + suffix, "")
+        if len(cand) <= max_len:
+            best = cand
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best is not None:
+        return best
+    return build("🎁", "…")
+
+
 def ru_times_per_day_word(n: int) -> str:
     """Склонение: 1 раз, 2 раза, 5 раз, 11 раз, 22 раза."""
     n = int(n)
@@ -3158,19 +3232,32 @@ async def giveaways(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     giveaway_id, title, text_value, photo, _, buttons_json, _, _, _ = active
-    text = build_giveaway_announce_caption(
-        context.bot.username or "", update.effective_user.id, giveaway_id, title, text_value
-    )
+    uname = context.bot.username or ""
+    uid = update.effective_user.id
     markup = giveaway_buttons_markup_from_json(buttons_json)
     if update.message:
         if photo:
+            cap = _fit_giveaway_caption(
+                uname, uid, giveaway_id, title, text_value, GIVEAWAY_PHOTO_CAPTION_MAX, use_html=True
+            )
             try:
                 await update.message.reply_photo(
-                    photo=photo, caption=text, parse_mode="HTML", reply_markup=markup
+                    photo=photo, caption=cap, parse_mode="HTML", reply_markup=markup
                 )
                 return
             except Exception:
                 logger.exception("Ошибка отправки фото активного розыгрыша")
+                try:
+                    plain = _fit_giveaway_caption(
+                        uname, uid, giveaway_id, title, text_value, GIVEAWAY_PHOTO_CAPTION_MAX, use_html=False
+                    )
+                    await update.message.reply_photo(photo=photo, caption=plain, reply_markup=markup)
+                    return
+                except Exception:
+                    logger.exception("Повтор без HTML тоже не удался")
+        text = _fit_giveaway_caption(
+            uname, uid, giveaway_id, title, text_value, GIVEAWAY_TEXT_MESSAGE_MAX, use_html=True
+        )
         await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 
@@ -3440,8 +3527,12 @@ async def admin_giveaway_autobroadcast_per_day_save(update: Update, context: Con
     if not active:
         await safe_send(update, "❌ Нет активного розыгрыша.", reply_markup=admin_giveaways_keyboard())
         return ConversationHandler.END
+    raw_in = (update.message.text or "").strip()
+    if re.fullmatch(r"\u21a9\uFE0F? К розыгрышам", raw_in):
+        await admin_open_giveaways(update, context)
+        return ConversationHandler.END
     try:
-        n = int((update.message.text or "").strip())
+        n = int(raw_in)
     except ValueError:
         await safe_send(
             update,
@@ -4353,9 +4444,13 @@ async def send_giveaway_announce_broadcast(
     sent = failed = blocked = 0
     reason_stats: dict[str, int] = {}
     for uid in user_ids:
-        caption = build_giveaway_announce_caption(bot_username, uid, gid, title, text_value)
+        has_photo = bool((photo or "").strip())
+        cap_limit = GIVEAWAY_PHOTO_CAPTION_MAX if has_photo else GIVEAWAY_TEXT_MESSAGE_MAX
+        caption = _fit_giveaway_caption(
+            bot_username, uid, gid, title, text_value, cap_limit, use_html=True
+        )
         try:
-            if (photo or "").strip():
+            if has_photo:
                 await context.bot.send_photo(
                     chat_id=uid, photo=photo, caption=caption, parse_mode="HTML", reply_markup=markup
                 )
@@ -4365,9 +4460,36 @@ async def send_giveaway_announce_broadcast(
                 )
             sent += 1
         except Exception as e:
+            err_s = str(e).lower()
+            retry_plain = any(
+                x in err_s
+                for x in (
+                    "parse",
+                    "entity",
+                    "can't parse",
+                    "caption is too long",
+                    "message is too long",
+                    "text must be encoded",
+                )
+            )
+            if retry_plain:
+                try:
+                    plain = _fit_giveaway_caption(
+                        bot_username, uid, gid, title, text_value, cap_limit, use_html=False
+                    )
+                    if has_photo:
+                        await context.bot.send_photo(
+                            chat_id=uid, photo=photo, caption=plain, reply_markup=markup
+                        )
+                    else:
+                        await context.bot.send_message(chat_id=uid, text=plain, reply_markup=markup)
+                    sent += 1
+                    continue
+                except Exception as e2:
+                    e = e2
+                    err_s = str(e).lower()
             failed += 1
-            msg = str(e).lower()
-            if "blocked" in msg or "forbidden" in msg:
+            if "blocked" in err_s or "forbidden" in err_s:
                 blocked += 1
             reason = str(e).split(":", 1)[0][:80]
             reason_stats[reason] = reason_stats.get(reason, 0) + 1
@@ -5870,6 +5992,8 @@ def main():
         MessageHandler(filters.Regex(r"^📤 Разослать анонс сейчас \(1 раз\)$"), admin_giveaway_autobroadcast_once_now)
     )
     app.add_handler(MessageHandler(filters.Regex(r"^📊 Статус авторассылки$"), admin_giveaway_autobroadcast_status))
+    # Вне ConversationHandler fallback эта кнопка иначе ни к чему не привязана.
+    app.add_handler(MessageHandler(filters.Regex(r"^\u21a9\uFE0F? К розыгрышам$"), admin_open_giveaways))
     app.add_handler(MessageHandler(filters.Regex(r"^👥 Клиенты$"), admin_open_clients))
     app.add_handler(MessageHandler(filters.Regex(r"^🔗 Ссылки и инфо$"), admin_open_links))
     app.add_handler(MessageHandler(filters.Regex(r"^📊 Аналитика$"), admin_open_analytics))
