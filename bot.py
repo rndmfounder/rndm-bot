@@ -780,6 +780,7 @@ ensure_column("giveaways", "results_broadcast_at", "TEXT")
 ensure_column("giveaways", "autobroadcast_enabled", "INTEGER NOT NULL DEFAULT 0")
 ensure_column("giveaways", "autobroadcast_per_day", "INTEGER NOT NULL DEFAULT 2")
 ensure_column("giveaways", "autobroadcast_last_at", "TEXT")
+ensure_column("referrals", "qualified_at", "TEXT")
 
 GIVEAWAY_AUTOBROADCAST_MIN_PER_DAY = 1
 GIVEAWAY_AUTOBROADCAST_MAX_PER_DAY = 48
@@ -1131,13 +1132,66 @@ def get_referral_top(limit: int = 20):
             COUNT(r.invited_id) AS invites_count
         FROM referrals r
         LEFT JOIN users u ON u.user_id = r.inviter_id
-        GROUP BY r.inviter_id
+        WHERE r.qualified_at IS NOT NULL
+        GROUP BY r.inviter_id, u.username, u.first_name
         ORDER BY invites_count DESC, r.inviter_id ASC
         LIMIT ?
         """,
         (limit,),
     )
     return cursor.fetchall()
+
+
+def get_qualified_referrals_count(user_id: int) -> int:
+    """Сколько приглашённых совершили первый заказ (один раз на аккаунт)."""
+    cursor.execute(
+        "SELECT COUNT(*) FROM referrals WHERE inviter_id = ? AND qualified_at IS NOT NULL",
+        (user_id,),
+    )
+    return int(cursor.fetchone()[0] or 0)
+
+
+def referral_tier_from_qualified_count(n: int) -> tuple[str, str, int]:
+    """Ключ ранга, эмодзи, персональная скидка % для самого пригласившего."""
+    n = int(n)
+    if n >= 80:
+        return ("GLOBAL", "🌍", 20)
+    if n >= 40:
+        return ("BIGSTAR", "🌟", 15)
+    if n >= 20:
+        return ("GOLD", "🥇", 12)
+    return ("SILVER", "🥈", 10)
+
+
+def referral_next_tier_hint(qualified: int) -> str:
+    """Краткая строка «до следующего ранга»."""
+    if qualified < 20:
+        return f"До 🥇 GOLD: ещё {20 - qualified} с заказом"
+    if qualified < 40:
+        return f"До 🌟 BIGSTAR: ещё {40 - qualified} с заказом"
+    if qualified < 80:
+        return f"До 🌍 GLOBAL: ещё {80 - qualified} с заказом"
+    return "Максимальный ранг 🌍"
+
+
+def get_inviter_personal_discount_percent(user_id: int) -> int:
+    q = get_qualified_referrals_count(user_id)
+    _, _, pct = referral_tier_from_qualified_count(q)
+    return pct
+
+
+def maybe_qualify_referral_on_first_order(invited_user_id: int) -> None:
+    """Первый заказ приглашённого → засчитываем другу пригласившего (один раз)."""
+    cursor.execute("SELECT COUNT(*) FROM orders WHERE user_id = ?", (invited_user_id,))
+    if int(cursor.fetchone()[0] or 0) != 1:
+        return
+    cursor.execute(
+        "UPDATE referrals SET qualified_at = ? WHERE invited_id = ? AND qualified_at IS NULL",
+        (now_iso(), invited_user_id),
+    )
+    if cursor.rowcount:
+        conn.commit()
+        log_action(invited_user_id, "referral_qualified", "first_order")
 
 
 def get_active_giveaway():
@@ -1865,7 +1919,12 @@ def cart_text(user_id: int) -> str:
     if not rows:
         return "🛒 *Корзина пока пустая.*"
 
-    lines = ["🛒 *ТВОЯ КОРЗИНА*\n"]
+    q_ok = get_qualified_referrals_count(user_id)
+    tier_key, tier_em, ref_pct = referral_tier_from_qualified_count(q_ok)
+    lines = [
+        "🛒 *ТВОЯ КОРЗИНА*\n",
+        f"{tier_em} *Ранг:* {tier_key} · скидка *{ref_pct}%* · друзей с заказом: *{q_ok}*\n",
+    ]
     for _, quantity, label, price, _ in rows:
         if price > 0:
             lines.append(f"• {label} — {quantity} шт × {price} ₽ = {price * quantity} ₽")
@@ -1901,7 +1960,7 @@ def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         ["📦 История заказов", "💬 Менеджер"],
         ["🛒 Наши барахолки", "🚀 Наши проекты"],
         ["🎁 Розыгрыши", "📱 Наш VK"],
-        ["🛒 Корзина", "👥 Пригласить друзей"],
+        ["🛒 Корзина", "🎁 Получить халяву"],
     ]
     if is_admin(user_id):
         keyboard.append(["⚙️ Админка"])
@@ -2200,6 +2259,13 @@ def build_manager_order_message_html(order_row: tuple, claimed_by_user) -> tuple
     rating_avg, rating_count = rating_summary_for_user(user_id)
     rating_text = f"{rating_avg:.2f}/5 ({rating_count} оценок)" if rating_count > 0 else "пока нет"
 
+    q_ref = get_qualified_referrals_count(user_id)
+    rk, r_em, r_pct = referral_tier_from_qualified_count(q_ref)
+    ref_rank_line = (
+        f"⭐️ <b>Реф. ранг клиента:</b> {r_em} <b>{html_esc(rk)}</b> · "
+        f"персональная скидка <b>{r_pct}%</b> · с заказом друзей: <b>{q_ref}</b>"
+    )
+
     total_line = format_price(subtotal) if subtotal > 0 else "цена уточняется"
     final_line = format_price(total_sum) if total_sum > 0 else "цена уточняется"
 
@@ -2213,6 +2279,7 @@ def build_manager_order_message_html(order_row: tuple, claimed_by_user) -> tuple
         f"Телефон: {html_esc(phone)}",
         f"Контактный username: {html_esc(contact_username)}",
         f"Рейтинг клиента: {html_esc(rating_text)}",
+        ref_rank_line,
     ]
 
     if order_type == "delivery":
@@ -2224,6 +2291,9 @@ def build_manager_order_message_html(order_row: tuple, claimed_by_user) -> tuple
     if promo_code:
         blocks.append(f"Промокод: {html_esc(promo_code)}")
         blocks.append(f"Скидка: -{int(discount_percent or 0)}%")
+        blocks.append(f"Размер скидки: {int(discount_amount or 0)} ₽")
+    elif int(discount_percent or 0) > 0:
+        blocks.append(f"Скидка по рангу: -{int(discount_percent)}%")
         blocks.append(f"Размер скидки: {int(discount_amount or 0)} ₽")
 
     try:
@@ -2495,6 +2565,8 @@ def clear_order_context(context: ContextTypes.DEFAULT_TYPE) -> None:
         "checkout_address",
         "checkout_time",
         "checkout_promocode",
+        "checkout_promo_percent",
+        "checkout_referral_percent",
         "checkout_discount_percent",
         "checkout_discount_amount",
         "checkout_total_before_discount",
@@ -2525,6 +2597,21 @@ def collect_checkout_items(user_id: int, buy_now_item_id):
             "quantity": quantity,
         })
     return result
+
+
+def recalculate_checkout_totals(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    """Скидка заказа = max(промокод %, персональный % по реф. рангу пригласившего)."""
+    items = collect_checkout_items(user_id, context.user_data.get("checkout_buy_now_item_id"))
+    total_sum = build_total_sum(items)
+    promo_pct = int(context.user_data.get("checkout_promo_percent") or 0)
+    ref_pct = get_inviter_personal_discount_percent(user_id)
+    eff = promo_pct if promo_pct > ref_pct else ref_pct
+    context.user_data["checkout_referral_percent"] = ref_pct
+    context.user_data["checkout_discount_percent"] = eff
+    final_sum, discount_amount = apply_discount_to_total(total_sum, eff)
+    context.user_data["checkout_total_before_discount"] = total_sum
+    context.user_data["checkout_total_after_discount"] = final_sum
+    context.user_data["checkout_discount_amount"] = discount_amount
 
 
 def build_items_text(items: list[dict]) -> str:
@@ -2602,14 +2689,19 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
     contact_username = context.user_data.get("checkout_username")
     address = context.user_data.get("checkout_address")
     delivery_time = context.user_data.get("checkout_time")
-    promocode = context.user_data.get("checkout_promocode")
-    discount_percent = context.user_data.get("checkout_discount_percent", 0)
+    promocode_raw = context.user_data.get("checkout_promocode")
+    promo_pct = int(context.user_data.get("checkout_promo_percent") or 0)
+    ref_pct = get_inviter_personal_discount_percent(user.id)
+    if promo_pct > ref_pct:
+        discount_percent = promo_pct
+        promo_db = (promocode_raw or "").strip().upper() if promocode_raw else None
+    else:
+        discount_percent = ref_pct
+        promo_db = None
 
     items_text = build_items_text(items)
     total_sum = build_total_sum(items)
     final_sum, discount_amount = apply_discount_to_total(total_sum, discount_percent)
-
-    promo_db = promocode.strip().upper() if promocode else None
 
     if USE_POSTGRES:
         cursor.execute(
@@ -2673,6 +2765,7 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
         )
         order_id = cursor.lastrowid
     conn.commit()
+    maybe_qualify_referral_on_first_order(user.id)
     log_action(user.id, "order_created", f"order_id={order_id};total={final_sum};type={order_type}")
 
     row = fetch_order_row_for_manager_card(order_id)
@@ -2846,15 +2939,25 @@ async def begin_checkout(query, context: ContextTypes.DEFAULT_TYPE, buy_now_item
     total_line = format_price(total_sum) if total_sum > 0 else "цена уточняется"
 
     context.user_data["checkout_promocode"] = None
-    context.user_data["checkout_discount_percent"] = 0
-    context.user_data["checkout_discount_amount"] = 0
-    context.user_data["checkout_total_before_discount"] = total_sum
-    context.user_data["checkout_total_after_discount"] = total_sum
+    context.user_data["checkout_promo_percent"] = 0
+    recalculate_checkout_totals(context, query.from_user.id)
+    ref_pct = int(context.user_data.get("checkout_referral_percent") or 0)
+    q_ok = get_qualified_referrals_count(query.from_user.id)
+    tier_key, tier_em, _ = referral_tier_from_qualified_count(q_ok)
+    after_ref = int(context.user_data.get("checkout_total_after_discount") or total_sum)
+    pay_hint = format_price(after_ref) if after_ref > 0 else "цена уточняется"
+    ref_line = (
+        f"{tier_em} *Твой ранг:* {tier_key} · скидка по рангу *{ref_pct}%*\n"
+        f"_{referral_next_tier_hint(q_ok)}_\n"
+        f"При оформлении действует *лучшая* из скидок: промокод или ранг.\n"
+        f"Сейчас к оплате с учётом ранга: *{pay_hint}* (если без промокода).\n\n"
+    )
 
     await _checkout_reply_after_query(
         context,
         query,
         f"🧾 ОФОРМЛЕНИЕ ЗАКАЗА\n\n"
+        f"{ref_line}"
         f"Товары:\n{items_text}\n\n"
         f"Итого без скидки: {total_line}\n\n"
         f"Если у тебя есть промокод — отправь его сейчас сообщением.\n"
@@ -2876,20 +2979,24 @@ async def checkout_promocode_input(update: Update, context: ContextTypes.DEFAULT
         )
         return ORDER_PROMOCODE_WAITING
 
-    items = collect_checkout_items(user.id, context.user_data.get("checkout_buy_now_item_id"))
-    total_sum = build_total_sum(items)
-    final_sum, discount_amount = apply_discount_to_total(total_sum, discount)
-
     context.user_data["checkout_promocode"] = code
-    context.user_data["checkout_discount_percent"] = discount
-    context.user_data["checkout_discount_amount"] = discount_amount
-    context.user_data["checkout_total_before_discount"] = total_sum
-    context.user_data["checkout_total_after_discount"] = final_sum
+    context.user_data["checkout_promo_percent"] = int(discount)
+    recalculate_checkout_totals(context, user.id)
+    eff = int(context.user_data.get("checkout_discount_percent") or 0)
+    ref_pct = int(context.user_data.get("checkout_referral_percent") or 0)
+    final_sum = int(context.user_data.get("checkout_total_after_discount") or 0)
+    discount_amount = int(context.user_data.get("checkout_discount_amount") or 0)
+    if int(discount) > ref_pct:
+        src = f"промокод *-{discount}%*"
+    elif ref_pct > int(discount):
+        src = f"ранг *-{ref_pct}%* (выгоднее промокода)"
+    else:
+        src = f"промокод и ранг *-{eff}%*"
 
     await safe_send(
         update,
-        f"✅ Промокод применён: *{code}*\n"
-        f"Скидка: *-{discount}%*\n"
+        f"✅ Учтено: {src}\n"
+        f"Итоговая скидка: *-{eff}%*\n"
         f"Размер скидки: *{discount_amount} ₽*\n"
         f"Итого к оплате: *{final_sum} ₽*\n\n"
         f"Теперь выбери тип заказа:",
@@ -2904,13 +3011,8 @@ async def checkout_skip_promocode(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
 
     context.user_data["checkout_promocode"] = None
-    context.user_data["checkout_discount_percent"] = 0
-    context.user_data["checkout_discount_amount"] = 0
-
-    items = collect_checkout_items(query.from_user.id, context.user_data.get("checkout_buy_now_item_id"))
-    total_sum = build_total_sum(items)
-    context.user_data["checkout_total_before_discount"] = total_sum
-    context.user_data["checkout_total_after_discount"] = total_sum
+    context.user_data["checkout_promo_percent"] = 0
+    recalculate_checkout_totals(context, query.from_user.id)
 
     await _checkout_reply_after_query(
         context,
@@ -2997,8 +3099,10 @@ async def checkout_delivery_time(update: Update, context: ContextTypes.DEFAULT_T
         clear_order_context(context)
         return ConversationHandler.END
 
+    promo_pct = int(context.user_data.get("checkout_promo_percent") or 0)
+    ref_pct = get_inviter_personal_discount_percent(user.id)
     promocode = context.user_data.get("checkout_promocode")
-    if promocode:
+    if promocode and promo_pct > ref_pct:
         mark_promocode_used(promocode)
 
     if not context.user_data.get("checkout_buy_now_item_id"):
@@ -3098,8 +3202,10 @@ async def checkout_pickup_username(update: Update, context: ContextTypes.DEFAULT
         clear_order_context(context)
         return ConversationHandler.END
 
+    promo_pct = int(context.user_data.get("checkout_promo_percent") or 0)
+    ref_pct = get_inviter_personal_discount_percent(user.id)
     promocode = context.user_data.get("checkout_promocode")
-    if promocode:
+    if promocode and promo_pct > ref_pct:
         mark_promocode_used(promocode)
 
     if not context.user_data.get("checkout_buy_now_item_id"):
@@ -3274,13 +3380,19 @@ async def manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def my_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     save_user(user)
-    invites_count = get_referrals_count(user.id)
+    all_ref = get_referrals_count(user.id)
+    q_ok = get_qualified_referrals_count(user.id)
+    tier_key, tier_em, disc = referral_tier_from_qualified_count(q_ok)
     ref_link = build_ref_link(context.bot.username, user.id)
 
     text = (
-        "👥 *Твоя реферальная программа*\n\n"
-        "Приглашай друзей в бота по своей ссылке и участвуй в розыгрышах.\n\n"
-        f"Твои приглашения: *{invites_count}*\n\n"
+        "🎁 *Получить халяву*\n\n"
+        f"{tier_em} *Твой ранг:* {tier_key}\n"
+        f"*Персональная скидка в магазине:* {disc}% (лучшая из ранга и промокода)\n"
+        f"_{referral_next_tier_hint(q_ok)}_\n\n"
+        f"По ссылке зашли: *{all_ref}*\n"
+        f"Совершили первый заказ: *{q_ok}* (в ранг идут только они)\n\n"
+        "Когда приглашённый оформляет *первый* заказ, засчитывается тебе в ранг (один раз с аккаунта друга).\n\n"
     )
     if ref_link:
         text += f"Твоя ссылка:\n`{ref_link}`"
@@ -3606,6 +3718,8 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pickup_count = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM referrals")
     referrals_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM referrals WHERE qualified_at IS NOT NULL")
+    referrals_qualified = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(DISTINCT inviter_id) FROM referrals")
     inviters_count = cursor.fetchone()[0]
 
@@ -3615,7 +3729,8 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Пользователей: *{users_count}*\n"
         f"Товарных кнопок: *{items_count}*\n"
         f"Точек самовывоза: *{pickup_count}*\n"
-        f"Реф. приглашений: *{referrals_count}*\n"
+        f"Реф. переходов: *{referrals_count}*\n"
+        f"Реф. с первым заказом: *{referrals_qualified}*\n"
         f"Активных рефереров: *{inviters_count}*\n"
         f"Выдано промокодов: *{codes_count}*\n"
         f"Использовано промокодов: *{used_count}*\n"
@@ -5973,7 +6088,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^🛒 Корзина$"), show_cart))
     app.add_handler(MessageHandler(filters.Regex(r"^📦 История заказов$"), show_order_history))
     app.add_handler(MessageHandler(filters.Regex(r"^🎰 Крутить скидку$"), spin))
-    app.add_handler(MessageHandler(filters.Regex(r"^👥 Пригласить друзей$"), my_referrals))
+    app.add_handler(MessageHandler(filters.Regex(r"^🎁 Получить халяву$"), my_referrals))
     app.add_handler(MessageHandler(filters.Regex(r"^💬 Менеджер$"), manager))
     app.add_handler(MessageHandler(filters.Regex(r"^📱 Наш VK$"), vk))
     app.add_handler(MessageHandler(filters.Regex(r"^🛒 Наши барахолки$"), baraholki))
