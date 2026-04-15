@@ -1361,14 +1361,29 @@ def build_ref_link(bot_username: str, user_id: int) -> str:
 def build_giveaway_announce_caption(
     bot_username: str, user_id: int, giveaway_id: int, title: str, text_value: str
 ) -> str:
+    """Текст анонса в HTML (parse_mode=HTML). Иначе Markdown ломается на _, *, [ в title/text_value."""
     ref_link = build_ref_link(bot_username, user_id)
     my_count = get_giveaway_referrals_count(giveaway_id, user_id)
+    t = html.escape(str(title) if title is not None else "")
+    body = html.escape(str(text_value) if text_value is not None else "")
+    link = html.escape(ref_link) if ref_link else "—"
     return (
-        f"🎁 *{title}*\n\n"
-        f"{text_value}\n\n"
-        f"Твои приглашения в этом розыгрыше: *{my_count}*\n"
-        f"Твоя ссылка для участия:\n`{ref_link}`"
+        f"🎁 <b>{t}</b>\n\n"
+        f"{body}\n\n"
+        f"Твои приглашения в этом розыгрыше: <b>{my_count}</b>\n"
+        f"Твоя ссылка для участия:\n<code>{link}</code>"
     )
+
+
+def ru_times_per_day_word(n: int) -> str:
+    """Склонение: 1 раз, 2 раза, 5 раз, 11 раз, 22 раза."""
+    n = int(n)
+    n10, n100 = n % 10, n % 100
+    if n10 == 1 and n100 != 11:
+        return "раз"
+    if 2 <= n10 <= 4 and n100 not in (12, 13, 14):
+        return "раза"
+    return "раз"
 
 
 def giveaway_autobroadcast_interval_seconds(per_day: int) -> float:
@@ -3151,12 +3166,12 @@ async def giveaways(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if photo:
             try:
                 await update.message.reply_photo(
-                    photo=photo, caption=text, parse_mode="Markdown", reply_markup=markup
+                    photo=photo, caption=text, parse_mode="HTML", reply_markup=markup
                 )
                 return
             except Exception:
                 logger.exception("Ошибка отправки фото активного розыгрыша")
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 
 async def manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3317,7 +3332,7 @@ def _giveaway_autobroadcast_status_lines(active: tuple | None) -> list[str]:
     lines = [
         f"🎁 Активный розыгрыш: *{title}* (ID `{gid}`)",
         f"📣 Авторассылка: *{'включена' if en else 'выключена'}*",
-        f"📅 Частота: *{per_day}* раз в сутки (интервал {interval_hr})",
+        f"📅 Частота: *{per_day}* {ru_times_per_day_word(per_day)} в сутки (интервал {interval_hr})",
         "Текст и кнопки — как у пользователя в «🎁 Розыгрыши» (у каждого своя ссылка и счётчик).",
     ]
     if last_at:
@@ -3450,8 +3465,7 @@ async def admin_giveaway_autobroadcast_per_day_save(update: Update, context: Con
     log_action(update.effective_user.id, "giveaway_autobroadcast_per_day", f"giveaway_id={gid};per_day={n}")
     await safe_send(
         update,
-        f"✅ Установлено: *{n}* раз в сутки (интервал {format_giveaway_autobroadcast_interval_ru(n)}).",
-        parse_mode="Markdown",
+        f"✅ Установлено: {n} {ru_times_per_day_word(n)} в сутки (интервал {format_giveaway_autobroadcast_interval_ru(n)}).",
         reply_markup=admin_giveaway_autobroadcast_keyboard(),
     )
     return ConversationHandler.END
@@ -4343,11 +4357,11 @@ async def send_giveaway_announce_broadcast(
         try:
             if (photo or "").strip():
                 await context.bot.send_photo(
-                    chat_id=uid, photo=photo, caption=caption, parse_mode="Markdown", reply_markup=markup
+                    chat_id=uid, photo=photo, caption=caption, parse_mode="HTML", reply_markup=markup
                 )
             else:
                 await context.bot.send_message(
-                    chat_id=uid, text=caption, parse_mode="Markdown", reply_markup=markup
+                    chat_id=uid, text=caption, parse_mode="HTML", reply_markup=markup
                 )
             sent += 1
         except Exception as e:
@@ -4357,6 +4371,8 @@ async def send_giveaway_announce_broadcast(
                 blocked += 1
             reason = str(e).split(":", 1)[0][:80]
             reason_stats[reason] = reason_stats.get(reason, 0) + 1
+            if failed <= 3:
+                logger.warning("giveaway announce: uid=%s err=%s", uid, e)
     return sent, failed, blocked, reason_stats
 
 
@@ -4436,10 +4452,14 @@ async def admin_giveaway_autobroadcast_once_now(update: Update, context: Context
     )
     conn.commit()
     log_action(update.effective_user.id, "giveaway_announce_once", f"giveaway_id={gid};sent={sent};failed={failed}")
+    detail_line = ""
+    if reason_stats:
+        detail_line = "\n" + "\n".join(f"• {k}: {v}" for k, v in sorted(reason_stats.items(), key=lambda x: -x[1]))
     await safe_send(
         update,
         f"✅ Разовая рассылка анонса завершена.\n"
-        f"Отправлено: {sent}\nОшибок: {failed}\nНедоставка/блок: {blocked}",
+        f"Отправлено: {sent}\nОшибок: {failed}\nНедоставка/блок: {blocked}"
+        f"{detail_line}",
         reply_markup=admin_giveaway_autobroadcast_keyboard(),
     )
 
