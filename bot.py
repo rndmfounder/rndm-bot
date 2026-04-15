@@ -10,7 +10,6 @@ from datetime import datetime, timedelta
 from itertools import count
 
 from telegram import (
-    CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
@@ -25,6 +24,11 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+try:
+    from telegram import CopyTextButton
+except ImportError:
+    CopyTextButton = None  # type: ignore[misc, assignment]
 
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
@@ -2004,7 +2008,7 @@ def order_status_keyboard(
 ) -> InlineKeyboardMarkup:
     rows = []
     addr = (address_plain or "").strip()
-    if addr:
+    if addr and CopyTextButton is not None:
         rows.append(
             [InlineKeyboardButton("📋 Скопировать адрес", copy_text=CopyTextButton(text=addr[:256]))]
         )
