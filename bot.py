@@ -2564,6 +2564,12 @@ def build_manager_order_message_html(order_row: tuple, claimed_by_user) -> tuple
     except Exception:
         order_time_str = str(created_at)
 
+    pay_block = (
+        "<b>▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬</b>\n"
+        "💰 <b>ИТОГО К ОПЛАТЕ</b>\n"
+        f"<code>  {html_esc(final_line)}  </code>\n"
+        "<b>▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬</b>"
+    )
     blocks.extend(
         [
             f"Время: {html_esc(delivery_time)}",
@@ -2571,9 +2577,11 @@ def build_manager_order_message_html(order_row: tuple, claimed_by_user) -> tuple
             "Товары:",
             html_esc(items_text),
             "",
-            f"Сумма до скидки: {html_esc(total_line)}",
-            f"Итого к оплате: {html_esc(final_line)}",
-            f"Время заказа: {html_esc(order_time_str)}",
+            f"<i>Сумма до скидки:</i> {html_esc(total_line)}",
+            "",
+            pay_block,
+            "",
+            f"<i>Время заказа:</i> {html_esc(order_time_str)}",
         ]
     )
 
