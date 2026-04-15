@@ -198,6 +198,7 @@ ADMIN_WELCOME_BUTTONS_WAITING = next(_state)
 ADMIN_REFERRAL_HUB_PHOTO_WAITING = next(_state)
 ADMIN_CREATE_PROMO_CODE_WAITING = next(_state)
 ADMIN_CREATE_PROMO_DISCOUNT_WAITING = next(_state)
+ADMIN_CREATE_PROMO_MAX_USES_WAITING = next(_state)
 ADMIN_CREATE_PROMO_DURATION_WAITING = next(_state)
 ADMIN_REVOKE_PROMO_WAITING = next(_state)
 
@@ -793,6 +794,24 @@ ensure_column("referrals", "qualified_at", "TEXT")
 ensure_column("promocodes", "admin_global", "INTEGER NOT NULL DEFAULT 0")
 ensure_column("promocodes", "expires_at", "TEXT")
 ensure_column("promocodes", "revoked_at", "TEXT")
+ensure_column("promocodes", "max_uses", "INTEGER NOT NULL DEFAULT 1")
+ensure_column("promocodes", "use_count", "INTEGER NOT NULL DEFAULT 0")
+
+
+def migrate_promocode_usage_counters() -> None:
+    """Одноразовая подгонка: лимит 1 раз, счётчик из флага used."""
+    try:
+        cursor.execute("UPDATE promocodes SET max_uses = 1 WHERE max_uses IS NULL")
+        cursor.execute("UPDATE promocodes SET use_count = 0 WHERE use_count IS NULL")
+        cursor.execute(
+            "UPDATE promocodes SET use_count = 1 WHERE COALESCE(used, 0) = 1 AND COALESCE(use_count, 0) = 0"
+        )
+        conn.commit()
+    except Exception:
+        logger.exception("migrate_promocode_usage_counters")
+
+
+migrate_promocode_usage_counters()
 
 GIVEAWAY_AUTOBROADCAST_MIN_PER_DAY = 1
 GIVEAWAY_AUTOBROADCAST_MAX_PER_DAY = 48
@@ -2876,7 +2895,8 @@ def get_promocode(code: str):
     cursor.execute(
         """
         SELECT code, discount, used, created_at, used_at, owner_user_id,
-               COALESCE(admin_global, 0), expires_at, revoked_at
+               COALESCE(admin_global, 0), expires_at, revoked_at,
+               COALESCE(max_uses, 1), COALESCE(use_count, 0)
         FROM promocodes
         WHERE code = ?
         """,
@@ -2900,31 +2920,59 @@ def validate_promocode_for_user(code: str, user_id: int):
         admin_global,
         expires_at,
         revoked_at,
+        max_uses,
+        use_count,
     ) = promo
 
     if owner_user_id and owner_user_id != user_id:
         return False, "⛔ Этот промокод принадлежит другому пользователю.", None
 
-    if used:
-        return False, "⚠️ Этот промокод уже использован.", None
-
     if promocode_is_revoked(revoked_at):
         return False, "⛔ Промокод отключён администратором.", None
+
+    mu = int(max_uses or 0)
+    uc = int(use_count or 0)
 
     if int(admin_global or 0):
         if promocode_admin_expired(expires_at):
             return False, "⌛ Срок действия промокода истёк.", None
-    elif not is_code_active(created_at):
-        return False, "⌛ Срок действия промокода истёк.", None
+        if mu > 0 and uc >= mu:
+            return False, "⚠️ Лимит использований промокода исчерпан.", None
+    else:
+        if used:
+            return False, "⚠️ Этот промокод уже использован.", None
+        if not is_code_active(created_at):
+            return False, "⌛ Срок действия промокода истёк.", None
 
     return True, "✅ Промокод применён.", discount
 
 
 def mark_promocode_used(code: str) -> None:
+    code_u = code.strip().upper()
     cursor.execute(
-        "UPDATE promocodes SET used = 1, used_at = ? WHERE code = ?",
-        (now_iso(), code.strip().upper()),
+        """
+        SELECT COALESCE(max_uses, 1), COALESCE(use_count, 0), COALESCE(used, 0)
+        FROM promocodes WHERE code = ?
+        """,
+        (code_u,),
     )
+    row = cursor.fetchone()
+    if not row:
+        return
+    max_u, uc, was_used = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
+    new_uc = uc + 1
+    now = now_iso()
+    if max_u == 0:
+        cursor.execute(
+            "UPDATE promocodes SET use_count = ?, used_at = ? WHERE code = ?",
+            (new_uc, now, code_u),
+        )
+    else:
+        new_used = 1 if new_uc >= max_u else was_used
+        cursor.execute(
+            "UPDATE promocodes SET use_count = ?, used = ?, used_at = ? WHERE code = ?",
+            (new_uc, new_used, now, code_u),
+        )
     conn.commit()
 
 
@@ -3545,8 +3593,10 @@ async def spin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cursor.execute(
         """
-        INSERT INTO promocodes (code, discount, used, created_at, used_at, owner_user_id)
-        VALUES (?, ?, 0, ?, NULL, ?)
+        INSERT INTO promocodes (
+            code, discount, used, created_at, used_at, owner_user_id, max_uses, use_count
+        )
+        VALUES (?, ?, 0, ?, NULL, ?, 1, 0)
         """,
         (code, discount, created_at, user.id),
     )
@@ -5801,11 +5851,15 @@ def parse_admin_promo_duration_choice(text: str) -> timedelta | None:
 def format_admin_promos_revoke_list() -> str:
     cursor.execute(
         """
-        SELECT code, discount, expires_at, created_at, revoked_at
+        SELECT code, discount, expires_at, created_at,
+               COALESCE(max_uses, 1), COALESCE(use_count, 0)
         FROM promocodes
         WHERE COALESCE(admin_global, 0) = 1
-          AND COALESCE(used, 0) = 0
           AND revoked_at IS NULL
+          AND NOT (
+              COALESCE(max_uses, 1) > 0
+              AND COALESCE(use_count, 0) >= COALESCE(max_uses, 1)
+          )
         ORDER BY created_at DESC
         LIMIT 12
         """
@@ -5814,9 +5868,15 @@ def format_admin_promos_revoke_list() -> str:
     if not rows:
         return "— список пуст —"
     lines = []
-    for code, disc, exp, cre, _rev in rows:
+    for code, disc, exp, cre, mu, uc in rows:
         exp_s = "без срока" if not (exp or "").strip() else f"до {_format_short_date_iso(exp)}"
-        lines.append(f"• <code>{html_esc(code)}</code> — −{disc}% ({exp_s})")
+        mu_i = int(mu or 0)
+        uc_i = int(uc or 0)
+        if mu_i == 0:
+            lim_s = f"исп. {uc_i}/∞"
+        else:
+            lim_s = f"исп. {uc_i}/{mu_i}"
+        lines.append(f"• <code>{html_esc(code)}</code> — −{disc}% · {lim_s} · {exp_s}")
     return "\n".join(lines)
 
 
@@ -5832,13 +5892,14 @@ async def admin_create_promo_start(update: Update, context: ContextTypes.DEFAULT
         return ConversationHandler.END
     context.user_data.pop("admin_new_promo_code", None)
     context.user_data.pop("admin_new_promo_discount", None)
+    context.user_data.pop("admin_new_promo_max_uses", None)
     await safe_send(
         update,
         "🎫 *Создание промокода*\n\n"
         "Отправь код одним сообщением (латиница и цифры, 4–24 символа), "
         "или напиши `авто` — подберу свободный в формате `RNDM-XXXXXX`.\n\n"
-        "Дальше укажешь скидку и срок: *1 день*, *1 неделя* или *1 месяц*. "
-        "Промокод смогут вводить все клиенты (один раз на код, пока не истёк срок и пока его не отозвали).\n"
+        "Дальше: *скидка* → *сколько раз можно применить* (`0` = без лимита) → "
+        "срок *1 день / неделя / месяц*. Отозвать код можно в любой момент в админке.\n"
         "/cancel — отмена.",
         parse_mode="Markdown",
         reply_markup=admin_keyboard(),
@@ -5855,6 +5916,7 @@ async def admin_create_promo_code_step(update: Update, context: ContextTypes.DEF
     raw = update.message.text.strip()
     if raw in ADMIN_ESCAPE_LABELS:
         context.user_data.pop("admin_new_promo_discount", None)
+        context.user_data.pop("admin_new_promo_max_uses", None)
         return await admin_escape_conversation(update, context)
     low = raw.lower()
     if low == "авто":
@@ -5914,13 +5976,73 @@ async def admin_create_promo_discount_step(update: Update, context: ContextTypes
     if get_promocode(code):
         context.user_data.pop("admin_new_promo_code", None)
         context.user_data.pop("admin_new_promo_discount", None)
+        context.user_data.pop("admin_new_promo_max_uses", None)
         await safe_send(update, "❌ Код занят. Начни заново.", reply_markup=admin_keyboard())
         return ConversationHandler.END
     context.user_data["admin_new_promo_discount"] = pct
     await safe_send(
         update,
-        f"Скидка: *{pct}%*\n\nВыбери срок действия промокода кнопкой ниже "
-        "(от текущего момента): *1 день*, *1 неделя* или *1 месяц*.",
+        f"Скидка: *{pct}%*\n\n"
+        "Сколько раз можно *применить* этот код при оформлении заказов?\n"
+        "Отправь целое число: *0* — без ограничений (пока действует срок), "
+        "или например *1*, *5*, *100*.\n"
+        "Максимум вводимого числа: *999999*.",
+        parse_mode="Markdown",
+        reply_markup=admin_keyboard(),
+    )
+    return ADMIN_CREATE_PROMO_MAX_USES_WAITING
+
+
+ADMIN_PROMO_MAX_USES_CAP = 999_999
+
+
+async def admin_create_promo_max_uses_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    code = context.user_data.get("admin_new_promo_code")
+    pct = context.user_data.get("admin_new_promo_discount")
+    if not code or pct is None:
+        await safe_send(update, "❌ Сессия сброшена. Начни с «🎫 Создать промокод».", reply_markup=admin_keyboard())
+        return ConversationHandler.END
+    if not update.message or not update.message.text:
+        await safe_send(update, "Введи число использований (0 = без лимита).", reply_markup=admin_keyboard())
+        return ADMIN_CREATE_PROMO_MAX_USES_WAITING
+    raw = update.message.text.strip()
+    if raw in ADMIN_ESCAPE_LABELS:
+        context.user_data.pop("admin_new_promo_code", None)
+        context.user_data.pop("admin_new_promo_discount", None)
+        context.user_data.pop("admin_new_promo_max_uses", None)
+        return await admin_escape_conversation(update, context)
+    try:
+        lim = int(raw)
+    except ValueError:
+        await safe_send(
+            update,
+            "❌ Нужно целое число: *0* (без лимита) или от *1* до *999999*.",
+            parse_mode="Markdown",
+            reply_markup=admin_keyboard(),
+        )
+        return ADMIN_CREATE_PROMO_MAX_USES_WAITING
+    if lim < 0 or lim > ADMIN_PROMO_MAX_USES_CAP:
+        await safe_send(
+            update,
+            f"❌ Допустимо: *0* или от *1* до *{ADMIN_PROMO_MAX_USES_CAP}*.",
+            parse_mode="Markdown",
+            reply_markup=admin_keyboard(),
+        )
+        return ADMIN_CREATE_PROMO_MAX_USES_WAITING
+    if get_promocode(code):
+        context.user_data.pop("admin_new_promo_code", None)
+        context.user_data.pop("admin_new_promo_discount", None)
+        context.user_data.pop("admin_new_promo_max_uses", None)
+        await safe_send(update, "❌ Код занят. Начни заново.", reply_markup=admin_keyboard())
+        return ConversationHandler.END
+    context.user_data["admin_new_promo_max_uses"] = lim
+    lim_human = "без лимита (∞)" if lim == 0 else str(lim)
+    await safe_send(
+        update,
+        f"Лимит: *{lim_human}* использований.\n\n"
+        "Выбери срок действия кнопкой: *1 день*, *1 неделя* или *1 месяц*.",
         parse_mode="Markdown",
         reply_markup=admin_promo_duration_keyboard(),
     )
@@ -5932,7 +6054,8 @@ async def admin_create_promo_duration_step(update: Update, context: ContextTypes
         return ConversationHandler.END
     code = context.user_data.get("admin_new_promo_code")
     pct = context.user_data.get("admin_new_promo_discount")
-    if not code or pct is None:
+    max_uses = context.user_data.get("admin_new_promo_max_uses")
+    if not code or pct is None or max_uses is None:
         await safe_send(update, "❌ Сессия сброшена. Начни с «🎫 Создать промокод».", reply_markup=admin_keyboard())
         return ConversationHandler.END
     if not update.message or not update.message.text:
@@ -5946,6 +6069,7 @@ async def admin_create_promo_duration_step(update: Update, context: ContextTypes
     if raw in ADMIN_ESCAPE_LABELS:
         context.user_data.pop("admin_new_promo_code", None)
         context.user_data.pop("admin_new_promo_discount", None)
+        context.user_data.pop("admin_new_promo_max_uses", None)
         return await admin_escape_conversation(update, context)
     delta = parse_admin_promo_duration_choice(raw)
     if not delta:
@@ -5959,33 +6083,38 @@ async def admin_create_promo_duration_step(update: Update, context: ContextTypes
     if get_promocode(code):
         context.user_data.pop("admin_new_promo_code", None)
         context.user_data.pop("admin_new_promo_discount", None)
+        context.user_data.pop("admin_new_promo_max_uses", None)
         await safe_send(update, "❌ Код занят. Начни заново.", reply_markup=admin_keyboard())
         return ConversationHandler.END
     created_at = now_iso()
     expires_dt = datetime.now() + delta
     expires_at = expires_dt.isoformat(timespec="seconds")
+    mu = int(max_uses)
     cursor.execute(
         """
         INSERT INTO promocodes (
-            code, discount, used, created_at, used_at, owner_user_id, admin_global, expires_at, revoked_at
+            code, discount, used, created_at, used_at, owner_user_id, admin_global,
+            expires_at, revoked_at, max_uses, use_count
         )
-        VALUES (?, ?, 0, ?, NULL, NULL, 1, ?, NULL)
+        VALUES (?, ?, 0, ?, NULL, NULL, 1, ?, NULL, ?, 0)
         """,
-        (code, int(pct), created_at, expires_at),
+        (code, int(pct), created_at, expires_at, mu),
     )
     conn.commit()
     context.user_data.pop("admin_new_promo_code", None)
     context.user_data.pop("admin_new_promo_discount", None)
+    context.user_data.pop("admin_new_promo_max_uses", None)
     log_action(
         update.effective_user.id,
         "admin_create_promo",
-        f"code={code};discount={pct};expires_at={expires_at}",
+        f"code={code};discount={pct};expires_at={expires_at};max_uses={mu}",
     )
     human_until = expires_dt.strftime("%d.%m.%Y %H:%M")
+    lim_line = "без лимита по числу использований" if mu == 0 else f"до *{mu}* применений (на разные заказы)"
     await safe_send(
         update,
         f"✅ Промокод `{code}` создан: скидка *{pct}%*, действует *до {human_until}*.\n"
-        f"Любой клиент может применить его при оформлении (один раз), пока не истёк срок. "
+        f"{lim_line}.\n"
         f"Отозвать досрочно: «🛑 Отозвать промокод».",
         parse_mode="Markdown",
         reply_markup=admin_keyboard(),
@@ -6037,6 +6166,8 @@ async def admin_revoke_promo_code_step(update: Update, context: ContextTypes.DEF
         admin_global,
         expires_at,
         revoked_at,
+        max_uses,
+        use_count,
     ) = promo
     if not int(admin_global or 0):
         await safe_send(
@@ -6046,8 +6177,14 @@ async def admin_revoke_promo_code_step(update: Update, context: ContextTypes.DEF
             reply_markup=admin_keyboard(),
         )
         return ConversationHandler.END
-    if used:
-        await safe_send(update, "⚠️ Промокод уже использован — отзыв не нужен.", reply_markup=admin_keyboard())
+    mu = int(max_uses or 0)
+    uc = int(use_count or 0)
+    if mu > 0 and uc >= mu:
+        await safe_send(
+            update,
+            "⚠️ Лимит использований уже исчерпан — отзыв не нужен.",
+            reply_markup=admin_keyboard(),
+        )
         return ConversationHandler.END
     if promocode_is_revoked(revoked_at):
         await safe_send(update, "ℹ️ Этот промокод уже был отозван.", reply_markup=admin_keyboard())
@@ -6203,7 +6340,8 @@ async def check_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute(
         """
         SELECT code, discount, used, created_at, used_at, owner_user_id,
-               COALESCE(admin_global, 0), expires_at, revoked_at
+               COALESCE(admin_global, 0), expires_at, revoked_at,
+               COALESCE(max_uses, 1), COALESCE(use_count, 0)
         FROM promocodes WHERE code = ?
         """,
         (code,),
@@ -6213,10 +6351,21 @@ async def check_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(update, "❌ Промокод не найден")
         return
 
-    _, discount, used, created_at, used_at, owner_user_id, admin_g, expires_at, revoked_at = row
-    if used:
-        await safe_send(update, f"⚠️ Промокод уже использован\nСкидка: -{discount}%\nКогда использован: {used_at}")
-        return
+    (
+        _c,
+        discount,
+        used,
+        created_at,
+        used_at,
+        owner_user_id,
+        admin_g,
+        expires_at,
+        revoked_at,
+        max_uses,
+        use_count,
+    ) = row
+    mu = int(max_uses or 0)
+    uc = int(use_count or 0)
 
     if promocode_is_revoked(revoked_at):
         await safe_send(update, f"⛔ Промокод отозван администратором\nСкидка была: -{discount}%")
@@ -6229,9 +6378,19 @@ async def check_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⌛ Срок админского промокода истёк\nСкидка была: -{discount}%\nДействовал до: {expires_at or '—'}",
             )
             return
-    elif not is_code_active(created_at):
-        await safe_send(update, f"⌛ Промокод просрочен\nСкидка была: -{discount}%\nСоздан: {created_at}")
-        return
+        if mu > 0 and uc >= mu:
+            await safe_send(
+                update,
+                f"⚠️ Лимит использований исчерпан\nСкидка: -{discount}%\nИспользовано: {uc}/{mu}",
+            )
+            return
+    else:
+        if used:
+            await safe_send(update, f"⚠️ Промокод уже использован\nСкидка: -{discount}%\nКогда использован: {used_at}")
+            return
+        if not is_code_active(created_at):
+            await safe_send(update, f"⌛ Промокод просрочен\nСкидка была: -{discount}%\nСоздан: {created_at}")
+            return
 
     if int(admin_g or 0):
         exp_line = (
@@ -6239,14 +6398,19 @@ async def check_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if (expires_at or "").strip()
             else "Срок: не задан (старый код)\n"
         )
+        if mu == 0:
+            lim_line = f"Использований: {uc} (∞ без лимита)\n"
+        else:
+            lim_line = f"Использований: {uc}/{mu}\n"
         kind = "админский"
     else:
         exp_line = ""
+        lim_line = ""
         kind = "крутилка (12 ч от создания)"
     await safe_send(
         update,
         f"✅ Промокод активен ({kind})\nСкидка: -{discount}%\nСоздан: {created_at}\n"
-        f"{exp_line}Владелец user_id: {owner_user_id}",
+        f"{exp_line}{lim_line}Владелец user_id: {owner_user_id}",
     )
 
 
@@ -6258,7 +6422,8 @@ async def use_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = context.args[0].strip().upper()
     cursor.execute(
         """
-        SELECT used, created_at, discount, COALESCE(admin_global, 0), expires_at, revoked_at
+        SELECT used, created_at, discount, COALESCE(admin_global, 0), expires_at, revoked_at,
+               COALESCE(max_uses, 1), COALESCE(use_count, 0)
         FROM promocodes WHERE code = ?
         """,
         (code,),
@@ -6268,10 +6433,9 @@ async def use_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(update, "❌ Промокод не найден")
         return
 
-    used, created_at, discount, admin_g, expires_at, revoked_at = row
-    if used:
-        await safe_send(update, "⚠️ Промокод уже использован")
-        return
+    used, created_at, discount, admin_g, expires_at, revoked_at, max_uses, use_count = row
+    mu = int(max_uses or 0)
+    uc = int(use_count or 0)
 
     if promocode_is_revoked(revoked_at):
         await safe_send(update, "⛔ Промокод отозван")
@@ -6281,12 +6445,18 @@ async def use_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if promocode_admin_expired(expires_at):
             await safe_send(update, "⌛ Срок промокода истёк")
             return
-    elif not is_code_active(created_at):
-        await safe_send(update, "⌛ Промокод просрочен")
-        return
+        if mu > 0 and uc >= mu:
+            await safe_send(update, "⚠️ Лимит использований исчерпан")
+            return
+    else:
+        if used:
+            await safe_send(update, "⚠️ Промокод уже использован")
+            return
+        if not is_code_active(created_at):
+            await safe_send(update, "⌛ Промокод просрочен")
+            return
 
-    cursor.execute("UPDATE promocodes SET used = 1, used_at = ? WHERE code = ?", (now_iso(), code))
-    conn.commit()
+    mark_promocode_used(code)
     await safe_send(update, f"✅ Промокод {code} активирован\nСкидка: -{discount}%")
 
 
@@ -6740,6 +6910,9 @@ def main():
             ],
             ADMIN_CREATE_PROMO_DISCOUNT_WAITING: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_create_promo_discount_step),
+            ],
+            ADMIN_CREATE_PROMO_MAX_USES_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_create_promo_max_uses_step),
             ],
             ADMIN_CREATE_PROMO_DURATION_WAITING: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_create_promo_duration_step),
