@@ -1207,7 +1207,7 @@ def get_referral_top(limit: int = 20):
 
 
 def get_qualified_referrals_count(user_id: int) -> int:
-    """Сколько приглашённых совершили первый заказ (один раз на аккаунт)."""
+    """Сколько приглашённых получили засчёт в ранг (первый заказ со статусом «Выдан»)."""
     _, q = get_referral_hub_counts(user_id)
     return q
 
@@ -1230,13 +1230,13 @@ def referral_next_tier_hint(qualified: int) -> str:
     """Краткая строка «до следующего ранга»."""
     q = int(qualified)
     if q < 20:
-        return f"До 🥈 SILVER: ещё {20 - q} с заказом"
+        return f"До 🥈 SILVER: ещё {20 - q} с выданным заказом"
     if q < 41:
-        return f"До 🥇 GOLD: ещё {41 - q} с заказом"
+        return f"До 🥇 GOLD: ещё {41 - q} с выданным заказом"
     if q < 61:
-        return f"До 🌟 BIGSTAR: ещё {61 - q} с заказом"
+        return f"До 🌟 BIGSTAR: ещё {61 - q} с выданным заказом"
     if q < 101:
-        return f"До 🌍 GLOBAL: ещё {101 - q} с заказом"
+        return f"До 🌍 GLOBAL: ещё {101 - q} с выданным заказом"
     return "Максимальный ранг 🌍"
 
 
@@ -1292,7 +1292,9 @@ def _order_type_ru(order_type: str | None) -> str:
 
 
 def get_inviter_referrals_detail(inviter_id: int) -> list[tuple]:
-    """Строки: invited_id, ref_at, qualified_at, username, first_name, order_id, order_type, items_text, total_sum, order_at."""
+    """Строки: invited_id, ref_at, qualified_at, username, first_name,
+    первый заказ (любой): id, type, items, sum, at, status;
+    первый выданный: id, type, items, sum, at."""
     cursor.execute(
         """
         SELECT
@@ -1301,16 +1303,27 @@ def get_inviter_referrals_detail(inviter_id: int) -> list[tuple]:
             r.qualified_at,
             COALESCE(u.username, ''),
             COALESCE(u.first_name, ''),
-            fo.order_id,
-            fo.order_type,
-            fo.items_text,
-            fo.total_sum,
-            fo.created_at
+            po.order_id,
+            po.order_type,
+            po.items_text,
+            po.total_sum,
+            po.created_at,
+            COALESCE(po.status, 'new'),
+            qo.order_id,
+            qo.order_type,
+            qo.items_text,
+            qo.total_sum,
+            qo.created_at
         FROM referrals r
         LEFT JOIN users u ON u.user_id = r.invited_id
-        LEFT JOIN orders fo ON fo.user_id = r.invited_id
-            AND fo.order_id = (
+        LEFT JOIN orders po ON po.user_id = r.invited_id
+            AND po.order_id = (
                 SELECT MIN(oi.order_id) FROM orders oi WHERE oi.user_id = r.invited_id
+            )
+        LEFT JOIN orders qo ON qo.user_id = r.invited_id
+            AND qo.order_id = (
+                SELECT MIN(oi.order_id) FROM orders oi
+                WHERE oi.user_id = r.invited_id AND COALESCE(oi.status, '') = 'done'
             )
         WHERE r.inviter_id = ?
         ORDER BY
@@ -1333,7 +1346,7 @@ def build_referral_cabinet_html_chunks(inviter_id: int) -> list[str]:
             "📊 <b>Личный кабинет</b>\n"
             "━━━━━━━━━━━━━━━━\n\n"
             "Пока <b>никто не переходил</b> по твоей ссылке.\n\n"
-            "Поделись ссылкой из раздела «Получить халяву» — здесь появятся друзья и их первые заказы."
+            "Поделись ссылкой из раздела «Получить халяву» — здесь появятся друзья; в ранг идут после выдачи заказа."
         ]
 
     blocks: list[str] = []
@@ -1344,11 +1357,17 @@ def build_referral_cabinet_html_chunks(inviter_id: int) -> list[str]:
             qualified_at,
             username,
             first_name,
-            order_id,
-            order_type,
-            items_text,
-            total_sum,
-            order_at,
+            p_oid,
+            p_type,
+            p_items,
+            p_sum,
+            p_at,
+            p_status,
+            q_oid,
+            q_type,
+            q_items,
+            q_sum,
+            q_at,
         ) = row
         name = (first_name or "").strip() or "Без имени"
         uname = (username or "").strip()
@@ -1359,13 +1378,16 @@ def build_referral_cabinet_html_chunks(inviter_id: int) -> list[str]:
             f"📎 Переход по ссылке: {_format_short_date(ref_at)}",
         ]
         if qualified_at:
-            block_lines.append("✅ <b>В ранге</b> (первый заказ засчитан)")
-            if order_id is not None:
-                block_lines.append(f"🧾 Заказ №<code>{order_id}</code> · {_format_short_date(order_at)}")
-                block_lines.append(f"📦 Тип: {_order_type_ru(order_type)}")
-                ts = int(total_sum or 0)
+            block_lines.append("✅ <b>В ранге</b> (засчитан после статуса «Выдан»)")
+            oid, ot, itxt, sm, oat = q_oid, q_type, q_items, q_sum, q_at
+            if oid is None:
+                oid, ot, itxt, sm, oat = p_oid, p_type, p_items, p_sum, p_at
+            if oid is not None:
+                block_lines.append(f"🧾 Заказ №<code>{oid}</code> · {_format_short_date(oat)}")
+                block_lines.append(f"📦 Тип: {_order_type_ru(ot)}")
+                ts = int(sm or 0)
                 block_lines.append(f"💰 К оплате: <b>{ts} ₽</b>")
-                raw_items = (items_text or "").strip()
+                raw_items = (itxt or "").strip()
                 if raw_items:
                     snippet = raw_items.replace("\n", " · ")
                     if len(snippet) > 320:
@@ -1374,14 +1396,21 @@ def build_referral_cabinet_html_chunks(inviter_id: int) -> list[str]:
             else:
                 block_lines.append("<i>Детали заказа не найдены в базе.</i>")
         else:
-            block_lines.append("⏳ <b>Пока без первого заказа</b> — в ранг не засчитано")
+            if p_oid is not None:
+                st_ru = html_esc(order_status_label_ru(p_status))
+                block_lines.append(
+                    f"⏳ <b>В ранг не засчитано</b> — нужен статус заказа <b>«Выдан»</b>.\n"
+                    f"🧾 Первый заказ №<code>{p_oid}</code> · сейчас: <b>{st_ru}</b>"
+                )
+            else:
+                block_lines.append("⏳ <b>Заказа ещё не было</b> — в ранг не засчитано")
 
         blocks.append("\n".join(block_lines))
 
     header_main = (
         "📊 <b>Личный кабинет</b>\n"
         "━━━━━━━━━━━━━━━━\n"
-        f"<i>По ссылке человек: {len(rows)}. В ранг — только с первым заказом.</i>\n\n"
+        f"<i>По ссылке человек: {len(rows)}. В ранг — после выдачи первого заказа (статус «Выдан»).</i>\n\n"
     )
     header_next = "📊 <b>Личный кабинет</b> <i>(продолжение)</i>\n━━━━━━━━━━━━━━━━\n\n"
 
@@ -1410,9 +1439,12 @@ def get_inviter_personal_discount_percent(user_id: int) -> int:
     return pct
 
 
-def maybe_qualify_referral_on_first_order(invited_user_id: int) -> None:
-    """Первый заказ приглашённого → засчитываем другу пригласившего (один раз)."""
-    cursor.execute("SELECT COUNT(*) FROM orders WHERE user_id = ?", (invited_user_id,))
+def maybe_qualify_referral_on_first_completed_order(invited_user_id: int) -> None:
+    """Первый заказ приглашённого в статусе «Выдан» (done) → засчитываем пригласившему (один раз)."""
+    cursor.execute(
+        "SELECT COUNT(*) FROM orders WHERE user_id = ? AND COALESCE(status, '') = ?",
+        (invited_user_id, "done"),
+    )
     if int(cursor.fetchone()[0] or 0) != 1:
         return
     cursor.execute(
@@ -1421,7 +1453,7 @@ def maybe_qualify_referral_on_first_order(invited_user_id: int) -> None:
     )
     if cursor.rowcount:
         conn.commit()
-        log_action(invited_user_id, "referral_qualified", "first_order")
+        log_action(invited_user_id, "referral_qualified", "first_order_done")
 
 
 def get_active_giveaway():
@@ -2177,7 +2209,7 @@ def cart_text(user_id: int) -> str:
     tier_key, tier_em, ref_pct = referral_tier_from_qualified_count(q_ok)
     lines = [
         "🛒 *ТВОЯ КОРЗИНА*\n",
-        f"{tier_em} *Ранг:* {tier_key} · скидка *{ref_pct}%* · друзей с заказом: *{q_ok}*\n",
+        f"{tier_em} *Ранг:* {tier_key} · скидка *{ref_pct}%* · в ранге друзей: *{q_ok}*\n",
     ]
     for _, quantity, label, price, _ in rows:
         if price > 0:
@@ -2414,6 +2446,11 @@ ORDER_STATUS_META = {
 }
 
 
+def order_status_label_ru(status: str | None) -> str:
+    key = (status or "").strip() or "new"
+    return ORDER_STATUS_META.get(key, ORDER_STATUS_META["new"])[1]
+
+
 def order_status_keyboard(
     order_id: int, client_user_id: int, address_plain: str | None = None
 ) -> InlineKeyboardMarkup:
@@ -2526,7 +2563,7 @@ def build_manager_order_message_html(order_row: tuple, claimed_by_user) -> tuple
     rk, r_em, r_pct = referral_tier_from_qualified_count(q_ref)
     ref_rank_line = (
         f"⭐️ <b>Реф. ранг клиента:</b> {r_em} <b>{html_esc(rk)}</b> · "
-        f"персональная скидка <b>{r_pct}%</b> · с заказом друзей: <b>{q_ref}</b>"
+        f"персональная скидка <b>{r_pct}%</b> · в ранге друзей (выдан заказ): <b>{q_ref}</b>"
     )
 
     total_line = format_price(subtotal) if subtotal > 0 else "цена уточняется"
@@ -3082,7 +3119,6 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
         )
         order_id = cursor.lastrowid
     conn.commit()
-    maybe_qualify_referral_on_first_order(user.id)
     log_action(user.id, "order_created", f"order_id={order_id};total={final_sum};type={order_type}")
 
     row = fetch_order_row_for_manager_card(order_id)
@@ -3146,6 +3182,9 @@ async def order_status_callback(update: Update, context: ContextTypes.DEFAULT_TY
         logger.exception("order_status: ошибка UPDATE orders order_id=%s", order_id)
         await answer_once("Не удалось сохранить статус в БД. Напиши разработчику.", show_alert=True)
         return
+
+    if new_status == "done":
+        maybe_qualify_referral_on_first_completed_order(client_user_id)
 
     message = query.message
     toast = "Статус обновлён"
@@ -3714,10 +3753,10 @@ async def my_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{progress_block}\n\n"
         f"<b>Статистика</b>\n"
         f"· по ссылке зашли: <b>{all_ref}</b>\n"
-        f"· с первым заказом: <b>{q_ok}</b>\n"
+        f"· в ранге (выдан первый заказ): <b>{q_ok}</b>\n"
         f"<i>{hint}</i>\n\n"
-        "Когда друг оформляет <b>первый</b> заказ, он попадает в твой ранг "
-        "(один раз с одного аккаунта). Детали — в «Личный кабинет».\n\n"
+        "Друг засчитывается в ранг, когда его <b>первый</b> заказ переведён в статус "
+        "<b>«Выдан»</b> (один раз с аккаунта друга). Детали — в «Личный кабинет».\n\n"
     )
     if ref_link:
         text += f"<b>Твоя ссылка</b>\n<code>{html_esc(ref_link)}</code>"
@@ -3734,7 +3773,7 @@ async def my_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━━\n\n"
             f"{tier_em} <b>Ранг:</b> {html_esc(tier_key)} · <b>скидка {disc}%</b>\n"
             f"{progress_block}\n\n"
-            f"👥 <b>{all_ref}</b> по ссылке · ✅ <b>{q_ok}</b> с заказом\n"
+            f"👥 <b>{all_ref}</b> по ссылке · ✅ <b>{q_ok}</b> в ранге\n"
             f"<i>{hint}</i>\n\n"
             "<i>Подробности и состав заказов друзей — кнопка «Личный кабинет».</i>\n\n"
         )
@@ -4145,7 +4184,7 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Товарных кнопок: *{items_count}*\n"
         f"Точек самовывоза: *{pickup_count}*\n"
         f"Реф. переходов: *{referrals_count}*\n"
-        f"Реф. с первым заказом: *{referrals_qualified}*\n"
+        f"Реф. в ранге (выдан заказ): *{referrals_qualified}*\n"
         f"Активных рефереров: *{inviters_count}*\n"
         f"Выдано промокодов: *{codes_count}*\n"
         f"Использовано промокодов: *{used_count}*\n"
