@@ -195,6 +195,7 @@ ADMIN_WELCOME_MENU_WAITING = next(_state)
 ADMIN_WELCOME_TEXT_WAITING = next(_state)
 ADMIN_WELCOME_PHOTO_WAITING = next(_state)
 ADMIN_WELCOME_BUTTONS_WAITING = next(_state)
+ADMIN_REFERRAL_HUB_PHOTO_WAITING = next(_state)
 
 ORDER_PROMOCODE_WAITING = next(_state)
 ORDER_CHOICE_WAITING = next(_state)
@@ -1003,6 +1004,21 @@ def set_welcome_photo_value(file_id: str) -> None:
 
 def clear_welcome_photo_value() -> None:
     set_setting("welcome_photo", "")
+
+
+REFERRAL_HUB_PHOTO_KEY = "referral_hub_photo"
+
+
+def get_referral_hub_photo() -> str:
+    return (get_setting(REFERRAL_HUB_PHOTO_KEY, "") or "").strip()
+
+
+def set_referral_hub_photo(file_id: str) -> None:
+    set_setting(REFERRAL_HUB_PHOTO_KEY, (file_id or "").strip())
+
+
+def clear_referral_hub_photo() -> None:
+    set_setting(REFERRAL_HUB_PHOTO_KEY, "")
 
 
 def get_welcome_buttons_raw() -> list:
@@ -2061,8 +2077,16 @@ def admin_links_keyboard() -> ReplyKeyboardMarkup:
             ["🗂 Инфо-блоки", "💬 Ссылка на менеджера"],
             ["🛒 Ссылка на барахолки", "🚀 Ссылка на проекты"],
             ["🎁 Ссылка на розыгрыши"],
+            ["🖼 Фото: Получить халяву"],
             ["↩️ Админка"],
         ],
+        resize_keyboard=True,
+    )
+
+
+def admin_referral_hub_photo_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [["🗑 Убрать фото"], ["↩️ Админка"]],
         resize_keyboard=True,
     )
 
@@ -3399,12 +3423,76 @@ async def my_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         text += "Ссылка временно недоступна, попробуй позже."
 
+    msg = update.message
+    if not msg:
+        return
+    photo_id = get_referral_hub_photo()
+    if photo_id:
+        try:
+            await msg.reply_photo(
+                photo=photo_id,
+                caption=text,
+                parse_mode="Markdown",
+                reply_markup=my_referrals_keyboard(),
+            )
+            return
+        except Exception:
+            logger.exception("my_referrals: не удалось отправить фото экрана халявы")
+    await msg.reply_text(text, parse_mode="Markdown", reply_markup=my_referrals_keyboard())
+
+
+async def admin_referral_hub_photo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
     await safe_send(
         update,
-        text,
+        "🖼 *Фото для «Получить халяву»*\n\n"
+        "Пользователи увидят это изображение вместе с текстом (ранг, статистика, ссылка) — "
+        "текст пойдёт *подписью* к фото.\n\n"
+        "Отправь *фото* сообщением.\n"
+        "Чтобы сбросить — «🗑 Убрать фото» или слово `убрать`.\n"
+        "«↩️ Админка» — выход без изменений.",
         parse_mode="Markdown",
-        reply_markup=my_referrals_keyboard(),
+        reply_markup=admin_referral_hub_photo_keyboard(),
     )
+    return ADMIN_REFERRAL_HUB_PHOTO_WAITING
+
+
+async def admin_referral_hub_photo_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    if not update.message:
+        return ADMIN_REFERRAL_HUB_PHOTO_WAITING
+
+    if update.message.text:
+        raw = update.message.text.strip()
+        low = raw.lower()
+        if raw == "🗑 Убрать фото" or low in ("убрать", "удалить", "сбросить"):
+            clear_referral_hub_photo()
+            await safe_send(
+                update,
+                "✅ Фото экрана «Получить халяву» убрано.",
+                reply_markup=admin_links_keyboard(),
+            )
+            return ConversationHandler.END
+        if raw in ADMIN_ESCAPE_LABELS:
+            return await admin_escape_conversation(update, context)
+
+    if update.message.photo:
+        set_referral_hub_photo(update.message.photo[-1].file_id)
+        await safe_send(
+            update,
+            "✅ Фото сохранено. Пользователи увидят его при нажатии «🎁 Получить халяву».",
+            reply_markup=admin_links_keyboard(),
+        )
+        return ConversationHandler.END
+
+    await safe_send(
+        update,
+        "❌ Отправь фото или нажми «🗑 Убрать фото».",
+        reply_markup=admin_referral_hub_photo_keyboard(),
+    )
+    return ADMIN_REFERRAL_HUB_PHOTO_WAITING
 
 
 async def admin_info_blocks_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5941,6 +6029,17 @@ def main():
         fallbacks=[*ADMIN_CONV_FALLBACKS, MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main)],
     )
 
+    referral_hub_photo_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🖼 Фото: Получить халяву$"), admin_referral_hub_photo_start)],
+        states={
+            ADMIN_REFERRAL_HUB_PHOTO_WAITING: [
+                MessageHandler(filters.PHOTO, admin_referral_hub_photo_save),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_referral_hub_photo_save),
+            ],
+        },
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
+    )
+
     add_pickup_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^➕ Добавить точку$"), admin_add_pickup_start)],
         states={ADMIN_ADD_PICKUP_NAME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_pickup_name)]},
@@ -6053,6 +6152,7 @@ def main():
     app.add_handler(checkout_conv)
     app.add_handler(CallbackQueryHandler(pickup_select_stale_fallback, pattern=r"^pickup_select:\d+$"))
     app.add_handler(info_blocks_conv)
+    app.add_handler(referral_hub_photo_conv)
     app.add_handler(broadcast_conv)
     app.add_handler(baraholki_conv)
     app.add_handler(projects_conv)
