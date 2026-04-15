@@ -1217,6 +1217,170 @@ def referral_next_tier_hint(qualified: int) -> str:
     return "Максимальный ранг 🌍"
 
 
+def referral_next_milestone(qualified: int) -> tuple[int | None, str]:
+    """Порог следующего ранга (для прогресс-бара) и короткая метка."""
+    q = max(0, int(qualified))
+    if q < 20:
+        return 20, "SILVER"
+    if q < 41:
+        return 41, "GOLD"
+    if q < 61:
+        return 61, "BIGSTAR"
+    if q < 101:
+        return 101, "GLOBAL"
+    return None, "MAX"
+
+
+def referral_progress_bar_html(qualified: int, width: int = 14) -> str:
+    """Визуальная полоса прогресса до следующего ранга (HTML)."""
+    q = max(0, int(qualified))
+    target, label = referral_next_milestone(q)
+    if target is None:
+        return (
+            "<b>📈 Прогресс</b>\n"
+            "<code>████████████████</code>\n"
+            "🏆 <i>Максимальный ранг — дальше только больше друзей в статистике.</i>"
+        )
+    filled = int(round(min(1.0, q / target) * width)) if target else 0
+    filled = max(0, min(width, filled))
+    bar = "█" * filled + "░" * (width - filled)
+    return (
+        f"<b>📈 Прогресс до {html_esc(label)}</b>\n"
+        f"<code>{bar}</code>  <b>{q}</b> / <b>{target}</b>\n"
+        f"<i>{html_esc(referral_next_tier_hint(q))}</i>"
+    )
+
+
+def _format_short_date(iso_ts: str | None) -> str:
+    if not (iso_ts or "").strip():
+        return "—"
+    raw = iso_ts.strip()
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt.strftime("%d.%m.%Y")
+    except Exception:
+        return raw[:16] if len(raw) > 16 else raw
+
+
+def _order_type_ru(order_type: str | None) -> str:
+    if (order_type or "").strip() == "delivery":
+        return "Доставка"
+    return "Самовывоз"
+
+
+def get_inviter_referrals_detail(inviter_id: int) -> list[tuple]:
+    """Строки: invited_id, ref_at, qualified_at, username, first_name, order_id, order_type, items_text, total_sum, order_at."""
+    cursor.execute(
+        """
+        SELECT
+            r.invited_id,
+            r.created_at,
+            r.qualified_at,
+            COALESCE(u.username, ''),
+            COALESCE(u.first_name, ''),
+            fo.order_id,
+            fo.order_type,
+            fo.items_text,
+            fo.total_sum,
+            fo.created_at
+        FROM referrals r
+        LEFT JOIN users u ON u.user_id = r.invited_id
+        LEFT JOIN orders fo ON fo.user_id = r.invited_id
+            AND fo.order_id = (
+                SELECT MIN(oi.order_id) FROM orders oi WHERE oi.user_id = r.invited_id
+            )
+        WHERE r.inviter_id = ?
+        ORDER BY
+            CASE WHEN r.qualified_at IS NOT NULL THEN 0 ELSE 1 END,
+            r.created_at DESC
+        """,
+        (inviter_id,),
+    )
+    return cursor.fetchall()
+
+
+REFERRAL_CABINET_CHUNK = 3600
+
+
+def build_referral_cabinet_html_chunks(inviter_id: int) -> list[str]:
+    """Сообщения HTML для личного кабинета (разбивка по лимиту Telegram)."""
+    rows = get_inviter_referrals_detail(inviter_id)
+    if not rows:
+        return [
+            "📊 <b>Личный кабинет</b>\n"
+            "━━━━━━━━━━━━━━━━\n\n"
+            "Пока <b>никто не переходил</b> по твоей ссылке.\n\n"
+            "Поделись ссылкой из раздела «Получить халяву» — здесь появятся друзья и их первые заказы."
+        ]
+
+    blocks: list[str] = []
+    for i, row in enumerate(rows, start=1):
+        (
+            invited_id,
+            ref_at,
+            qualified_at,
+            username,
+            first_name,
+            order_id,
+            order_type,
+            items_text,
+            total_sum,
+            order_at,
+        ) = row
+        name = (first_name or "").strip() or "Без имени"
+        uname = (username or "").strip()
+        who = f"@{html_esc(uname)}" if uname else html_esc(name)
+        block_lines = [
+            f"<b>{i}.</b> {who}",
+            f"🆔 <code>{invited_id}</code>",
+            f"📎 Переход по ссылке: {_format_short_date(ref_at)}",
+        ]
+        if qualified_at:
+            block_lines.append("✅ <b>В ранге</b> (первый заказ засчитан)")
+            if order_id is not None:
+                block_lines.append(f"🧾 Заказ №<code>{order_id}</code> · {_format_short_date(order_at)}")
+                block_lines.append(f"📦 Тип: {_order_type_ru(order_type)}")
+                ts = int(total_sum or 0)
+                block_lines.append(f"💰 К оплате: <b>{ts} ₽</b>")
+                raw_items = (items_text or "").strip()
+                if raw_items:
+                    snippet = raw_items.replace("\n", " · ")
+                    if len(snippet) > 320:
+                        snippet = snippet[:320] + "…"
+                    block_lines.append(f"🛒 <b>Состав:</b>\n{html_esc(snippet)}")
+            else:
+                block_lines.append("<i>Детали заказа не найдены в базе.</i>")
+        else:
+            block_lines.append("⏳ <b>Пока без первого заказа</b> — в ранг не засчитано")
+
+        blocks.append("\n".join(block_lines))
+
+    header_main = (
+        "📊 <b>Личный кабинет</b>\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"<i>По ссылке человек: {len(rows)}. В ранг — только с первым заказом.</i>\n\n"
+    )
+    header_next = "📊 <b>Личный кабинет</b> <i>(продолжение)</i>\n━━━━━━━━━━━━━━━━\n\n"
+
+    messages: list[str] = []
+    cur = header_main
+    sep = "\n\n──────────────\n\n"
+    for i, b in enumerate(blocks):
+        prefix = "" if i == 0 else sep
+        nxt = cur + prefix + b
+        if len(nxt) > REFERRAL_CABINET_CHUNK and cur != header_main:
+            messages.append(cur)
+            cur = header_next + b
+        else:
+            cur = nxt
+    messages.append(cur)
+
+    total = len(messages)
+    if total > 1:
+        messages = [f"{m}\n\n<i>сообщение {i} из {total}</i>" for i, m in enumerate(messages, start=1)]
+    return messages
+
+
 def get_inviter_personal_discount_percent(user_id: int) -> int:
     q = get_qualified_referrals_count(user_id)
     _, _, pct = referral_tier_from_qualified_count(q)
@@ -1574,7 +1738,10 @@ def format_giveaway_autobroadcast_interval_ru(per_day: int) -> str:
 
 
 def my_referrals_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([["⬅️ Назад"]], resize_keyboard=True)
+    return ReplyKeyboardMarkup(
+        [["📊 Личный кабинет"], ["⬅️ Назад"]],
+        resize_keyboard=True,
+    )
 
 
 def update_last_spin(user_id: int) -> None:
@@ -3437,20 +3604,24 @@ async def my_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tier_key, tier_em, disc = referral_tier_from_qualified_count(q_ok)
     ref_link = build_ref_link(context.bot.username, user.id)
     hint = html_esc(referral_next_tier_hint(q_ok))
+    progress_block = referral_progress_bar_html(q_ok)
 
     text = (
-        "🎁 <b>Получить халяву</b>\n\n"
+        "🎁 <b>Получить халяву</b>\n"
+        "━━━━━━━━━━━━━━━━\n\n"
         f"{tier_em} <b>Твой ранг:</b> {html_esc(tier_key)}\n"
-        f"<b>Персональная скидка в магазине:</b> {disc}% "
-        "(лучшая из ранга и промокода)\n"
+        f"<b>Скидка по рангу:</b> {disc}% "
+        "<i>(с промокодом выбирается лучшая)</i>\n\n"
+        f"{progress_block}\n\n"
+        f"<b>Статистика</b>\n"
+        f"· по ссылке зашли: <b>{all_ref}</b>\n"
+        f"· с первым заказом: <b>{q_ok}</b>\n"
         f"<i>{hint}</i>\n\n"
-        f"По ссылке зашли: <b>{all_ref}</b>\n"
-        f"Совершили первый заказ: <b>{q_ok}</b> (в ранг идут только они)\n\n"
-        "Когда приглашённый оформляет <b>первый</b> заказ, засчитывается тебе в ранг "
-        "(один раз с аккаунта друга).\n\n"
+        "Когда друг оформляет <b>первый</b> заказ, он попадает в твой ранг "
+        "(один раз с одного аккаунта). Детали — в «Личный кабинет».\n\n"
     )
     if ref_link:
-        text += f"Твоя ссылка:\n<code>{html_esc(ref_link)}</code>"
+        text += f"<b>Твоя ссылка</b>\n<code>{html_esc(ref_link)}</code>"
     else:
         text += "Ссылка временно недоступна, попробуй позже."
 
@@ -3458,6 +3629,20 @@ async def my_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
     photo_id = get_referral_hub_photo()
+    if photo_id and len(text) > 1000:
+        text = (
+            "🎁 <b>Получить халяву</b>\n"
+            "━━━━━━━━━━━━━━━━\n\n"
+            f"{tier_em} <b>Ранг:</b> {html_esc(tier_key)} · <b>скидка {disc}%</b>\n"
+            f"{progress_block}\n\n"
+            f"👥 <b>{all_ref}</b> по ссылке · ✅ <b>{q_ok}</b> с заказом\n"
+            f"<i>{hint}</i>\n\n"
+            "<i>Подробности и состав заказов друзей — кнопка «Личный кабинет».</i>\n\n"
+        )
+        if ref_link:
+            text += f"<code>{html_esc(ref_link)}</code>"
+        else:
+            text += "Ссылка недоступна."
     if photo_id:
         try:
             await msg.reply_photo(
@@ -3470,6 +3655,18 @@ async def my_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             logger.exception("my_referrals: не удалось отправить фото экрана халявы")
     await msg.reply_text(text, parse_mode="HTML", reply_markup=my_referrals_keyboard())
+
+
+async def referral_personal_cabinet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Детальный список приглашённых и первых заказов (личный кабинет)."""
+    user = update.effective_user
+    save_user(user)
+    msg = update.message
+    if not msg:
+        return
+    chunks = build_referral_cabinet_html_chunks(user.id)
+    for chunk in chunks:
+        await msg.reply_text(chunk, parse_mode="HTML", reply_markup=my_referrals_keyboard())
 
 
 async def admin_referral_hub_photo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6349,6 +6546,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^📦 История заказов$"), show_order_history))
     app.add_handler(MessageHandler(filters.Regex(r"^🎰 Крутить скидку$"), spin))
     app.add_handler(MessageHandler(filters.Regex(r"^🎁 Получить халяву$"), my_referrals))
+    app.add_handler(MessageHandler(filters.Regex(r"^📊 Личный кабинет$"), referral_personal_cabinet))
     app.add_handler(MessageHandler(filters.Regex(r"^💬 Менеджер$"), manager))
     app.add_handler(MessageHandler(filters.Regex(r"^📱 Наш VK$"), vk))
     app.add_handler(MessageHandler(filters.Regex(r"^🛒 Наши барахолки$"), baraholki))
