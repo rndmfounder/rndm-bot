@@ -196,6 +196,8 @@ ADMIN_WELCOME_TEXT_WAITING = next(_state)
 ADMIN_WELCOME_PHOTO_WAITING = next(_state)
 ADMIN_WELCOME_BUTTONS_WAITING = next(_state)
 ADMIN_REFERRAL_HUB_PHOTO_WAITING = next(_state)
+ADMIN_CREATE_PROMO_CODE_WAITING = next(_state)
+ADMIN_CREATE_PROMO_DISCOUNT_WAITING = next(_state)
 
 ORDER_PROMOCODE_WAITING = next(_state)
 ORDER_CHOICE_WAITING = next(_state)
@@ -257,6 +259,10 @@ class DBCursor:
     @property
     def lastrowid(self):
         return getattr(self.raw_cursor, "lastrowid", None)
+
+    @property
+    def rowcount(self):
+        return getattr(self.raw_cursor, "rowcount", -1)
 
 
 if USE_POSTGRES:
@@ -782,6 +788,7 @@ ensure_column("giveaways", "autobroadcast_enabled", "INTEGER NOT NULL DEFAULT 0"
 ensure_column("giveaways", "autobroadcast_per_day", "INTEGER NOT NULL DEFAULT 2")
 ensure_column("giveaways", "autobroadcast_last_at", "TEXT")
 ensure_column("referrals", "qualified_at", "TEXT")
+ensure_column("promocodes", "admin_global", "INTEGER NOT NULL DEFAULT 0")
 
 GIVEAWAY_AUTOBROADCAST_MIN_PER_DAY = 1
 GIVEAWAY_AUTOBROADCAST_MAX_PER_DAY = 48
@@ -1133,9 +1140,27 @@ def register_referral_if_valid(invited_user_id: int, raw_ref: str) -> bool:
     return True
 
 
+def get_referral_hub_counts(user_id: int) -> tuple[int, int]:
+    """Один запрос: переходы по ссылке и число приглашённых с первым заказом (согласованные цифры)."""
+    cursor.execute(
+        """
+        SELECT
+            COUNT(*),
+            COALESCE(SUM(CASE WHEN qualified_at IS NOT NULL THEN 1 ELSE 0 END), 0)
+        FROM referrals
+        WHERE inviter_id = ?
+        """,
+        (user_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return 0, 0
+    return int(row[0] or 0), int(row[1] or 0)
+
+
 def get_referrals_count(user_id: int) -> int:
-    cursor.execute("SELECT COUNT(*) FROM referrals WHERE inviter_id = ?", (user_id,))
-    return cursor.fetchone()[0]
+    all_ref, _ = get_referral_hub_counts(user_id)
+    return all_ref
 
 
 def get_referral_top(limit: int = 20):
@@ -1160,33 +1185,35 @@ def get_referral_top(limit: int = 20):
 
 def get_qualified_referrals_count(user_id: int) -> int:
     """Сколько приглашённых совершили первый заказ (один раз на аккаунт)."""
-    cursor.execute(
-        "SELECT COUNT(*) FROM referrals WHERE inviter_id = ? AND qualified_at IS NOT NULL",
-        (user_id,),
-    )
-    return int(cursor.fetchone()[0] or 0)
+    _, q = get_referral_hub_counts(user_id)
+    return q
 
 
 def referral_tier_from_qualified_count(n: int) -> tuple[str, str, int]:
-    """Ключ ранга, эмодзи, персональная скидка % для самого пригласившего."""
-    n = int(n)
-    if n >= 80:
-        return ("GLOBAL", "🌍", 20)
-    if n >= 40:
-        return ("BIGSTAR", "🌟", 15)
-    if n >= 20:
+    """Ключ ранга, эмодзи, персональная скидка % (друзей с 1-м заказом). BRONZE 0–19: 0%, SILVER 20–40: 10%."""
+    n = max(0, int(n))
+    if n < 20:
+        return ("BRONZE", "🥉", 0)
+    if n < 41:
+        return ("SILVER", "🥈", 10)
+    if n < 61:
         return ("GOLD", "🥇", 12)
-    return ("SILVER", "🥈", 10)
+    if n < 101:
+        return ("BIGSTAR", "🌟", 15)
+    return ("GLOBAL", "🌍", 20)
 
 
 def referral_next_tier_hint(qualified: int) -> str:
     """Краткая строка «до следующего ранга»."""
-    if qualified < 20:
-        return f"До 🥇 GOLD: ещё {20 - qualified} с заказом"
-    if qualified < 40:
-        return f"До 🌟 BIGSTAR: ещё {40 - qualified} с заказом"
-    if qualified < 80:
-        return f"До 🌍 GLOBAL: ещё {80 - qualified} с заказом"
+    q = int(qualified)
+    if q < 20:
+        return f"До 🥈 SILVER: ещё {20 - q} с заказом"
+    if q < 41:
+        return f"До 🥇 GOLD: ещё {41 - q} с заказом"
+    if q < 61:
+        return f"До 🌟 BIGSTAR: ещё {61 - q} с заказом"
+    if q < 101:
+        return f"До 🌍 GLOBAL: ещё {101 - q} с заказом"
     return "Максимальный ранг 🌍"
 
 
@@ -1988,6 +2015,7 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
         [
             ["🛍 Редактор каталога", "📣 Рассылки"],
             ["🎁 Розыгрыши (админ)", "👥 Клиенты"],
+            ["🎫 Создать промокод"],
             ["🔗 Ссылки и инфо", "📊 Аналитика"],
             ["👋 Экран приветствия"],
             ["⬅️ Назад"],
@@ -2655,7 +2683,8 @@ def build_total_sum(items: list[dict]) -> int:
 def get_promocode(code: str):
     cursor.execute(
         """
-        SELECT code, discount, used, created_at, used_at, owner_user_id
+        SELECT code, discount, used, created_at, used_at, owner_user_id,
+               COALESCE(admin_global, 0)
         FROM promocodes
         WHERE code = ?
         """,
@@ -2669,7 +2698,7 @@ def validate_promocode_for_user(code: str, user_id: int):
     if not promo:
         return False, "❌ Промокод не найден.", None
 
-    promo_code, discount, used, created_at, used_at, owner_user_id = promo
+    promo_code, discount, used, created_at, used_at, owner_user_id, admin_global = promo
 
     if owner_user_id and owner_user_id != user_id:
         return False, "⛔ Этот промокод принадлежит другому пользователю.", None
@@ -2677,7 +2706,7 @@ def validate_promocode_for_user(code: str, user_id: int):
     if used:
         return False, "⚠️ Этот промокод уже использован.", None
 
-    if not is_code_active(created_at):
+    if not int(admin_global or 0) and not is_code_active(created_at):
         return False, "⌛ Срок действия промокода истёк.", None
 
     return True, "✅ Промокод применён.", discount
@@ -3404,22 +3433,24 @@ async def manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def my_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     save_user(user)
-    all_ref = get_referrals_count(user.id)
-    q_ok = get_qualified_referrals_count(user.id)
+    all_ref, q_ok = get_referral_hub_counts(user.id)
     tier_key, tier_em, disc = referral_tier_from_qualified_count(q_ok)
     ref_link = build_ref_link(context.bot.username, user.id)
+    hint = html_esc(referral_next_tier_hint(q_ok))
 
     text = (
-        "🎁 *Получить халяву*\n\n"
-        f"{tier_em} *Твой ранг:* {tier_key}\n"
-        f"*Персональная скидка в магазине:* {disc}% (лучшая из ранга и промокода)\n"
-        f"_{referral_next_tier_hint(q_ok)}_\n\n"
-        f"По ссылке зашли: *{all_ref}*\n"
-        f"Совершили первый заказ: *{q_ok}* (в ранг идут только они)\n\n"
-        "Когда приглашённый оформляет *первый* заказ, засчитывается тебе в ранг (один раз с аккаунта друга).\n\n"
+        "🎁 <b>Получить халяву</b>\n\n"
+        f"{tier_em} <b>Твой ранг:</b> {html_esc(tier_key)}\n"
+        f"<b>Персональная скидка в магазине:</b> {disc}% "
+        "(лучшая из ранга и промокода)\n"
+        f"<i>{hint}</i>\n\n"
+        f"По ссылке зашли: <b>{all_ref}</b>\n"
+        f"Совершили первый заказ: <b>{q_ok}</b> (в ранг идут только они)\n\n"
+        "Когда приглашённый оформляет <b>первый</b> заказ, засчитывается тебе в ранг "
+        "(один раз с аккаунта друга).\n\n"
     )
     if ref_link:
-        text += f"Твоя ссылка:\n`{ref_link}`"
+        text += f"Твоя ссылка:\n<code>{html_esc(ref_link)}</code>"
     else:
         text += "Ссылка временно недоступна, попробуй позже."
 
@@ -3432,13 +3463,13 @@ async def my_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_photo(
                 photo=photo_id,
                 caption=text,
-                parse_mode="Markdown",
+                parse_mode="HTML",
                 reply_markup=my_referrals_keyboard(),
             )
             return
         except Exception:
             logger.exception("my_referrals: не удалось отправить фото экрана халявы")
-    await msg.reply_text(text, parse_mode="Markdown", reply_markup=my_referrals_keyboard())
+    await msg.reply_text(text, parse_mode="HTML", reply_markup=my_referrals_keyboard())
 
 
 async def admin_referral_hub_photo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5508,6 +5539,111 @@ def _format_welcome_buttons_preview() -> str:
     return "\n".join(lines) if lines else "— нет —"
 
 
+async def admin_create_promo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    context.user_data.pop("admin_new_promo_code", None)
+    await safe_send(
+        update,
+        "🎫 *Создание промокода*\n\n"
+        "Отправь код одним сообщением (латиница и цифры, 4–24 символа), "
+        "или напиши `авто` — подберу свободный в формате `RNDM-XXXXXX`.\n\n"
+        "Такой промокод может использовать *любой* клиент, без ограничения 12 часов.\n"
+        "/cancel — отмена.",
+        parse_mode="Markdown",
+        reply_markup=admin_keyboard(),
+    )
+    return ADMIN_CREATE_PROMO_CODE_WAITING
+
+
+async def admin_create_promo_code_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    if not update.message or not update.message.text:
+        await safe_send(update, "Нужен текст кодом.", reply_markup=admin_keyboard())
+        return ADMIN_CREATE_PROMO_CODE_WAITING
+    raw = update.message.text.strip()
+    if raw in ADMIN_ESCAPE_LABELS:
+        return await admin_escape_conversation(update, context)
+    low = raw.lower()
+    if low == "авто":
+        code = generate_code()
+        for _ in range(80):
+            if not get_promocode(code):
+                break
+            code = generate_code()
+        else:
+            await safe_send(update, "❌ Не удалось сгенерировать уникальный код. Попробуй ввести свой.", reply_markup=admin_keyboard())
+            return ADMIN_CREATE_PROMO_CODE_WAITING
+    else:
+        code = re.sub(r"[^A-Za-z0-9_-]", "", raw).upper()
+        if len(code) < 4 or len(code) > 24:
+            await safe_send(
+                update,
+                "❌ Длина кода 4–24 символа, только буквы, цифры, `-` и `_`.",
+                reply_markup=admin_keyboard(),
+            )
+            return ADMIN_CREATE_PROMO_CODE_WAITING
+        if get_promocode(code):
+            await safe_send(update, "❌ Такой код уже есть. Введи другой или `авто`.", reply_markup=admin_keyboard())
+            return ADMIN_CREATE_PROMO_CODE_WAITING
+    context.user_data["admin_new_promo_code"] = code
+    await safe_send(
+        update,
+        f"Код: `{code}`\n\nВведи скидку в процентах (целое число от *1* до *100*).",
+        parse_mode="Markdown",
+        reply_markup=admin_keyboard(),
+    )
+    return ADMIN_CREATE_PROMO_DISCOUNT_WAITING
+
+
+async def admin_create_promo_discount_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    code = context.user_data.get("admin_new_promo_code")
+    if not code:
+        await safe_send(update, "❌ Сессия сброшена. Начни с «🎫 Создать промокод».", reply_markup=admin_keyboard())
+        return ConversationHandler.END
+    if not update.message or not update.message.text:
+        await safe_send(update, "Введи число — процент скидки.", reply_markup=admin_keyboard())
+        return ADMIN_CREATE_PROMO_DISCOUNT_WAITING
+    raw = update.message.text.strip()
+    if raw in ADMIN_ESCAPE_LABELS:
+        context.user_data.pop("admin_new_promo_code", None)
+        return await admin_escape_conversation(update, context)
+    try:
+        pct = int(raw)
+    except ValueError:
+        await safe_send(update, "❌ Нужно целое число от 1 до 100.", reply_markup=admin_keyboard())
+        return ADMIN_CREATE_PROMO_DISCOUNT_WAITING
+    if not 1 <= pct <= 100:
+        await safe_send(update, "❌ Скидка только от 1 до 100%.", reply_markup=admin_keyboard())
+        return ADMIN_CREATE_PROMO_DISCOUNT_WAITING
+    if get_promocode(code):
+        context.user_data.pop("admin_new_promo_code", None)
+        await safe_send(update, "❌ Код занят. Начни заново.", reply_markup=admin_keyboard())
+        return ConversationHandler.END
+    created_at = now_iso()
+    cursor.execute(
+        """
+        INSERT INTO promocodes (code, discount, used, created_at, used_at, owner_user_id, admin_global)
+        VALUES (?, ?, 0, ?, NULL, NULL, 1)
+        """,
+        (code, pct, created_at),
+    )
+    conn.commit()
+    context.user_data.pop("admin_new_promo_code", None)
+    log_action(update.effective_user.id, "admin_create_promo", f"code={code};discount={pct}")
+    await safe_send(
+        update,
+        f"✅ Промокод `{code}` создан: скидка *{pct}%*.\n"
+        f"Любой пользователь может ввести его при оформлении заказа (одноразово, пока не использован).",
+        parse_mode="Markdown",
+        reply_markup=admin_keyboard(),
+    )
+    return ConversationHandler.END
+
+
 async def admin_welcome_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await safe_send(update, "⛔ У тебя нет доступа.")
@@ -5641,7 +5777,10 @@ async def check_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     code = context.args[0].strip().upper()
     cursor.execute(
-        "SELECT code, discount, used, created_at, used_at, owner_user_id FROM promocodes WHERE code = ?",
+        """
+        SELECT code, discount, used, created_at, used_at, owner_user_id, COALESCE(admin_global, 0)
+        FROM promocodes WHERE code = ?
+        """,
         (code,),
     )
     row = cursor.fetchone()
@@ -5649,16 +5788,20 @@ async def check_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(update, "❌ Промокод не найден")
         return
 
-    _, discount, used, created_at, used_at, owner_user_id = row
+    _, discount, used, created_at, used_at, owner_user_id, admin_g = row
     if used:
         await safe_send(update, f"⚠️ Промокод уже использован\nСкидка: -{discount}%\nКогда использован: {used_at}")
         return
 
-    if not is_code_active(created_at):
+    if not int(admin_g or 0) and not is_code_active(created_at):
         await safe_send(update, f"⌛ Промокод просрочен\nСкидка была: -{discount}%\nСоздан: {created_at}")
         return
 
-    await safe_send(update, f"✅ Промокод активен\nСкидка: -{discount}%\nСоздан: {created_at}\nВладелец user_id: {owner_user_id}")
+    kind = "админский (без срока)" if int(admin_g or 0) else "крутилка (12 ч)"
+    await safe_send(
+        update,
+        f"✅ Промокод активен ({kind})\nСкидка: -{discount}%\nСоздан: {created_at}\nВладелец user_id: {owner_user_id}",
+    )
 
 
 async def use_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5667,18 +5810,21 @@ async def use_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     code = context.args[0].strip().upper()
-    cursor.execute("SELECT used, created_at, discount FROM promocodes WHERE code = ?", (code,))
+    cursor.execute(
+        "SELECT used, created_at, discount, COALESCE(admin_global, 0) FROM promocodes WHERE code = ?",
+        (code,),
+    )
     row = cursor.fetchone()
     if not row:
         await safe_send(update, "❌ Промокод не найден")
         return
 
-    used, created_at, discount = row
+    used, created_at, discount, admin_g = row
     if used:
         await safe_send(update, "⚠️ Промокод уже использован")
         return
 
-    if not is_code_active(created_at):
+    if not int(admin_g or 0) and not is_code_active(created_at):
         await safe_send(update, "⌛ Промокод просрочен")
         return
 
@@ -6129,6 +6275,19 @@ def main():
         fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
+    create_promo_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🎫 Создать промокод$"), admin_create_promo_start)],
+        states={
+            ADMIN_CREATE_PROMO_CODE_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_create_promo_code_step),
+            ],
+            ADMIN_CREATE_PROMO_DISCOUNT_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_create_promo_discount_step),
+            ],
+        },
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
+    )
+
     welcome_screen_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^👋 Экран приветствия$"), admin_welcome_open)],
         states={
@@ -6153,6 +6312,7 @@ def main():
     app.add_handler(CallbackQueryHandler(pickup_select_stale_fallback, pattern=r"^pickup_select:\d+$"))
     app.add_handler(info_blocks_conv)
     app.add_handler(referral_hub_photo_conv)
+    app.add_handler(create_promo_conv)
     app.add_handler(broadcast_conv)
     app.add_handler(baraholki_conv)
     app.add_handler(projects_conv)
@@ -6236,4 +6396,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main() 
