@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import html
 import random
 import sqlite3
 import string
@@ -9,6 +10,7 @@ from datetime import datetime, timedelta
 from itertools import count
 
 from telegram import (
+    CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
@@ -752,10 +754,19 @@ def init_database() -> None:
     ensure_column("orders", "status", "TEXT NOT NULL DEFAULT 'new'")
     ensure_column("orders", "status_updated_at", "TEXT")
     ensure_column("orders", "status_updated_by", "BIGINT")
+    ensure_column("orders", "order_subtotal", "INTEGER")
+    ensure_column("orders", "promo_code", "TEXT")
+    ensure_column("orders", "discount_percent", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column("orders", "discount_amount", "INTEGER NOT NULL DEFAULT 0")
     ensure_column("broadcast_logs", "blocked", "INTEGER NOT NULL DEFAULT 0")
     ensure_column("broadcast_logs", "details", "TEXT")
     ensure_postgres_cart_items_primary_key()
     ensure_postgres_orders_status_updated_by_bigint()
+    try:
+        cursor.execute("UPDATE orders SET order_subtotal = total_sum WHERE order_subtotal IS NULL")
+        conn.commit()
+    except Exception:
+        logger.exception("orders.order_subtotal backfill")
 
 
 init_database()
@@ -823,7 +834,7 @@ INFO_BLOCK_DEFAULTS = {
     "vk": "📱 Наш VK\n\nЗдесь ты можешь следить за нашими точками и новостями во VK.",
     "baraholki": "🛒 Наши барахолки\n\nАктуальная информация по нашим барахолкам.",
     "projects": "🚀 Наши проекты\n\nАктуальная информация по нашим проектам.",
-    "giveaways": "🎁 Розыгрыши\n\nАктуальная информация по нашим розыгрышам.",
+    "giveaways": "🎁 Розыгрыши\n\nПока нет активного розыгрыша — загляни позже.",
 }
 
 
@@ -1988,29 +1999,162 @@ ORDER_STATUS_META = {
 }
 
 
-def order_status_keyboard(order_id: int, client_user_id: int) -> InlineKeyboardMarkup:
-    rows = [
+def order_status_keyboard(
+    order_id: int, client_user_id: int, address_plain: str | None = None
+) -> InlineKeyboardMarkup:
+    rows = []
+    addr = (address_plain or "").strip()
+    if addr:
+        rows.append(
+            [InlineKeyboardButton("📋 Скопировать адрес", copy_text=CopyTextButton(text=addr[:256]))]
+        )
+    rows.extend(
         [
-            InlineKeyboardButton("✅ Принят", callback_data=f"order_status:{order_id}:accepted"),
-            InlineKeyboardButton("🚚 В работе", callback_data=f"order_status:{order_id}:in_progress"),
-        ],
-        [
-            InlineKeyboardButton("🎉 Выдан", callback_data=f"order_status:{order_id}:done"),
-            InlineKeyboardButton("❌ Отменён", callback_data=f"order_status:{order_id}:canceled"),
-        ],
-        [
-            InlineKeyboardButton("⭐1", callback_data=f"order_rate:{order_id}:1"),
-            InlineKeyboardButton("⭐3", callback_data=f"order_rate:{order_id}:3"),
-            InlineKeyboardButton("⭐5", callback_data=f"order_rate:{order_id}:5"),
-        ],
-        [InlineKeyboardButton("👤 Профиль клиента", url=f"tg://user?id={client_user_id}")],
-    ]
+            [
+                InlineKeyboardButton("✅ Принят", callback_data=f"order_status:{order_id}:accepted"),
+                InlineKeyboardButton("🚚 В работе", callback_data=f"order_status:{order_id}:in_progress"),
+            ],
+            [
+                InlineKeyboardButton("🎉 Выдан", callback_data=f"order_status:{order_id}:done"),
+                InlineKeyboardButton("❌ Отменён", callback_data=f"order_status:{order_id}:canceled"),
+            ],
+            [
+                InlineKeyboardButton("⭐1", callback_data=f"order_rate:{order_id}:1"),
+                InlineKeyboardButton("⭐3", callback_data=f"order_rate:{order_id}:3"),
+                InlineKeyboardButton("⭐5", callback_data=f"order_rate:{order_id}:5"),
+            ],
+            [InlineKeyboardButton("👤 Профиль клиента", url=f"tg://user?id={client_user_id}")],
+        ]
+    )
     return InlineKeyboardMarkup(rows)
 
 
-def render_order_title(order_id: int, status: str) -> str:
+def html_esc(s) -> str:
+    return html.escape(str(s) if s is not None else "", quote=False)
+
+
+def format_claiming_manager_html(user) -> str:
+    if not user or not getattr(user, "id", None):
+        return ""
+    parts: list[str] = []
+    name = " ".join(
+        p
+        for p in [getattr(user, "first_name", None) or "", getattr(user, "last_name", None) or ""]
+        if p
+    ).strip()
+    if name:
+        parts.append(html_esc(name))
+    un = getattr(user, "username", None)
+    if un:
+        parts.append(html_esc("@" + un))
+    if not parts:
+        parts.append(html_esc(str(user.id)))
+    return " · ".join(parts)
+
+
+def render_order_group_header_html(order_id: int, status: str, claimed_by_user) -> str:
     icon, title = ORDER_STATUS_META.get(status, ORDER_STATUS_META["new"])
-    return f"{icon} {title} ЗАКАЗ #{order_id}"
+    status_label = html_esc(title)
+    line = f"{icon} <b>{status_label}</b> ЗАКАЗ #{order_id}"
+    if claimed_by_user is not None and getattr(claimed_by_user, "id", None):
+        mgr = format_claiming_manager_html(claimed_by_user)
+        if mgr:
+            line += f" · <b>🔥 ВЗЯЛ(А):</b> <code>{mgr}</code>"
+    return line
+
+
+def fetch_order_row_for_manager_card(order_id: int) -> tuple | None:
+    cursor.execute(
+        """
+        SELECT order_id, user_id, username, first_name, order_type, pickup_point, phone,
+               contact_username, address, delivery_time, items_text, total_sum, created_at,
+               COALESCE(status, 'new'), status_updated_by,
+               order_subtotal, promo_code, discount_percent, discount_amount
+        FROM orders WHERE order_id = ?
+        """,
+        (order_id,),
+    )
+    return cursor.fetchone()
+
+
+def build_manager_order_message_html(order_row: tuple, claimed_by_user) -> tuple[str, InlineKeyboardMarkup]:
+    (
+        order_id,
+        user_id,
+        username,
+        first_name,
+        order_type,
+        pickup_point,
+        phone,
+        contact_username,
+        address,
+        delivery_time,
+        items_text,
+        total_sum,
+        created_at,
+        status,
+        _status_updated_by,
+        order_subtotal,
+        promo_code,
+        discount_percent,
+        discount_amount,
+    ) = order_row
+
+    subtotal = order_subtotal if order_subtotal is not None else total_sum
+    header = render_order_group_header_html(order_id, status, claimed_by_user)
+
+    username_line = f"@{username}" if username else "нет username"
+    rating_avg, rating_count = rating_summary_for_user(user_id)
+    rating_text = f"{rating_avg:.2f}/5 ({rating_count} оценок)" if rating_count > 0 else "пока нет"
+
+    total_line = format_price(subtotal) if subtotal > 0 else "цена уточняется"
+    final_line = format_price(total_sum) if total_sum > 0 else "цена уточняется"
+
+    blocks: list[str] = [
+        header,
+        "",
+        f"Тип: {'Доставка' if order_type == 'delivery' else 'Самовывоз'}",
+        f"Клиент: {html_esc(first_name or '-')}",
+        f"Username: {html_esc(username_line)}",
+        f"User ID: {user_id}",
+        f"Телефон: {html_esc(phone)}",
+        f"Контактный username: {html_esc(contact_username)}",
+        f"Рейтинг клиента: {html_esc(rating_text)}",
+    ]
+
+    if order_type == "delivery":
+        addr_plain = (address or "").strip()
+        blocks.append(f"📍 <b>Адрес:</b> <code>{html_esc(addr_plain)}</code>")
+    else:
+        blocks.append(f"Точка самовывоза: {html_esc(pickup_point)}")
+
+    if promo_code:
+        blocks.append(f"Промокод: {html_esc(promo_code)}")
+        blocks.append(f"Скидка: -{int(discount_percent or 0)}%")
+        blocks.append(f"Размер скидки: {int(discount_amount or 0)} ₽")
+
+    try:
+        order_time_str = datetime.fromisoformat(created_at).strftime("%d.%m.%Y %H:%M:%S")
+    except Exception:
+        order_time_str = str(created_at)
+
+    blocks.extend(
+        [
+            f"Время: {html_esc(delivery_time)}",
+            "",
+            "Товары:",
+            html_esc(items_text),
+            "",
+            f"Сумма до скидки: {html_esc(total_line)}",
+            f"Итого к оплате: {html_esc(final_line)}",
+            f"Время заказа: {html_esc(order_time_str)}",
+        ]
+    )
+
+    text = "\n".join(blocks)
+    addr_copy = (address or "").strip() if order_type == "delivery" else None
+    markup = order_status_keyboard(order_id, user_id, address_plain=addr_copy)
+    return text, markup
 
 
 async def open_category_view(target_message, category_key: str):
@@ -2372,14 +2516,17 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
     total_sum = build_total_sum(items)
     final_sum, discount_amount = apply_discount_to_total(total_sum, discount_percent)
 
+    promo_db = promocode.strip().upper() if promocode else None
+
     if USE_POSTGRES:
         cursor.execute(
             """
             INSERT INTO orders (
                 user_id, username, first_name, order_type, pickup_point, phone,
-                contact_username, address, delivery_time, items_text, total_sum, created_at
+                contact_username, address, delivery_time, items_text, total_sum, created_at,
+                order_subtotal, promo_code, discount_percent, discount_amount
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING order_id
             """,
             (
@@ -2395,6 +2542,10 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
                 items_text,
                 final_sum,
                 now_iso(),
+                total_sum,
+                promo_db,
+                int(discount_percent or 0),
+                int(discount_amount or 0),
             ),
         )
         order_id = cursor.fetchone()[0]
@@ -2403,9 +2554,10 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
             """
             INSERT INTO orders (
                 user_id, username, first_name, order_type, pickup_point, phone,
-                contact_username, address, delivery_time, items_text, total_sum, created_at
+                contact_username, address, delivery_time, items_text, total_sum, created_at,
+                order_subtotal, promo_code, discount_percent, discount_amount
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user.id,
@@ -2420,51 +2572,27 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
                 items_text,
                 final_sum,
                 now_iso(),
+                total_sum,
+                promo_db,
+                int(discount_percent or 0),
+                int(discount_amount or 0),
             ),
         )
         order_id = cursor.lastrowid
     conn.commit()
     log_action(user.id, "order_created", f"order_id={order_id};total={final_sum};type={order_type}")
 
-    username_line = f"@{user.username}" if user.username else "нет username"
-    total_line = format_price(total_sum) if total_sum > 0 else "цена уточняется"
-    final_line = format_price(final_sum) if final_sum > 0 else "цена уточняется"
-    rating_avg, rating_count = rating_summary_for_user(user.id)
-    rating_text = f"{rating_avg:.2f}/5 ({rating_count} оценок)" if rating_count > 0 else "пока нет"
+    row = fetch_order_row_for_manager_card(order_id)
+    if not row:
+        logger.error("send_order_to_managers: заказ %s не найден после INSERT", order_id)
+        return order_id
 
-    manager_text = (
-        f"{render_order_title(order_id, 'new')}\n\n"
-        f"Тип: {'Доставка' if order_type == 'delivery' else 'Самовывоз'}\n"
-        f"Клиент: {user.first_name or '-'}\n"
-        f"Username: {username_line}\n"
-        f"User ID: {user.id}\n"
-        f"Телефон: {phone}\n"
-        f"Контактный username: {contact_username}\n"
-        f"Рейтинг клиента: {rating_text}\n"
-    )
-
-    if order_type == "delivery":
-        manager_text += f"Адрес: {address}\n"
-    else:
-        manager_text += f"Точка самовывоза: {pickup_point}\n"
-
-    if promocode:
-        manager_text += f"Промокод: {promocode}\n"
-        manager_text += f"Скидка: -{discount_percent}%\n"
-        manager_text += f"Размер скидки: {discount_amount} ₽\n"
-
-    manager_text += (
-        f"Время: {delivery_time}\n\n"
-        f"Товары:\n{items_text}\n\n"
-        f"Сумма до скидки: {total_line}\n"
-        f"Итого к оплате: {final_line}\n"
-        f"Время заказа: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
-    )
-
+    manager_text, order_markup = build_manager_order_message_html(row, None)
     await context.bot.send_message(
         chat_id=ORDER_GROUP_ID,
         text=manager_text,
-        reply_markup=order_status_keyboard(order_id, user.id),
+        parse_mode="HTML",
+        reply_markup=order_markup,
     )
     return order_id
 
@@ -2518,19 +2646,21 @@ async def order_status_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     message = query.message
     toast = "Статус обновлён"
-    if message and message.text:
-        lines = message.text.splitlines()
-        if lines:
-            lines[0] = render_order_title(order_id, new_status)
-        updated_text = "\n".join(lines)
-        try:
-            await message.edit_text(
-                updated_text,
-                reply_markup=order_status_keyboard(order_id, client_user_id),
-            )
-        except Exception:
-            logger.exception("Не удалось обновить сообщение заказа order_id=%s", order_id)
-            toast = "Статус сохранён. Не удалось обновить текст в чате."
+    if message:
+        row = fetch_order_row_for_manager_card(order_id)
+        if row:
+            updated_text, order_markup = build_manager_order_message_html(row, query.from_user)
+            try:
+                await message.edit_text(
+                    updated_text,
+                    reply_markup=order_markup,
+                    parse_mode="HTML",
+                )
+            except Exception:
+                logger.exception("Не удалось обновить сообщение заказа order_id=%s", order_id)
+                toast = "Статус сохранён. Не удалось обновить текст в чате."
+        else:
+            toast = "Статус сохранён. Не удалось перечитать заказ из БД."
 
     await answer_once(toast[:200] if toast else None)
 
@@ -3001,7 +3131,11 @@ async def giveaways(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(update.effective_user)
     active = get_active_giveaway()
     if not active:
-        await open_info_block(update, "giveaways")
+        await safe_send(
+            update,
+            "🎁 Пока нет активного розыгрыша.\n\nСледи за обновлениями — как только что-то запустим, анонс будет здесь, в боте.",
+            reply_markup=main_keyboard(update.effective_user.id),
+        )
         return
 
     giveaway_id, title, text_value, photo, _, buttons_json, _, _, _ = active
