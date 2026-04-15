@@ -1257,10 +1257,10 @@ def build_giveaway_results_caption(giveaway_id: int) -> str | None:
     if not winners:
         lines.append("— список пуст")
     else:
-        for winner_id, invites_count, username, first_name in winners:
+        for winner_id, _invites_count, username, first_name in winners:
             uname = f"@{username}" if username else "—"
             who = first_name or "—"
-            lines.append(f"• {who} ({uname}) — ID {winner_id}, приглашений: {invites_count}")
+            lines.append(f"• {who} ({uname}) — ID {winner_id}")
     lines.extend(["", "Спасибо всем за участие! 💜"])
     return "\n".join(lines)
 
@@ -4357,7 +4357,7 @@ async def admin_ref_giveaway_pick(update: Update, context: ContextTypes.DEFAULT_
         safe_username = re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", username or "")
         safe_first_name = re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", first_name or "")
         uname = f"@{safe_username}" if safe_username else "-"
-        result_lines.append(f"• {safe_first_name or '-'} ({uname}) — ID {winner_id}, приглашений: {invites_count}")
+        result_lines.append(f"• {safe_first_name or '-'} ({uname}) — ID {winner_id}")
 
         try:
             await context.bot.send_message(
