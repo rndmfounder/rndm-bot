@@ -198,6 +198,8 @@ ADMIN_WELCOME_BUTTONS_WAITING = next(_state)
 ADMIN_REFERRAL_HUB_PHOTO_WAITING = next(_state)
 ADMIN_CREATE_PROMO_CODE_WAITING = next(_state)
 ADMIN_CREATE_PROMO_DISCOUNT_WAITING = next(_state)
+ADMIN_CREATE_PROMO_DURATION_WAITING = next(_state)
+ADMIN_REVOKE_PROMO_WAITING = next(_state)
 
 ORDER_PROMOCODE_WAITING = next(_state)
 ORDER_CHOICE_WAITING = next(_state)
@@ -789,6 +791,8 @@ ensure_column("giveaways", "autobroadcast_per_day", "INTEGER NOT NULL DEFAULT 2"
 ensure_column("giveaways", "autobroadcast_last_at", "TEXT")
 ensure_column("referrals", "qualified_at", "TEXT")
 ensure_column("promocodes", "admin_global", "INTEGER NOT NULL DEFAULT 0")
+ensure_column("promocodes", "expires_at", "TEXT")
+ensure_column("promocodes", "revoked_at", "TEXT")
 
 GIVEAWAY_AUTOBROADCAST_MIN_PER_DAY = 1
 GIVEAWAY_AUTOBROADCAST_MAX_PER_DAY = 48
@@ -1775,6 +1779,27 @@ def is_code_active(created_at: str) -> bool:
     return datetime.now() - created <= timedelta(hours=12)
 
 
+def _parse_iso_datetime(raw: str | None) -> datetime | None:
+    if not raw or not str(raw).strip():
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def promocode_is_revoked(revoked_at: str | None) -> bool:
+    return bool(revoked_at and str(revoked_at).strip())
+
+
+def promocode_admin_expired(expires_at: str | None) -> bool:
+    """Админский промокод с заданным expires_at просрочен по текущему времени."""
+    dt = _parse_iso_datetime(expires_at)
+    if dt is None:
+        return False
+    return datetime.now() >= dt
+
+
 def slugify_name(name: str) -> str:
     allowed = string.ascii_lowercase + string.digits + "_"
     base = name.lower().strip().replace(" ", "_")
@@ -2182,7 +2207,7 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
         [
             ["🛍 Редактор каталога", "📣 Рассылки"],
             ["🎁 Розыгрыши (админ)", "👥 Клиенты"],
-            ["🎫 Создать промокод"],
+            ["🎫 Создать промокод", "🛑 Отозвать промокод"],
             ["🔗 Ссылки и инфо", "📊 Аналитика"],
             ["👋 Экран приветствия"],
             ["⬅️ Назад"],
@@ -2851,7 +2876,7 @@ def get_promocode(code: str):
     cursor.execute(
         """
         SELECT code, discount, used, created_at, used_at, owner_user_id,
-               COALESCE(admin_global, 0)
+               COALESCE(admin_global, 0), expires_at, revoked_at
         FROM promocodes
         WHERE code = ?
         """,
@@ -2865,7 +2890,17 @@ def validate_promocode_for_user(code: str, user_id: int):
     if not promo:
         return False, "❌ Промокод не найден.", None
 
-    promo_code, discount, used, created_at, used_at, owner_user_id, admin_global = promo
+    (
+        promo_code,
+        discount,
+        used,
+        created_at,
+        used_at,
+        owner_user_id,
+        admin_global,
+        expires_at,
+        revoked_at,
+    ) = promo
 
     if owner_user_id and owner_user_id != user_id:
         return False, "⛔ Этот промокод принадлежит другому пользователю.", None
@@ -2873,7 +2908,13 @@ def validate_promocode_for_user(code: str, user_id: int):
     if used:
         return False, "⚠️ Этот промокод уже использован.", None
 
-    if not int(admin_global or 0) and not is_code_active(created_at):
+    if promocode_is_revoked(revoked_at):
+        return False, "⛔ Промокод отключён администратором.", None
+
+    if int(admin_global or 0):
+        if promocode_admin_expired(expires_at):
+            return False, "⌛ Срок действия промокода истёк.", None
+    elif not is_code_active(created_at):
         return False, "⌛ Срок действия промокода истёк.", None
 
     return True, "✅ Промокод применён.", discount
@@ -5736,16 +5777,68 @@ def _format_welcome_buttons_preview() -> str:
     return "\n".join(lines) if lines else "— нет —"
 
 
+def admin_promo_duration_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["1 день", "1 неделя"],
+            ["1 месяц"],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def parse_admin_promo_duration_choice(text: str) -> timedelta | None:
+    t = (text or "").strip().lower()
+    if t in ("1 день", "1д", "день"):
+        return timedelta(days=1)
+    if t in ("1 неделя", "неделя", "7 дней", "7д"):
+        return timedelta(days=7)
+    if t in ("1 месяц", "месяц", "30 дней"):
+        return timedelta(days=30)
+    return None
+
+
+def format_admin_promos_revoke_list() -> str:
+    cursor.execute(
+        """
+        SELECT code, discount, expires_at, created_at, revoked_at
+        FROM promocodes
+        WHERE COALESCE(admin_global, 0) = 1
+          AND COALESCE(used, 0) = 0
+          AND revoked_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT 12
+        """
+    )
+    rows = cursor.fetchall()
+    if not rows:
+        return "— список пуст —"
+    lines = []
+    for code, disc, exp, cre, _rev in rows:
+        exp_s = "без срока" if not (exp or "").strip() else f"до {_format_short_date_iso(exp)}"
+        lines.append(f"• <code>{html_esc(code)}</code> — −{disc}% ({exp_s})")
+    return "\n".join(lines)
+
+
+def _format_short_date_iso(iso_ts: str | None) -> str:
+    dt = _parse_iso_datetime(iso_ts)
+    if not dt:
+        return (iso_ts or "")[:16]
+    return dt.strftime("%d.%m.%Y %H:%M")
+
+
 async def admin_create_promo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     context.user_data.pop("admin_new_promo_code", None)
+    context.user_data.pop("admin_new_promo_discount", None)
     await safe_send(
         update,
         "🎫 *Создание промокода*\n\n"
         "Отправь код одним сообщением (латиница и цифры, 4–24 символа), "
         "или напиши `авто` — подберу свободный в формате `RNDM-XXXXXX`.\n\n"
-        "Такой промокод может использовать *любой* клиент, без ограничения 12 часов.\n"
+        "Дальше укажешь скидку и срок: *1 день*, *1 неделя* или *1 месяц*. "
+        "Промокод смогут вводить все клиенты (один раз на код, пока не истёк срок и пока его не отозвали).\n"
         "/cancel — отмена.",
         parse_mode="Markdown",
         reply_markup=admin_keyboard(),
@@ -5761,6 +5854,7 @@ async def admin_create_promo_code_step(update: Update, context: ContextTypes.DEF
         return ADMIN_CREATE_PROMO_CODE_WAITING
     raw = update.message.text.strip()
     if raw in ADMIN_ESCAPE_LABELS:
+        context.user_data.pop("admin_new_promo_discount", None)
         return await admin_escape_conversation(update, context)
     low = raw.lower()
     if low == "авто":
@@ -5807,6 +5901,7 @@ async def admin_create_promo_discount_step(update: Update, context: ContextTypes
     raw = update.message.text.strip()
     if raw in ADMIN_ESCAPE_LABELS:
         context.user_data.pop("admin_new_promo_code", None)
+        context.user_data.pop("admin_new_promo_discount", None)
         return await admin_escape_conversation(update, context)
     try:
         pct = int(raw)
@@ -5818,24 +5913,156 @@ async def admin_create_promo_discount_step(update: Update, context: ContextTypes
         return ADMIN_CREATE_PROMO_DISCOUNT_WAITING
     if get_promocode(code):
         context.user_data.pop("admin_new_promo_code", None)
+        context.user_data.pop("admin_new_promo_discount", None)
+        await safe_send(update, "❌ Код занят. Начни заново.", reply_markup=admin_keyboard())
+        return ConversationHandler.END
+    context.user_data["admin_new_promo_discount"] = pct
+    await safe_send(
+        update,
+        f"Скидка: *{pct}%*\n\nВыбери срок действия промокода кнопкой ниже "
+        "(от текущего момента): *1 день*, *1 неделя* или *1 месяц*.",
+        parse_mode="Markdown",
+        reply_markup=admin_promo_duration_keyboard(),
+    )
+    return ADMIN_CREATE_PROMO_DURATION_WAITING
+
+
+async def admin_create_promo_duration_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    code = context.user_data.get("admin_new_promo_code")
+    pct = context.user_data.get("admin_new_promo_discount")
+    if not code or pct is None:
+        await safe_send(update, "❌ Сессия сброшена. Начни с «🎫 Создать промокод».", reply_markup=admin_keyboard())
+        return ConversationHandler.END
+    if not update.message or not update.message.text:
+        await safe_send(
+            update,
+            "Выбери срок кнопкой: 1 день / 1 неделя / 1 месяц.",
+            reply_markup=admin_promo_duration_keyboard(),
+        )
+        return ADMIN_CREATE_PROMO_DURATION_WAITING
+    raw = update.message.text.strip()
+    if raw in ADMIN_ESCAPE_LABELS:
+        context.user_data.pop("admin_new_promo_code", None)
+        context.user_data.pop("admin_new_promo_discount", None)
+        return await admin_escape_conversation(update, context)
+    delta = parse_admin_promo_duration_choice(raw)
+    if not delta:
+        await safe_send(
+            update,
+            "❌ Нужна одна из кнопок: *1 день*, *1 неделя*, *1 месяц*.",
+            parse_mode="Markdown",
+            reply_markup=admin_promo_duration_keyboard(),
+        )
+        return ADMIN_CREATE_PROMO_DURATION_WAITING
+    if get_promocode(code):
+        context.user_data.pop("admin_new_promo_code", None)
+        context.user_data.pop("admin_new_promo_discount", None)
         await safe_send(update, "❌ Код занят. Начни заново.", reply_markup=admin_keyboard())
         return ConversationHandler.END
     created_at = now_iso()
+    expires_dt = datetime.now() + delta
+    expires_at = expires_dt.isoformat(timespec="seconds")
     cursor.execute(
         """
-        INSERT INTO promocodes (code, discount, used, created_at, used_at, owner_user_id, admin_global)
-        VALUES (?, ?, 0, ?, NULL, NULL, 1)
+        INSERT INTO promocodes (
+            code, discount, used, created_at, used_at, owner_user_id, admin_global, expires_at, revoked_at
+        )
+        VALUES (?, ?, 0, ?, NULL, NULL, 1, ?, NULL)
         """,
-        (code, pct, created_at),
+        (code, int(pct), created_at, expires_at),
     )
     conn.commit()
     context.user_data.pop("admin_new_promo_code", None)
-    log_action(update.effective_user.id, "admin_create_promo", f"code={code};discount={pct}")
+    context.user_data.pop("admin_new_promo_discount", None)
+    log_action(
+        update.effective_user.id,
+        "admin_create_promo",
+        f"code={code};discount={pct};expires_at={expires_at}",
+    )
+    human_until = expires_dt.strftime("%d.%m.%Y %H:%M")
     await safe_send(
         update,
-        f"✅ Промокод `{code}` создан: скидка *{pct}%*.\n"
-        f"Любой пользователь может ввести его при оформлении заказа (одноразово, пока не использован).",
+        f"✅ Промокод `{code}` создан: скидка *{pct}%*, действует *до {human_until}*.\n"
+        f"Любой клиент может применить его при оформлении (один раз), пока не истёк срок. "
+        f"Отозвать досрочно: «🛑 Отозвать промокод».",
         parse_mode="Markdown",
+        reply_markup=admin_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+async def admin_revoke_promo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    preview = format_admin_promos_revoke_list()
+    await safe_send(
+        update,
+        "🛑 <b>Отзыв админского промокода</b>\n\n"
+        "Активные коды (не использованы, не отозваны):\n"
+        f"{preview}\n\n"
+        "Отправь <b>код</b> промокода текстом (как в списке), который нужно отключить.\n"
+        "/cancel — отмена.",
+        parse_mode="HTML",
+        reply_markup=admin_keyboard(),
+    )
+    return ADMIN_REVOKE_PROMO_WAITING
+
+
+async def admin_revoke_promo_code_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    if not update.message or not update.message.text:
+        await safe_send(update, "Отправь код промокода текстом.", reply_markup=admin_keyboard())
+        return ADMIN_REVOKE_PROMO_WAITING
+    raw = update.message.text.strip()
+    if raw in ADMIN_ESCAPE_LABELS:
+        return await admin_escape_conversation(update, context)
+    code = re.sub(r"[^A-Za-z0-9_-]", "", raw).upper()
+    if len(code) < 2:
+        await safe_send(update, "❌ Код слишком короткий.", reply_markup=admin_keyboard())
+        return ADMIN_REVOKE_PROMO_WAITING
+    promo = get_promocode(code)
+    if not promo:
+        await safe_send(update, "❌ Промокод не найден. Проверь написание.", reply_markup=admin_keyboard())
+        return ADMIN_REVOKE_PROMO_WAITING
+    (
+        _c,
+        discount,
+        used,
+        _ca,
+        _ua,
+        _owner,
+        admin_global,
+        expires_at,
+        revoked_at,
+    ) = promo
+    if not int(admin_global or 0):
+        await safe_send(
+            update,
+            "⛔ Отзыв только для <b>админских</b> промокодов. Пользовательские — не из этой панели.",
+            parse_mode="HTML",
+            reply_markup=admin_keyboard(),
+        )
+        return ConversationHandler.END
+    if used:
+        await safe_send(update, "⚠️ Промокод уже использован — отзыв не нужен.", reply_markup=admin_keyboard())
+        return ConversationHandler.END
+    if promocode_is_revoked(revoked_at):
+        await safe_send(update, "ℹ️ Этот промокод уже был отозван.", reply_markup=admin_keyboard())
+        return ConversationHandler.END
+    cursor.execute(
+        "UPDATE promocodes SET revoked_at = ? WHERE code = ?",
+        (now_iso(), code),
+    )
+    conn.commit()
+    log_action(update.effective_user.id, "admin_revoke_promo", f"code={code}")
+    await safe_send(
+        update,
+        f"✅ Промокод <code>{html_esc(code)}</code> отозван. Скидка была −{discount}%.\n"
+        f"Клиенты больше не смогут его применить.",
+        parse_mode="HTML",
         reply_markup=admin_keyboard(),
     )
     return ConversationHandler.END
@@ -5975,7 +6202,8 @@ async def check_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = context.args[0].strip().upper()
     cursor.execute(
         """
-        SELECT code, discount, used, created_at, used_at, owner_user_id, COALESCE(admin_global, 0)
+        SELECT code, discount, used, created_at, used_at, owner_user_id,
+               COALESCE(admin_global, 0), expires_at, revoked_at
         FROM promocodes WHERE code = ?
         """,
         (code,),
@@ -5985,19 +6213,40 @@ async def check_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(update, "❌ Промокод не найден")
         return
 
-    _, discount, used, created_at, used_at, owner_user_id, admin_g = row
+    _, discount, used, created_at, used_at, owner_user_id, admin_g, expires_at, revoked_at = row
     if used:
         await safe_send(update, f"⚠️ Промокод уже использован\nСкидка: -{discount}%\nКогда использован: {used_at}")
         return
 
-    if not int(admin_g or 0) and not is_code_active(created_at):
+    if promocode_is_revoked(revoked_at):
+        await safe_send(update, f"⛔ Промокод отозван администратором\nСкидка была: -{discount}%")
+        return
+
+    if int(admin_g or 0):
+        if promocode_admin_expired(expires_at):
+            await safe_send(
+                update,
+                f"⌛ Срок админского промокода истёк\nСкидка была: -{discount}%\nДействовал до: {expires_at or '—'}",
+            )
+            return
+    elif not is_code_active(created_at):
         await safe_send(update, f"⌛ Промокод просрочен\nСкидка была: -{discount}%\nСоздан: {created_at}")
         return
 
-    kind = "админский (без срока)" if int(admin_g or 0) else "крутилка (12 ч)"
+    if int(admin_g or 0):
+        exp_line = (
+            f"Действует до: {_format_short_date_iso(expires_at)}\n"
+            if (expires_at or "").strip()
+            else "Срок: не задан (старый код)\n"
+        )
+        kind = "админский"
+    else:
+        exp_line = ""
+        kind = "крутилка (12 ч от создания)"
     await safe_send(
         update,
-        f"✅ Промокод активен ({kind})\nСкидка: -{discount}%\nСоздан: {created_at}\nВладелец user_id: {owner_user_id}",
+        f"✅ Промокод активен ({kind})\nСкидка: -{discount}%\nСоздан: {created_at}\n"
+        f"{exp_line}Владелец user_id: {owner_user_id}",
     )
 
 
@@ -6008,7 +6257,10 @@ async def use_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     code = context.args[0].strip().upper()
     cursor.execute(
-        "SELECT used, created_at, discount, COALESCE(admin_global, 0) FROM promocodes WHERE code = ?",
+        """
+        SELECT used, created_at, discount, COALESCE(admin_global, 0), expires_at, revoked_at
+        FROM promocodes WHERE code = ?
+        """,
         (code,),
     )
     row = cursor.fetchone()
@@ -6016,12 +6268,20 @@ async def use_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(update, "❌ Промокод не найден")
         return
 
-    used, created_at, discount, admin_g = row
+    used, created_at, discount, admin_g, expires_at, revoked_at = row
     if used:
         await safe_send(update, "⚠️ Промокод уже использован")
         return
 
-    if not int(admin_g or 0) and not is_code_active(created_at):
+    if promocode_is_revoked(revoked_at):
+        await safe_send(update, "⛔ Промокод отозван")
+        return
+
+    if int(admin_g or 0):
+        if promocode_admin_expired(expires_at):
+            await safe_send(update, "⌛ Срок промокода истёк")
+            return
+    elif not is_code_active(created_at):
         await safe_send(update, "⌛ Промокод просрочен")
         return
 
@@ -6481,6 +6741,19 @@ def main():
             ADMIN_CREATE_PROMO_DISCOUNT_WAITING: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_create_promo_discount_step),
             ],
+            ADMIN_CREATE_PROMO_DURATION_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_create_promo_duration_step),
+            ],
+        },
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
+    )
+
+    revoke_promo_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🛑 Отозвать промокод$"), admin_revoke_promo_start)],
+        states={
+            ADMIN_REVOKE_PROMO_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_revoke_promo_code_step),
+            ],
         },
         fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
@@ -6510,6 +6783,7 @@ def main():
     app.add_handler(info_blocks_conv)
     app.add_handler(referral_hub_photo_conv)
     app.add_handler(create_promo_conv)
+    app.add_handler(revoke_promo_conv)
     app.add_handler(broadcast_conv)
     app.add_handler(baraholki_conv)
     app.add_handler(projects_conv)
