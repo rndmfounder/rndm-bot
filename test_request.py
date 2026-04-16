@@ -1,6 +1,12 @@
+"""Локальная проверка токена: BOT_TOKEN в окружении или .env (не коммить токены в файл)."""
+import os
 import urllib.request
 
-url = "https://api.telegram.org/bot8358029510:AAFv03CvLuhb0NiOQaWqEGjrskAiJrS7ty4/getMe"
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise SystemExit("Укажи BOT_TOKEN в переменных окружения.")
+
+url = f"https://api.telegram.org/bot{TOKEN}/getMe"
 
 try:
     with urllib.request.urlopen(url, timeout=20) as response:

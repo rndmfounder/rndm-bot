@@ -1,17 +1,21 @@
 import os
 import re
 import json
+import csv
 import html
 import random
+from io import BytesIO, StringIO
 import sqlite3
 import string
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from itertools import count
+from zoneinfo import ZoneInfo
 
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputFile,
     ReplyKeyboardMarkup,
     Update,
 )
@@ -34,9 +38,12 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("Не найдена переменная окружения BOT_TOKEN")
 
-ADMIN_IDS = {
-    8463296102,
-}
+# «Вечные» админы из кода — не снимаются через админку. Остальных добавляй в БД (раздел 👤 Админы).
+ADMIN_IDS = frozenset(
+    {
+        8463296102,
+    }
+)
 
 MANAGER_USER_ID = 8423978061
 DEFAULT_MANAGER_URL = f"tg://user?id={MANAGER_USER_ID}"
@@ -200,6 +207,10 @@ ADMIN_CREATE_PROMO_DISCOUNT_WAITING = next(_state)
 ADMIN_CREATE_PROMO_MAX_USES_WAITING = next(_state)
 ADMIN_CREATE_PROMO_DURATION_WAITING = next(_state)
 ADMIN_REVOKE_PROMO_WAITING = next(_state)
+ADMIN_ADD_ADMIN_WAITING = next(_state)
+ADMIN_REMOVE_ADMIN_WAITING = next(_state)
+ADMIN_BROADCAST_BUTTONS_WAITING = next(_state)
+ADMIN_AUTOPOST_CLOCK_TIMES = next(_state)
 
 ORDER_PROMOCODE_WAITING = next(_state)
 ORDER_CHOICE_WAITING = next(_state)
@@ -219,6 +230,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Отображение времени пользователям (заказы, история, промо): Екатеринбург (UTC+5).
+# В БД пишем UTC через now_iso(); старые строки без смещения считаем записанными в UTC (типично для сервера).
+BOT_DISPLAY_TZ = ZoneInfo("Asia/Yekaterinburg")
 
 USE_POSTGRES = bool(DATABASE_URL)
 if USE_POSTGRES:
@@ -290,11 +304,38 @@ else:
 
 
 def now_iso() -> str:
-    return datetime.now().isoformat()
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _ensure_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_iso_datetime(raw: str | None) -> datetime | None:
+    if not raw or not str(raw).strip():
+        return None
+    s = str(raw).strip().replace("Z", "+00:00")
+    try:
+        return _ensure_utc(datetime.fromisoformat(s))
+    except Exception:
+        return None
+
+
+def format_dt_yekaterinburg(iso_ts: str | None, fmt: str = "%d.%m.%Y %H:%M:%S") -> str:
+    dt = _parse_iso_datetime(iso_ts)
+    if not dt:
+        r = (iso_ts or "").strip()
+        return r[:19] if len(r) > 19 else (r or "—")
+    return dt.astimezone(BOT_DISPLAY_TZ).strftime(fmt)
 
 
 def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    if user_id in ADMIN_IDS:
+        return True
+    cursor.execute("SELECT 1 FROM extra_admins WHERE user_id = ?", (user_id,))
+    return cursor.fetchone() is not None
 
 
 def ensure_column(table_name: str, column_name: str, column_def: str) -> None:
@@ -796,6 +837,48 @@ ensure_column("promocodes", "revoked_at", "TEXT")
 ensure_column("promocodes", "max_uses", "INTEGER NOT NULL DEFAULT 1")
 ensure_column("promocodes", "use_count", "INTEGER NOT NULL DEFAULT 0")
 
+cursor.execute(
+    """
+    CREATE TABLE IF NOT EXISTS extra_admins (
+        user_id BIGINT PRIMARY KEY,
+        added_at TEXT NOT NULL,
+        added_by BIGINT NOT NULL
+    )
+    """
+)
+conn.commit()
+
+ensure_column("auto_posts", "buttons_json", "TEXT NOT NULL DEFAULT ''")
+ensure_column("auto_posts", "schedule_mode", "TEXT NOT NULL DEFAULT 'interval'")
+ensure_column("auto_posts", "clock_times_json", "TEXT")
+ensure_column("auto_posts", "last_clock_slot_key", "TEXT")
+
+if USE_POSTGRES:
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS client_notes (
+            note_id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            manager_id BIGINT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+else:
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS client_notes (
+            note_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            manager_id INTEGER NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+conn.commit()
+
 
 def migrate_promocode_usage_counters() -> None:
     """Одноразовая подгонка: лимит 1 раз, счётчик из флага used."""
@@ -1275,8 +1358,7 @@ def _format_short_date(iso_ts: str | None) -> str:
         return "—"
     raw = iso_ts.strip()
     try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        return dt.strftime("%d.%m.%Y")
+        return format_dt_yekaterinburg(raw, "%d.%m.%Y")
     except Exception:
         return raw[:16] if len(raw) > 16 else raw
 
@@ -1517,6 +1599,17 @@ def giveaway_buttons_markup_from_json(buttons_json_raw: str | None) -> InlineKey
     return InlineKeyboardMarkup(rows) if rows else None
 
 
+def autopost_reply_markup_from_row(
+    buttons_json_raw: str | None, button_text: str | None, button_url: str | None
+) -> InlineKeyboardMarkup | None:
+    bj = (buttons_json_raw or "").strip()
+    if bj and bj != "[]":
+        m = giveaway_buttons_markup_from_json(bj)
+        if m:
+            return m
+    return autopost_button_markup(button_text or "", button_url or "")
+
+
 def parse_giveaway_buttons_lines(body: str) -> tuple[list[dict] | None, list[str]]:
     raw_lines = body.splitlines()
     parsed: list[dict] = []
@@ -1539,6 +1632,39 @@ def parse_giveaway_buttons_lines(body: str) -> tuple[list[dict] | None, list[str
             continue
         parsed.append({"text": btn_text, "url": url})
     return parsed, errors
+
+
+def parse_local_clock_times_body(body: str) -> tuple[list[str] | None, list[str]]:
+    """Строки вида 9:00 / 13.30 (локальное время бота — Екатеринбург)."""
+    errors: list[str] = []
+    times: list[str] = []
+    for i, raw_line in enumerate(body.splitlines(), 1):
+        line = raw_line.strip().replace(" ", "")
+        if not line:
+            continue
+        line = line.replace(".", ":")
+        if not re.fullmatch(r"\d{1,2}:\d{2}", line):
+            errors.append(f"Строка {i}: ожидаю время как 9:00 или 13.30")
+            continue
+        h_s, m_s = line.split(":", 1)
+        h, mm = int(h_s), int(m_s)
+        if not (0 <= h <= 23 and 0 <= mm <= 59):
+            errors.append(f"Строка {i}: недопустимое время")
+            continue
+        times.append(f"{h:02d}:{mm:02d}")
+    if errors:
+        return None, errors
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for t in times:
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    if not uniq:
+        return None, ["Нет ни одной строки с временем."]
+    if len(uniq) > 8:
+        return None, ["Максимум 8 времён в сутки."]
+    return uniq, []
 
 
 def get_giveaway_winners_rows(giveaway_id: int):
@@ -1659,9 +1785,72 @@ def calc_discounted_price(base_price: int, category_key: str) -> int:
 
 
 def rating_summary_for_user(user_id: int) -> tuple[float, int]:
-    cursor.execute("SELECT COALESCE(AVG(rating), 0), COUNT(*) FROM customer_ratings WHERE user_id = ?", (user_id,))
+    """Среднее и число оценок только по звёздам (rating>0), без текстовых /ratecomment с rating=0."""
+    cursor.execute(
+        """
+        SELECT COALESCE(AVG(rating), 0), COUNT(*)
+        FROM customer_ratings
+        WHERE user_id = ? AND rating > 0
+        """,
+        (user_id,),
+    )
     avg_value, count_value = cursor.fetchone()
     return float(avg_value or 0), int(count_value or 0)
+
+
+def count_client_notes(user_id: int) -> int:
+    cursor.execute("SELECT COUNT(*) FROM client_notes WHERE user_id = ?", (user_id,))
+    return int(cursor.fetchone()[0] or 0)
+
+
+def latest_client_note_snippet(user_id: int, max_len: int = 100) -> str:
+    cursor.execute(
+        """
+        SELECT body FROM client_notes WHERE user_id = ? ORDER BY note_id DESC LIMIT 1
+        """,
+        (user_id,),
+    )
+    row = cursor.fetchone()
+    if not row or not (row[0] or "").strip():
+        return ""
+    s = str(row[0]).strip().replace("\n", " ")
+    return s[:max_len] + ("…" if len(s) > max_len else "")
+
+
+def fetch_client_notes(user_id: int, limit: int = 50) -> list[tuple]:
+    cursor.execute(
+        """
+        SELECT manager_id, body, created_at
+        FROM client_notes
+        WHERE user_id = ?
+        ORDER BY note_id DESC
+        LIMIT ?
+        """,
+        (user_id, limit),
+    )
+    return list(cursor.fetchall())
+
+
+def insert_client_note(user_id: int, manager_id: int, body: str) -> None:
+    b = (body or "").strip()[:4000]
+    if not b:
+        raise ValueError("empty note")
+    cursor.execute(
+        "INSERT INTO client_notes (user_id, manager_id, body, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, manager_id, b, now_iso()),
+    )
+    conn.commit()
+
+
+def manager_ratings_count_for_order(order_id: int, manager_id: int) -> int:
+    cursor.execute(
+        """
+        SELECT COUNT(*) FROM customer_ratings
+        WHERE order_id = ? AND manager_id = ? AND rating > 0
+        """,
+        (order_id, manager_id),
+    )
+    return int(cursor.fetchone()[0] or 0)
 
 
 def build_ref_link(bot_username: str, user_id: int) -> str:
@@ -1808,8 +1997,10 @@ def can_spin(user_id: int) -> bool:
     row = cursor.fetchone()
     if not row or not row[0]:
         return True
-    last_spin = datetime.fromisoformat(row[0])
-    return datetime.now() - last_spin >= timedelta(hours=48)
+    last_spin = _parse_iso_datetime(row[0])
+    if last_spin is None:
+        return True
+    return datetime.now(timezone.utc) - last_spin >= timedelta(hours=48)
 
 
 def generate_code() -> str:
@@ -1822,17 +2013,10 @@ def get_discount() -> int:
 
 
 def is_code_active(created_at: str) -> bool:
-    created = datetime.fromisoformat(created_at)
-    return datetime.now() - created <= timedelta(hours=12)
-
-
-def _parse_iso_datetime(raw: str | None) -> datetime | None:
-    if not raw or not str(raw).strip():
-        return None
-    try:
-        return datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
-    except Exception:
-        return None
+    created = _parse_iso_datetime(created_at)
+    if created is None:
+        return False
+    return datetime.now(timezone.utc) - created <= timedelta(hours=12)
 
 
 def promocode_is_revoked(revoked_at: str | None) -> bool:
@@ -1844,7 +2028,7 @@ def promocode_admin_expired(expires_at: str | None) -> bool:
     dt = _parse_iso_datetime(expires_at)
     if dt is None:
         return False
-    return datetime.now() >= dt
+    return datetime.now(timezone.utc) >= dt
 
 
 def slugify_name(name: str) -> str:
@@ -2256,6 +2440,7 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
             ["🎁 Розыгрыши (админ)", "👥 Клиенты"],
             ["🎫 Создать промокод", "🛑 Отозвать промокод"],
             ["🔗 Ссылки и инфо", "📊 Аналитика"],
+            ["👤 Админы"],
             ["👋 Экран приветствия"],
             ["⬅️ Назад"],
         ],
@@ -2362,7 +2547,18 @@ def admin_analytics_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["📊 Статистика", "📈 Аналитика PRO"],
+            ["👥 Пользователи (список)", "📥 Скачать пользователей"],
             ["↩️ Админка"],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def admin_admins_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["➕ Добавить админа", "🗑 Удалить админа"],
+            ["📋 Кто админ", "↩️ Админка"],
         ],
         resize_keyboard=True,
     )
@@ -2471,6 +2667,10 @@ def order_status_keyboard(
                 InlineKeyboardButton("⭐3", callback_data=f"order_rate:{order_id}:3"),
                 InlineKeyboardButton("⭐5", callback_data=f"order_rate:{order_id}:5"),
             ],
+            [
+                InlineKeyboardButton("📜 Заметки", callback_data=f"cn_list:{client_user_id}"),
+                InlineKeyboardButton("❓ +заметка", callback_data="cn_help"),
+            ],
             [InlineKeyboardButton("👤 Профиль клиента", url=f"tg://user?id={client_user_id}")],
         ]
     )
@@ -2549,7 +2749,21 @@ def build_manager_order_message_html(order_row: tuple, claimed_by_user) -> tuple
     ) = order_row
 
     subtotal = order_subtotal if order_subtotal is not None else total_sum
-    header = render_order_group_header_html(order_id, status, claimed_by_user)
+    header_claim = claimed_by_user
+    if header_claim is None and _status_updated_by is not None:
+        suid = int(_status_updated_by)
+
+        class _HdrUser:
+            __slots__ = ("id", "first_name", "last_name", "username")
+
+            def __init__(self, uid: int):
+                self.id = uid
+                self.first_name = None
+                self.last_name = None
+                self.username = None
+
+        header_claim = _HdrUser(suid)
+    header = render_order_group_header_html(order_id, status, header_claim)
 
     username_line = f"@{username}" if username else "нет username"
     rating_avg, rating_count = rating_summary_for_user(user_id)
@@ -2565,18 +2779,33 @@ def build_manager_order_message_html(order_row: tuple, claimed_by_user) -> tuple
     total_line = format_price(subtotal) if subtotal > 0 else "цена уточняется"
     final_line = format_price(total_sum) if total_sum > 0 else "цена уточняется"
 
+    if order_type == "delivery":
+        type_line = "🚚 <b><u>ТИП: ДОСТАВКА</u></b>"
+    else:
+        type_line = "📍 <b><u>ТИП: САМОВЫВОЗ</u></b>"
+
+    n_notes = count_client_notes(user_id)
+    note_snip = latest_client_note_snippet(user_id)
+    notes_line = ""
+    if n_notes > 0:
+        notes_line = f"🗂 <b>Заметок о клиенте:</b> {n_notes}"
+        if note_snip:
+            notes_line += f"\n<i>Последняя:</i> {html_esc(note_snip)}"
+
     blocks: list[str] = [
         header,
         "",
-        f"Тип: {'Доставка' if order_type == 'delivery' else 'Самовывоз'}",
+        type_line,
         f"Клиент: {html_esc(first_name or '-')}",
         f"Username: {html_esc(username_line)}",
         f"User ID: {user_id}",
         f"Телефон: {html_esc(phone)}",
         f"Контактный username: {html_esc(contact_username)}",
-        f"Рейтинг клиента: {html_esc(rating_text)}",
+        f"Рейтинг клиента: {html_esc(rating_text)} <i>(до 2 оценок за заказ с одного аккаунта)</i>",
         ref_rank_line,
     ]
+    if notes_line:
+        blocks.append(notes_line)
 
     if order_type == "delivery":
         addr_plain = (address or "").strip()
@@ -2593,7 +2822,7 @@ def build_manager_order_message_html(order_row: tuple, claimed_by_user) -> tuple
         blocks.append(f"Размер скидки: {int(discount_amount or 0)} ₽")
 
     try:
-        order_time_str = datetime.fromisoformat(created_at).strftime("%d.%m.%Y %H:%M:%S")
+        order_time_str = format_dt_yekaterinburg(created_at, "%d.%m.%Y %H:%M:%S")
     except Exception:
         order_time_str = str(created_at)
 
@@ -3236,6 +3465,11 @@ async def order_rate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await answer_once("Заказ не найден", show_alert=True)
         return
     client_user_id = row[0]
+    already = manager_ratings_count_for_order(order_id, manager_id)
+    if already >= 2:
+        await answer_once("С твоего аккаунта уже 2 оценки за этот заказ.", show_alert=True)
+        return
+
     cursor.execute(
         """
         INSERT INTO customer_ratings (order_id, user_id, manager_id, rating, comment, created_at)
@@ -3246,8 +3480,155 @@ async def order_rate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     conn.commit()
     log_action(manager_id, "order_rate", f"order={order_id};client={client_user_id};rating={rating}")
     avg_value, cnt_value = rating_summary_for_user(client_user_id)
-    msg = f"Оценка сохранена: {rating}/5. Ср: {avg_value:.2f} ({cnt_value})"
+    left = 2 - manager_ratings_count_for_order(order_id, manager_id)
+    msg = f"Оценка {rating}/5 сохранена. Средний по клиенту: {avg_value:.2f} ({cnt_value} оц.). За этот заказ с твоего аккаунта ещё можно: {max(left, 0)}"
     await answer_once(msg[:200])
+
+    message = query.message
+    if message:
+        row2 = fetch_order_row_for_manager_card(order_id)
+        if row2:
+            updated_text, order_markup = build_manager_order_message_html(row2, None)
+            try:
+                await message.edit_text(updated_text, reply_markup=order_markup, parse_mode="HTML")
+            except Exception:
+                logger.exception("order_rate: не удалось обновить карточку заказа %s", order_id)
+
+
+def _format_client_notes_message_html(user_id: int, rows: list[tuple]) -> str:
+    lines = [f"🗂 <b>Заметки по клиенту</b> <code>{user_id}</code> (последние {len(rows)}):\n"]
+    for mgr_id, body, cre in rows:
+        lines.append(
+            f"— {html_esc(format_dt_yekaterinburg(cre, '%d.%m.%Y %H:%M'))} · менеджер <code>{mgr_id}</code>\n"
+            f"{html_esc(body)}\n"
+        )
+    return "\n".join(lines)
+
+
+async def client_note_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    try:
+        await query.answer(
+            "Заметка о клиенте хранится в базе навсегда.\n\n"
+            "В этом чате отправь одной строкой:\n"
+            "/cnote USER_ID текст\n\n"
+            "Пример:\n/cnote 123456 Оплатил переводом",
+            show_alert=True,
+        )
+    except Exception:
+        logger.exception("client_note_help_callback")
+
+
+async def client_notes_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.message or not isinstance(query.data, str):
+        return
+    parts = query.data.split(":")
+    if len(parts) != 2 or parts[0] != "cn_list" or not parts[1].isdigit():
+        try:
+            await query.answer("Некорректные данные", show_alert=True)
+        except Exception:
+            pass
+        return
+    uid = int(parts[1])
+    try:
+        await query.answer()
+    except Exception:
+        logger.exception("client_notes_list_callback: answer")
+
+    rows = fetch_client_notes(uid, limit=40)
+    chat_id = query.message.chat_id
+    rid = query.message.message_id
+    if not rows:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"🗂 Заметок по клиенту <code>{uid}</code> пока нет.\n"
+                f"Добавить: <code>/cnote {uid} текст</code>"
+            ),
+            parse_mode="HTML",
+            reply_to_message_id=rid,
+        )
+        return
+
+    body_html = _format_client_notes_message_html(uid, rows)
+    max_len = 4000
+    if len(body_html) <= max_len:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=body_html,
+            parse_mode="HTML",
+            reply_to_message_id=rid,
+        )
+        return
+
+    chunk = body_html[:max_len]
+    rest = body_html[max_len:]
+    part = 1
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"<i>часть {part}</i>\n" + chunk,
+        parse_mode="HTML",
+        reply_to_message_id=rid,
+    )
+    while rest:
+        part += 1
+        chunk = rest[:max_len]
+        rest = rest[max_len:]
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"<i>часть {part}</i>\n" + chunk,
+            parse_mode="HTML",
+        )
+
+
+async def cmd_cnote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Только в чате заказов ORDER_GROUP_ID: общая память о клиенте для менеджеров."""
+    if not update.message or not update.effective_user or not update.effective_chat:
+        return
+    if update.effective_chat.id != ORDER_GROUP_ID:
+        return
+    text = (update.message.text or "").strip()
+    parts = text.split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        await update.message.reply_text("Формат: /cnote USER_ID текст заметки")
+        return
+    target = int(parts[1])
+    note_body = parts[2].strip()
+    if not note_body:
+        await update.message.reply_text("Нужен непустой текст заметки после USER_ID.")
+        return
+    try:
+        insert_client_note(target, update.effective_user.id, note_body)
+    except ValueError:
+        await update.message.reply_text("Пустая заметка.")
+        return
+    log_action(update.effective_user.id, "client_note", f"user={target};len={len(note_body)}")
+    await update.message.reply_text(f"✅ Заметка о клиенте {target} сохранена.")
+
+
+async def cmd_cnotes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_chat:
+        return
+    if update.effective_chat.id != ORDER_GROUP_ID:
+        return
+    args = context.args or []
+    if len(args) != 1 or not args[0].isdigit():
+        await update.message.reply_text("Формат: /cnotes USER_ID")
+        return
+    uid = int(args[0])
+    rows = fetch_client_notes(uid, limit=30)
+    if not rows:
+        await update.message.reply_text(
+            f"Заметок по клиенту {uid} пока нет. Добавить: /cnote {uid} текст"
+        )
+        return
+    body_html = _format_client_notes_message_html(uid, rows)
+    if len(body_html) > 4000:
+        body_html = body_html[:3990] + "\n…"
+    await update.message.reply_text(body_html, parse_mode="HTML")
 
 
 async def rate_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3608,7 +3989,7 @@ async def show_order_history(update: Update, context: ContextTypes.DEFAULT_TYPE)
         order_type_text = "Доставка" if order_type == "delivery" else "Самовывоз"
         place = address if order_type == "delivery" else pickup_point
         total_text = format_price(total_sum) if total_sum > 0 else "цена уточняется"
-        dt = datetime.fromisoformat(created_at).strftime("%d.%m.%Y %H:%M")
+        dt = format_dt_yekaterinburg(created_at, "%d.%m.%Y %H:%M")
         lines.append(f"• Заказ #{order_id}")
         lines.append(f"  Тип: {order_type_text}")
         lines.append(f"  Куда: {place}")
@@ -4152,6 +4533,166 @@ async def admin_open_analytics(update: Update, context: ContextTypes.DEFAULT_TYP
         await safe_send(update, "📊 Раздел: аналитика", reply_markup=admin_analytics_keyboard())
 
 
+async def admin_admins_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    base = ", ".join(str(x) for x in sorted(ADMIN_IDS))
+    await safe_send(
+        update,
+        "👤 *Дополнительные администраторы*\n\n"
+        f"Базовые ID из кода (их нельзя снять через бота): `{base}`\n\n"
+        "Остальных можно добавить или удалить ниже.",
+        parse_mode="Markdown",
+        reply_markup=admin_admins_keyboard(),
+    )
+
+
+async def admin_admins_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    cursor.execute(
+        "SELECT user_id, added_at, added_by FROM extra_admins ORDER BY user_id ASC"
+    )
+    rows = cursor.fetchall()
+    lines = ["📋 Доп. админы (из БД):"]
+    if not rows:
+        lines.append("— пока никого —")
+    else:
+        for uid, added_at, added_by in rows:
+            lines.append(f"• {uid} — кем добавлен: {added_by} — {added_at}")
+    await safe_send(update, "\n".join(lines), reply_markup=admin_admins_keyboard())
+
+
+async def admin_admins_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    await safe_send(
+        update,
+        "➕ Отправь *числовой Telegram user_id* нового админа.\n"
+        "Узнать ID: @userinfobot или пересланное сообщение.\n\n"
+        "/cancel — отмена.",
+        parse_mode="Markdown",
+        reply_markup=admin_admins_keyboard(),
+    )
+    return ADMIN_ADD_ADMIN_WAITING
+
+
+async def admin_admins_add_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    raw = (update.message.text or "").strip()
+    if not raw.isdigit():
+        await safe_send(update, "❌ Нужен только числовой user_id.", reply_markup=admin_admins_keyboard())
+        return ADMIN_ADD_ADMIN_WAITING
+    new_id = int(raw)
+    if new_id in ADMIN_IDS:
+        await safe_send(
+            update,
+            "ℹ️ Этот пользователь уже в списке базовых админов (код).",
+            reply_markup=admin_admins_keyboard(),
+        )
+        return ConversationHandler.END
+    cursor.execute("SELECT 1 FROM extra_admins WHERE user_id = ?", (new_id,))
+    if cursor.fetchone():
+        await safe_send(update, "ℹ️ Уже в списке доп. админов.", reply_markup=admin_admins_keyboard())
+        return ConversationHandler.END
+    cursor.execute(
+        "INSERT INTO extra_admins (user_id, added_at, added_by) VALUES (?, ?, ?)",
+        (new_id, now_iso(), update.effective_user.id),
+    )
+    conn.commit()
+    log_action(update.effective_user.id, "admin_add", f"target={new_id}")
+    await safe_send(
+        update,
+        f"✅ Админ `{new_id}` добавлен. Пусть нажмёт /start или ⚙️ Админка.",
+        parse_mode="Markdown",
+        reply_markup=admin_admins_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+async def admin_admins_remove_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    await safe_send(
+        update,
+        "🗑 Отправь *user_id* доп. админа для удаления из БД.\n"
+        "Базовых из кода удалить нельзя.\n\n/cancel — отмена.",
+        parse_mode="Markdown",
+        reply_markup=admin_admins_keyboard(),
+    )
+    return ADMIN_REMOVE_ADMIN_WAITING
+
+
+async def admin_admins_remove_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    raw = (update.message.text or "").strip()
+    if not raw.isdigit():
+        await safe_send(update, "❌ Нужен только числовой user_id.", reply_markup=admin_admins_keyboard())
+        return ADMIN_REMOVE_ADMIN_WAITING
+    rid = int(raw)
+    if rid in ADMIN_IDS:
+        await safe_send(
+            update,
+            "❌ Базовых админов из кода нельзя удалить через бота.",
+            reply_markup=admin_admins_keyboard(),
+        )
+        return ConversationHandler.END
+    cursor.execute("DELETE FROM extra_admins WHERE user_id = ?", (rid,))
+    conn.commit()
+    if cursor.rowcount:
+        log_action(update.effective_user.id, "admin_remove", f"target={rid}")
+        await safe_send(update, f"✅ Доп. админ `{rid}` удалён.", parse_mode="Markdown", reply_markup=admin_admins_keyboard())
+    else:
+        await safe_send(update, "ℹ️ Такого доп. админа в базе не было.", reply_markup=admin_admins_keyboard())
+    return ConversationHandler.END
+
+
+async def admin_users_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    cursor.execute(
+        "SELECT user_id, COALESCE(username,''), COALESCE(first_name,'') FROM users ORDER BY user_id ASC LIMIT 80"
+    )
+    rows = cursor.fetchall()
+    cursor.execute("SELECT COUNT(*) FROM users")
+    total = int(cursor.fetchone()[0] or 0)
+    if not rows:
+        await safe_send(update, "Пользователей в базе пока нет.", reply_markup=admin_analytics_keyboard())
+        return
+    lines = [f"👥 Пользователи (показано {len(rows)} из {total})\n"]
+    for uid, uname, fname in rows:
+        u = f"@{uname}" if uname else "—"
+        fn = fname or "—"
+        lines.append(f"{uid} · {html_esc(u)} · {html_esc(fn)}")
+    if total > len(rows):
+        lines.append(f"\n…ещё {total - len(rows)} — «📥 Скачать пользователей».")
+    await safe_send(update, "\n".join(lines), parse_mode="HTML", reply_markup=admin_analytics_keyboard())
+
+
+async def admin_users_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id) or not update.message:
+        return
+    cursor.execute(
+        "SELECT user_id, COALESCE(username,''), COALESCE(first_name,''), COALESCE(last_seen,'') FROM users ORDER BY user_id ASC"
+    )
+    rows = cursor.fetchall()
+    buf = StringIO()
+    w = csv.writer(buf, delimiter=";", lineterminator="\n")
+    w.writerow(["user_id", "username", "first_name", "last_seen_iso"])
+    for row in rows:
+        w.writerow(row)
+    data = buf.getvalue().encode("utf-8-sig")
+    bio = BytesIO(data)
+    bio.name = "users_export.csv"
+    await update.message.reply_document(
+        document=InputFile(bio, filename="users_export.csv"),
+        caption=f"Всего строк: {len(rows)}",
+        reply_markup=admin_analytics_keyboard(),
+    )
+
+
 async def admin_pickup_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -4669,37 +5210,56 @@ async def admin_autopost_photo(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await safe_send(
         update,
-        "🔗 Отправь кнопку в формате: Текст | URL\n"
-        "Или `skip`.\n"
+        "🔗 Кнопки под постом: *каждая строка* `Текст | https://…`\n"
+        "Или одно слово `skip` — без кнопок.\n"
         "Выйти: /cancel, /stop или «🛑 Прервать сценарий».",
+        parse_mode="Markdown",
     )
     return ADMIN_AUTOPOST_BUTTON_WAITING
 
 
 async def admin_autopost_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = update.message.text.strip()
+    raw = (update.message.text or "").strip()
     if raw.lower() == "skip":
+        context.user_data["autopost_buttons_json"] = "[]"
         context.user_data["autopost_button_text"] = ""
         context.user_data["autopost_button_url"] = ""
     else:
-        if "|" not in raw:
-            await safe_send(update, "❌ Формат: Текст | URL")
+        parsed, errors = parse_giveaway_buttons_lines(raw)
+        if errors:
+            await safe_send(update, "❌ Ошибки:\n" + "\n".join(errors[:15]))
             return ADMIN_AUTOPOST_BUTTON_WAITING
-        button_text, button_url = [x.strip() for x in raw.split("|", 1)]
-        if not button_text or not is_valid_inline_button_url(button_url):
-            await safe_send(update, "❌ URL должен начинаться с http://, https:// или tg://")
+        if not parsed:
+            await safe_send(update, "❌ Нет ни одной кнопки. Исправь или напиши skip.")
             return ADMIN_AUTOPOST_BUTTON_WAITING
-        context.user_data["autopost_button_text"] = button_text
-        context.user_data["autopost_button_url"] = button_url
+        context.user_data["autopost_buttons_json"] = json.dumps(parsed, ensure_ascii=False)
+        context.user_data["autopost_button_text"] = parsed[0]["text"]
+        context.user_data["autopost_button_url"] = parsed[0]["url"]
 
-    await safe_send(update, "⏱ Интервал в часах (например 24):")
+    await safe_send(
+        update,
+        "⏱ *Расписание:*\n"
+        "• число *часов* между отправками (например `24`)\n"
+        "• или слово *время* — следующим сообщением строки `ЧЧ:ММ` "
+        "(**Екатеринбург**), например два раза в день:\n"
+        "`09:00`\n`21:00`",
+        parse_mode="Markdown",
+    )
     return ADMIN_AUTOPOST_INTERVAL_WAITING
 
 
 async def admin_autopost_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = update.message.text.strip()
+    raw = (update.message.text or "").strip()
+    low = raw.lower()
+    if low in ("время", "по часам", "clock", "такт"):
+        await safe_send(
+            update,
+            "Отправь построчно время (`9:00`, `13.30` …), до 8 строк.",
+            parse_mode="Markdown",
+        )
+        return ADMIN_AUTOPOST_CLOCK_TIMES
     if not raw.isdigit() or int(raw) <= 0:
-        await safe_send(update, "❌ Укажи целое число часов (1, 6, 24...).")
+        await safe_send(update, "❌ Укажи целое число часов (1, 6, 24…) или слово «время».")
         return ADMIN_AUTOPOST_INTERVAL_WAITING
 
     interval_hours = int(raw)
@@ -4708,38 +5268,123 @@ async def admin_autopost_interval(update: Update, context: ContextTypes.DEFAULT_
     photo = context.user_data.get("autopost_photo", "")
     button_text = context.user_data.get("autopost_button_text", "")
     button_url = context.user_data.get("autopost_button_url", "")
+    buttons_json = context.user_data.get("autopost_buttons_json", "[]")
 
     cursor.execute(
         """
         INSERT INTO auto_posts (
-            text_value, photo, button_text, button_url, interval_hours, is_active,
-            last_sent_at, next_send_at, sent_count, created_at, created_by
+            text_value, photo, button_text, button_url, buttons_json,
+            interval_hours, schedule_mode, clock_times_json, last_clock_slot_key,
+            is_active, last_sent_at, next_send_at, sent_count, created_at, created_by
         )
-        VALUES (?, ?, ?, ?, ?, 1, NULL, ?, 0, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, 'interval', NULL, NULL, 1, NULL, ?, 0, ?, ?)
         """,
-        (text_value, photo, button_text, button_url, interval_hours, next_send_at, now_iso(), update.effective_user.id),
+        (
+            text_value,
+            photo,
+            button_text,
+            button_url,
+            buttons_json,
+            interval_hours,
+            next_send_at,
+            now_iso(),
+            update.effective_user.id,
+        ),
     )
     conn.commit()
 
-    for key in ["autopost_text", "autopost_photo", "autopost_button_text", "autopost_button_url"]:
+    for key in (
+        "autopost_text",
+        "autopost_photo",
+        "autopost_button_text",
+        "autopost_button_url",
+        "autopost_buttons_json",
+    ):
         context.user_data.pop(key, None)
     await safe_send(update, "✅ Авто-рассылка создана и активирована.", reply_markup=admin_broadcast_keyboard())
     return ConversationHandler.END
 
 
+async def admin_autopost_clock_times(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    body = update.message.text or ""
+    times, errs = parse_local_clock_times_body(body)
+    if errs:
+        await safe_send(update, "❌ " + "\n".join(errs[:10]))
+        return ADMIN_AUTOPOST_CLOCK_TIMES
+    if not times:
+        await safe_send(update, "❌ Нужна хотя бы одна строка с временем.")
+        return ADMIN_AUTOPOST_CLOCK_TIMES
+
+    text_value = context.user_data.get("autopost_text", "")
+    photo = context.user_data.get("autopost_photo", "")
+    button_text = context.user_data.get("autopost_button_text", "")
+    button_url = context.user_data.get("autopost_button_url", "")
+    buttons_json = context.user_data.get("autopost_buttons_json", "[]")
+    clock_json = json.dumps(times, ensure_ascii=False)
+
+    cursor.execute(
+        """
+        INSERT INTO auto_posts (
+            text_value, photo, button_text, button_url, buttons_json,
+            interval_hours, schedule_mode, clock_times_json, last_clock_slot_key,
+            is_active, last_sent_at, next_send_at, sent_count, created_at, created_by
+        )
+        VALUES (?, ?, ?, ?, ?, 24, 'clock', ?, NULL, 1, NULL, NULL, 0, ?, ?)
+        """,
+        (text_value, photo, button_text, button_url, buttons_json, clock_json, now_iso(), update.effective_user.id),
+    )
+    conn.commit()
+
+    for key in (
+        "autopost_text",
+        "autopost_photo",
+        "autopost_button_text",
+        "autopost_button_url",
+        "autopost_buttons_json",
+    ):
+        context.user_data.pop(key, None)
+    await safe_send(
+        update,
+        f"✅ Авто-рассылка по времени (Екатеринбург): {', '.join(times)}",
+        reply_markup=admin_broadcast_keyboard(),
+    )
+    return ConversationHandler.END
+
+
 def _build_autopost_card_text(row) -> str:
-    post_id, text_value, photo, interval_hours, is_active, next_send_at, last_sent_at, sent_count = row
+    (
+        post_id,
+        text_value,
+        photo,
+        interval_hours,
+        is_active,
+        next_send_at,
+        last_sent_at,
+        sent_count,
+        schedule_mode,
+        clock_json,
+    ) = row
     preview = (text_value or "").replace("\n", " ").strip()
     if len(preview) > 100:
         preview = preview[:100] + "…"
     status = "▶ Активна" if is_active else "⏸ На паузе"
     photo_mark = "🖼 фото" if photo else "📄 только текст"
+    sm = (schedule_mode or "interval").strip().lower()
+    if sm == "clock" and (clock_json or "").strip():
+        try:
+            arr = json.loads(clock_json)
+            sch = ", ".join(arr) if isinstance(arr, list) else str(clock_json)
+        except json.JSONDecodeError:
+            sch = str(clock_json)[:80]
+        sched_line = f"По времени (Екб): {sch}"
+    else:
+        sched_line = f"Интервал: {interval_hours} ч."
     return (
         f"📌 Пост #{post_id} ({photo_mark})\n"
         f"Статус: {status}\n"
-        f"Интервал: {interval_hours} ч.\n"
+        f"{sched_line}\n"
         f"Циклов отправки: {sent_count}\n"
-        f"Следующая: {next_send_at or '—'}\n"
+        f"Следующая (интервал): {next_send_at or '—'}\n"
         f"Последняя: {last_sent_at or '—'}\n"
         f"Текст: {preview or '—'}"
     )
@@ -4768,7 +5413,8 @@ def _autopost_card_markup(post_id: int, is_active: int) -> InlineKeyboardMarkup:
 def _fetch_autopost_row(post_id: int):
     cursor.execute(
         """
-        SELECT post_id, text_value, photo, interval_hours, is_active, next_send_at, last_sent_at, sent_count
+        SELECT post_id, text_value, photo, interval_hours, is_active, next_send_at, last_sent_at, sent_count,
+               COALESCE(schedule_mode, 'interval'), COALESCE(clock_times_json, '')
         FROM auto_posts
         WHERE post_id = ?
         """,
@@ -4785,7 +5431,8 @@ async def admin_autopost_list_screen(update: Update, context: ContextTypes.DEFAU
 
     cursor.execute(
         """
-        SELECT post_id, text_value, photo, interval_hours, is_active, next_send_at, last_sent_at, sent_count
+        SELECT post_id, text_value, photo, interval_hours, is_active, next_send_at, last_sent_at, sent_count,
+               COALESCE(schedule_mode, 'interval'), COALESCE(clock_times_json, '')
         FROM auto_posts
         ORDER BY post_id DESC
         """
@@ -4952,15 +5599,19 @@ async def admin_ref_giveaway_pick(update: Update, context: ContextTypes.DEFAULT_
 async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
+    context.user_data.pop("bc_text", None)
+    context.user_data.pop("bc_photo", None)
     await safe_send(
         update,
-        "📢 Отправь пост рассылки: текст или фото с подписью.\n"
+        "📢 Шаг 1/2: отправь *текст* или *фото с подписью*.\n\n"
+        "Шаг 2: кнопки под постом (несколько строк «Текст | URL») или `skip`.\n"
         "Отмена: /cancel, /stop, /admin_stop или «🛑 Прервать сценарий».",
+        parse_mode="Markdown",
     )
     return ADMIN_BROADCAST_WAITING
 
 
-async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_broadcast_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return ADMIN_BROADCAST_WAITING
     text = update.message.text or update.message.caption or ""
@@ -4968,19 +5619,52 @@ async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYP
     if not text and not photo:
         await safe_send(update, "❌ Нужен текст или фото.")
         return ADMIN_BROADCAST_WAITING
+    context.user_data["bc_text"] = text
+    context.user_data["bc_photo"] = photo
+    await safe_send(
+        update,
+        "Шаг 2: отправь кнопки — *каждая строка*: `Текст кнопки | https://…`\n"
+        "Или одно слово `skip` — без кнопок.",
+        parse_mode="Markdown",
+    )
+    return ADMIN_BROADCAST_BUTTONS_WAITING
+
+
+async def admin_broadcast_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    raw = (update.message.text or "").strip()
+    text = context.user_data.get("bc_text") or ""
+    photo = context.user_data.get("bc_photo") or ""
+
+    markup: InlineKeyboardMarkup | None = None
+    if raw.lower() == "skip":
+        markup = None
+    else:
+        parsed, errors = parse_giveaway_buttons_lines(raw)
+        if errors:
+            await safe_send(update, "❌ Ошибки:\n" + "\n".join(errors[:12]))
+            return ADMIN_BROADCAST_BUTTONS_WAITING
+        if not parsed:
+            await safe_send(update, "❌ Нет ни одной валидной кнопки. Исправь или напиши skip.")
+            return ADMIN_BROADCAST_BUTTONS_WAITING
+        markup = giveaway_buttons_markup_from_json(json.dumps(parsed, ensure_ascii=False))
+
     cursor.execute("SELECT user_id FROM users")
     user_ids = [row[0] for row in cursor.fetchall()]
 
     sent = 0
     failed = 0
     blocked = 0
-    reason_stats = {}
+    reason_stats: dict[str, int] = {}
     for user_id in user_ids:
         try:
             if photo:
-                await context.bot.send_photo(chat_id=user_id, photo=photo, caption=text or None)
+                await context.bot.send_photo(
+                    chat_id=user_id, photo=photo, caption=text or None, reply_markup=markup
+                )
             else:
-                await context.bot.send_message(chat_id=user_id, text=text)
+                await context.bot.send_message(chat_id=user_id, text=text, reply_markup=markup)
             sent += 1
         except Exception as e:
             failed += 1
@@ -5000,6 +5684,8 @@ async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYP
     conn.commit()
     log_action(update.effective_user.id, "broadcast_manual", f"sent={sent};failed={failed};blocked={blocked}")
 
+    context.user_data.pop("bc_text", None)
+    context.user_data.pop("bc_photo", None)
     await safe_send(
         update,
         f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}\nБлокировок: {blocked}",
@@ -5088,12 +5774,9 @@ async def process_giveaway_autobroadcast(context: ContextTypes.DEFAULT_TYPE):
         min(int(ab_per_day or GIVEAWAY_AUTOBROADCAST_DEFAULT_PER_DAY), GIVEAWAY_AUTOBROADCAST_MAX_PER_DAY),
     )
     need_sec = giveaway_autobroadcast_interval_seconds(per_day)
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     if ab_last:
-        try:
-            last_dt = datetime.fromisoformat(ab_last)
-        except ValueError:
-            last_dt = None
+        last_dt = _parse_iso_datetime(ab_last)
         if last_dt and (now - last_dt).total_seconds() < need_sec:
             return
 
@@ -5165,26 +5848,76 @@ async def admin_giveaway_autobroadcast_once_now(update: Update, context: Context
 
 
 async def process_auto_posts(context: ContextTypes.DEFAULT_TYPE):
+    now_s = now_iso()
+    now_utc = datetime.now(timezone.utc)
+    local = now_utc.astimezone(BOT_DISPLAY_TZ)
+    slot_key = f"{local.date().isoformat()}_{local.hour:02d}:{local.minute:02d}"
+    current_hm = f"{local.hour:02d}:{local.minute:02d}"
+
     cursor.execute(
         """
-        SELECT post_id, text_value, photo, button_text, button_url, interval_hours
+        SELECT post_id, text_value, photo, button_text, button_url, COALESCE(buttons_json, '') AS buttons_json,
+               interval_hours
         FROM auto_posts
-        WHERE is_active = 1 AND (next_send_at IS NULL OR next_send_at <= ?)
+        WHERE is_active = 1
+          AND COALESCE(schedule_mode, 'interval') = 'interval'
+          AND (next_send_at IS NULL OR next_send_at <= ?)
         ORDER BY post_id ASC
         """,
-        (now_iso(),),
+        (now_s,),
     )
-    posts = cursor.fetchall()
-    if posts:
+    interval_posts = cursor.fetchall()
+
+    cursor.execute(
+        """
+        SELECT post_id, text_value, photo, button_text, button_url, COALESCE(buttons_json, '') AS buttons_json,
+               COALESCE(clock_times_json, ''), COALESCE(last_clock_slot_key, '')
+        FROM auto_posts
+        WHERE is_active = 1 AND COALESCE(schedule_mode, 'interval') = 'clock'
+        ORDER BY post_id ASC
+        """
+    )
+    clock_posts = cursor.fetchall()
+
+    posts_to_run: list[tuple] = []
+    for row in interval_posts:
+        posts_to_run.append(("interval", row))
+    for row in clock_posts:
+        post_id, text_value, photo, button_text, button_url, buttons_json, clock_raw, last_key = row
+        try:
+            times_list = json.loads(clock_raw or "[]")
+        except json.JSONDecodeError:
+            times_list = []
+        if not isinstance(times_list, list) or not times_list:
+            continue
+        norm_times = {str(t).strip() for t in times_list if str(t).strip()}
+        if current_hm not in norm_times:
+            continue
+        if last_key == slot_key:
+            continue
+        posts_to_run.append(("clock", row))
+
+    if posts_to_run:
         cursor.execute("SELECT user_id FROM users")
         user_ids = [row[0] for row in cursor.fetchall()]
         if user_ids:
-            for post_id, text_value, photo, button_text, button_url, interval_hours in posts:
+            for kind, row in posts_to_run:
+                if kind == "interval":
+                    post_id, text_value, photo, button_text, button_url, buttons_json, interval_hours = row
+                    last_key_update = None
+                    next_send = (
+                        datetime.now(timezone.utc) + timedelta(hours=interval_hours)
+                    ).replace(microsecond=0).isoformat()
+                else:
+                    post_id, text_value, photo, button_text, button_url, buttons_json, _, _ = row
+                    last_key_update = slot_key
+                    next_send = None
+
                 sent = 0
                 failed = 0
                 blocked = 0
-                reason_stats = {}
-                markup = autopost_button_markup(button_text, button_url)
+                reason_stats: dict[str, int] = {}
+                markup = autopost_reply_markup_from_row(buttons_json, button_text, button_url)
 
                 for user_id in user_ids:
                     try:
@@ -5205,15 +5938,24 @@ async def process_auto_posts(context: ContextTypes.DEFAULT_TYPE):
                         reason = str(e).split(":", 1)[0][:80]
                         reason_stats[reason] = reason_stats.get(reason, 0) + 1
 
-                next_send = (datetime.now() + timedelta(hours=interval_hours)).isoformat()
-                cursor.execute(
-                    """
-                    UPDATE auto_posts
-                    SET last_sent_at = ?, next_send_at = ?, sent_count = sent_count + ?
-                    WHERE post_id = ?
-                    """,
-                    (now_iso(), next_send, sent, post_id),
-                )
+                if kind == "interval":
+                    cursor.execute(
+                        """
+                        UPDATE auto_posts
+                        SET last_sent_at = ?, next_send_at = ?, sent_count = sent_count + ?
+                        WHERE post_id = ?
+                        """,
+                        (now_iso(), next_send, sent, post_id),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE auto_posts
+                        SET last_sent_at = ?, last_clock_slot_key = ?, sent_count = sent_count + ?
+                        WHERE post_id = ?
+                        """,
+                        (now_iso(), last_key_update, sent, post_id),
+                    )
                 cursor.execute(
                     """
                     INSERT INTO broadcast_logs (kind, post_id, sent, failed, blocked, details, created_at, created_by)
@@ -5924,10 +6666,7 @@ def format_admin_promos_revoke_list() -> str:
 
 
 def _format_short_date_iso(iso_ts: str | None) -> str:
-    dt = _parse_iso_datetime(iso_ts)
-    if not dt:
-        return (iso_ts or "")[:16]
-    return dt.strftime("%d.%m.%Y %H:%M")
+    return format_dt_yekaterinburg(iso_ts, "%d.%m.%Y %H:%M")
 
 
 async def admin_create_promo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6130,8 +6869,8 @@ async def admin_create_promo_duration_step(update: Update, context: ContextTypes
         await safe_send(update, "❌ Код занят. Начни заново.", reply_markup=admin_keyboard())
         return ConversationHandler.END
     created_at = now_iso()
-    expires_dt = datetime.now() + delta
-    expires_at = expires_dt.isoformat(timespec="seconds")
+    expires_dt = datetime.now(timezone.utc) + delta
+    expires_at = expires_dt.replace(microsecond=0).isoformat()
     mu = int(max_uses)
     cursor.execute(
         """
@@ -6152,7 +6891,7 @@ async def admin_create_promo_duration_step(update: Update, context: ContextTypes
         "admin_create_promo",
         f"code={code};discount={pct};expires_at={expires_at};max_uses={mu}",
     )
-    human_until = expires_dt.strftime("%d.%m.%Y %H:%M")
+    human_until = expires_dt.astimezone(BOT_DISPLAY_TZ).strftime("%d.%m.%Y %H:%M")
     lim_line = "без лимита по числу использований" if mu == 0 else f"до *{mu}* применений (на разные заказы)"
     await safe_send(
         update,
@@ -6418,7 +7157,8 @@ async def check_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if promocode_admin_expired(expires_at):
             await safe_send(
                 update,
-                f"⌛ Срок админского промокода истёк\nСкидка была: -{discount}%\nДействовал до: {expires_at or '—'}",
+                f"⌛ Срок админского промокода истёк\nСкидка была: -{discount}%\n"
+                f"Действовал до: {format_dt_yekaterinburg(expires_at, '%d.%m.%Y %H:%M') if (expires_at or '').strip() else '—'}",
             )
             return
         if mu > 0 and uc >= mu:
@@ -6429,10 +7169,18 @@ async def check_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     else:
         if used:
-            await safe_send(update, f"⚠️ Промокод уже использован\nСкидка: -{discount}%\nКогда использован: {used_at}")
+            await safe_send(
+                update,
+                f"⚠️ Промокод уже использован\nСкидка: -{discount}%\n"
+                f"Когда использован: {format_dt_yekaterinburg(used_at, '%d.%m.%Y %H:%M:%S')}",
+            )
             return
         if not is_code_active(created_at):
-            await safe_send(update, f"⌛ Промокод просрочен\nСкидка была: -{discount}%\nСоздан: {created_at}")
+            await safe_send(
+                update,
+                f"⌛ Промокод просрочен\nСкидка была: -{discount}%\n"
+                f"Создан: {format_dt_yekaterinburg(created_at, '%d.%m.%Y %H:%M:%S')}",
+            )
             return
 
     if int(admin_g or 0):
@@ -6452,7 +7200,8 @@ async def check_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kind = "крутилка (12 ч от создания)"
     await safe_send(
         update,
-        f"✅ Промокод активен ({kind})\nСкидка: -{discount}%\nСоздан: {created_at}\n"
+        f"✅ Промокод активен ({kind})\nСкидка: -{discount}%\n"
+        f"Создан: {format_dt_yekaterinburg(created_at, '%d.%m.%Y %H:%M:%S')}\n"
         f"{exp_line}{lim_line}Владелец user_id: {owner_user_id}",
     )
 
@@ -6544,6 +7293,10 @@ ADMIN_ESCAPE_LABELS = frozenset(
         "📍 Точки самовывоза",
         "↩️ К розыгрышам",
         "📣 Авторассылка анонса",
+        "👤 Админы",
+        "📋 Кто админ",
+        "👥 Пользователи (список)",
+        "📥 Скачать пользователей",
     }
 )
 
@@ -6605,6 +7358,18 @@ async def admin_escape_conversation(update: Update, context: ContextTypes.DEFAUL
     if text == "📊 Аналитика":
         await admin_open_analytics(update, context)
         return ConversationHandler.END
+    if text == "👤 Админы":
+        await admin_admins_open(update, context)
+        return ConversationHandler.END
+    if text == "📋 Кто админ":
+        await admin_admins_list(update, context)
+        return ConversationHandler.END
+    if text == "👥 Пользователи (список)":
+        await admin_users_preview(update, context)
+        return ConversationHandler.END
+    if text == "📥 Скачать пользователей":
+        await admin_users_export(update, context)
+        return ConversationHandler.END
     if text == "👋 Экран приветствия":
         await safe_send(
             update,
@@ -6660,6 +7425,8 @@ def main():
     app.add_handler(CommandHandler("check", check_code))
     app.add_handler(CommandHandler("use", use_code))
     app.add_handler(CommandHandler("ratecomment", rate_comment))
+    app.add_handler(CommandHandler("cnote", cmd_cnote))
+    app.add_handler(CommandHandler("cnotes", cmd_cnotes))
     app.add_handler(CommandHandler("cancel", cancel))
 
     # ВАЖНО: conversation handlers должны регистрироваться раньше обычных MessageHandler.
@@ -6674,6 +7441,8 @@ def main():
     )
     app.add_handler(CallbackQueryHandler(order_status_callback, pattern=r"^order_status:\d+:[a-z_]+$"))
     app.add_handler(CallbackQueryHandler(order_rate_callback, pattern=r"^order_rate:\d+:\d+$"))
+    app.add_handler(CallbackQueryHandler(client_notes_list_callback, pattern=r"^cn_list:\d+$"))
+    app.add_handler(CallbackQueryHandler(client_note_help_callback, pattern=r"^cn_help$"))
     app.add_handler(CallbackQueryHandler(giveaway_results_broadcast_callback, pattern=r"^gwb:\d+$"))
     app.add_handler(CallbackQueryHandler(giveaway_results_skip_callback, pattern=r"^gwx:\d+$"))
     app.add_handler(CallbackQueryHandler(autopost_manage_callback, pattern=r"^autopost_(pause|resume|delete):\d+$"))
@@ -6708,10 +7477,15 @@ def main():
 
     broadcast_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^📢 Рассылка$"), admin_broadcast_start)],
-        states={ADMIN_BROADCAST_WAITING: [
-            MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_send),
-            MessageHandler(filters.PHOTO, admin_broadcast_send),
-        ]},
+        states={
+            ADMIN_BROADCAST_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_content),
+                MessageHandler(filters.PHOTO, admin_broadcast_content),
+            ],
+            ADMIN_BROADCAST_BUTTONS_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_buttons),
+            ],
+        },
         fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
@@ -6926,7 +7700,20 @@ def main():
             ],
             ADMIN_AUTOPOST_BUTTON_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_autopost_button)],
             ADMIN_AUTOPOST_INTERVAL_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_autopost_interval)],
+            ADMIN_AUTOPOST_CLOCK_TIMES: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_autopost_clock_times)],
         },
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
+    )
+
+    admins_add_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^➕ Добавить админа$"), admin_admins_add_start)],
+        states={ADMIN_ADD_ADMIN_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_admins_add_save)]},
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
+    )
+
+    admins_remove_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🗑 Удалить админа$"), admin_admins_remove_start)],
+        states={ADMIN_REMOVE_ADMIN_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_admins_remove_save)]},
         fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
@@ -7019,6 +7806,8 @@ def main():
     app.add_handler(finish_giveaway_conv)
     app.add_handler(giveaway_autobroadcast_conv)
     app.add_handler(autopost_conv)
+    app.add_handler(admins_add_conv)
+    app.add_handler(admins_remove_conv)
     app.add_handler(blacklist_conv)
     app.add_handler(category_discount_conv)
     app.add_handler(welcome_screen_conv)
@@ -7056,6 +7845,10 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^👥 Клиенты$"), admin_open_clients))
     app.add_handler(MessageHandler(filters.Regex(r"^🔗 Ссылки и инфо$"), admin_open_links))
     app.add_handler(MessageHandler(filters.Regex(r"^📊 Аналитика$"), admin_open_analytics))
+    app.add_handler(MessageHandler(filters.Regex(r"^👤 Админы$"), admin_admins_open))
+    app.add_handler(MessageHandler(filters.Regex(r"^📋 Кто админ$"), admin_admins_list))
+    app.add_handler(MessageHandler(filters.Regex(r"^👥 Пользователи \(список\)$"), admin_users_preview))
+    app.add_handler(MessageHandler(filters.Regex(r"^📥 Скачать пользователей$"), admin_users_export))
     app.add_handler(MessageHandler(filters.Regex(r"^📍 Точки самовывоза$"), admin_pickup_panel))
     app.add_handler(MessageHandler(filters.Regex(r"^📊 Статистика$"), admin_stats))
     app.add_handler(MessageHandler(filters.Regex(r"^📈 Аналитика PRO$"), admin_advanced_stats))
