@@ -82,6 +82,7 @@ CATEGORY_ORDER = [
     "disposables",
     "plates",
     "supplies",
+    "bu_rndm",
     "sale",
 ]
 
@@ -91,6 +92,7 @@ CATEGORY_LABELS = {
     "disposables": "🔥 ОДНОРАЗКИ",
     "plates": "🧊 ШАЙБЫ/ПЛАСТИНКИ",
     "supplies": "🛠 РАСХОДНИКИ",
+    "bu_rndm": "♻️ БУ РЫНОК RNDM",
     "sale": "💸 СЛИВ/СКИДКИ",
 }
 
