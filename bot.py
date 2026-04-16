@@ -1,5 +1,7 @@
 import os
 import re
+import sys
+import time
 import json
 import csv
 import html
@@ -19,6 +21,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -307,6 +310,13 @@ else:
         "файл базы каждый раз новый — пропадают товары, фото, ссылки, пользователи, заказы. "
         "Для продакшена: задай DATABASE_URL (Postgres плагин) ИЛИ Railway Volume + SQLITE_PATH вроде /data/rndm.db"
     )
+
+# Session lock в Postgres: только один процесс с этим DATABASE_URL может идти в run_polling.
+# Иначе две реплики Railway одновременно шлют getUpdates → telegram.error.Conflict (409).
+_PG_POLLING_ADVISORY_K1 = 0x524E444D  # 'RNDM'
+_PG_POLLING_ADVISORY_K2 = 0x53484F50  # 'SHOP'
+_POLLING_LOCK_ACQUIRE_TIMEOUT_SEC = 180
+_POLLING_LOCK_RETRY_INTERVAL_SEC = 3
 
 
 def now_iso() -> str:
@@ -7664,7 +7674,56 @@ async def pickup_select_stale_fallback(update: Update, context: ContextTypes.DEF
         logger.exception("pickup_select_stale_fallback: answer")
 
 
+def _acquire_postgres_polling_singleton_lock() -> None:
+    if not USE_POSTGRES:
+        return
+    deadline = time.monotonic() + _POLLING_LOCK_ACQUIRE_TIMEOUT_SEC
+    logged_wait = False
+    while True:
+        cursor.execute(
+            "SELECT pg_try_advisory_lock(?, ?)", (_PG_POLLING_ADVISORY_K1, _PG_POLLING_ADVISORY_K2)
+        )
+        row = cursor.fetchone()
+        if row and row[0]:
+            logger.info(
+                "PostgreSQL advisory lock для polling получен — второй инстанс с тем же DATABASE_URL "
+                "не начнёт getUpdates, пока этот процесс жив."
+            )
+            return
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        if not logged_wait:
+            logger.warning(
+                "Другой инстанс держит advisory lock (ожидание до %s с — типично при перекрытии деплоя).",
+                _POLLING_LOCK_ACQUIRE_TIMEOUT_SEC,
+            )
+            logged_wait = True
+        time.sleep(min(_POLLING_LOCK_RETRY_INTERVAL_SEC, left))
+    logger.critical(
+        "Не удалось получить PostgreSQL advisory lock за %s с — проверь зависший старый деплой или второй "
+        "процесс с тем же DATABASE_URL.",
+        _POLLING_LOCK_ACQUIRE_TIMEOUT_SEC,
+    )
+    sys.exit(1)
+
+
+def _is_getupdates_conflict(err: BaseException | None) -> bool:
+    if err is None:
+        return False
+    if isinstance(err, Conflict):
+        return True
+    msg = str(err)
+    return "other getUpdates request" in msg or ("Conflict" in msg and "getUpdates" in msg)
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if _is_getupdates_conflict(context.error):
+        logger.warning(
+            "Telegram 409 Conflict: одновременно идёт другой getUpdates с этим BOT_TOKEN. "
+            "Оставь один инстанс (Railway: 1 replica; не запускай бота локально параллельно)."
+        )
+        return
     if USE_POSTGRES:
         try:
             conn.rollback()
@@ -7735,6 +7794,7 @@ def main():
         fallbacks=[*ADMIN_CONV_FALLBACKS, MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main)],
         per_chat=False,
         per_user=True,
+        per_message=True,
     )
 
     broadcast_conv = ConversationHandler(
@@ -8143,6 +8203,7 @@ def main():
         print(f"Старт бота: режим БД = SQLite ({_p})", flush=True)
 
     print("RNDM SHOP bot запущен...", flush=True)
+    _acquire_postgres_polling_singleton_lock()
     app.run_polling(poll_interval=1, timeout=10, drop_pending_updates=True)
 
 
