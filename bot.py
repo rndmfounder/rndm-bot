@@ -7794,7 +7794,6 @@ def main():
         fallbacks=[*ADMIN_CONV_FALLBACKS, MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main)],
         per_chat=False,
         per_user=True,
-        per_message=True,
     )
 
     broadcast_conv = ConversationHandler(
