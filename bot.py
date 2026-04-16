@@ -2489,35 +2489,60 @@ def admin_broadcast_keyboard() -> ReplyKeyboardMarkup:
 
 
 def normalized_reply_keyboard_text(text: str | None) -> str:
-    """Telegram иногда добавляет U+FE0F к эмодзи в reply-кнопках."""
-    return (text or "").strip().replace("\uFE0F", "")
+    """Telegram иногда добавляет U+FE0F к эмодзи в reply-кнопках; плюс NBSP/тире из разных клиентов."""
+    s = (text or "").strip()
+    s = s.replace("\uFE0F", "").replace("\uFE0E", "")
+    for ch in ("\u200b", "\u200c", "\u200d", "\ufeff"):
+        s = s.replace(ch, "")
+    for ch in ("\u00a0", "\u202f", "\u2009", "\u2007", "\u3000"):
+        s = s.replace(ch, " ")
+    for ch in ("\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2212"):
+        s = s.replace(ch, "-")
+    while "  " in s:
+        s = s.replace("  ", " ")
+    return s.strip()
 
 
-BROADCAST_AUTOPOST_NAV_LABELS = frozenset({"📢 Рассылка", "🤖 Авто-рассылки"})
+def canonical_broadcast_nav_label(text: str | None) -> str | None:
+    """Канонический сценарий по тексту reply-кнопки: 'broadcast' | 'autopost' | None."""
+    nav = normalized_reply_keyboard_text(text)
+    if nav in ("📢 Рассылка", "📢 Рассылки"):
+        return "broadcast"
+    if nav in ("🤖 Авто-рассылки", "🤖 Авторассылки"):
+        return "autopost"
+    return None
+
+
+def is_broadcast_autopost_nav(text: str | None) -> bool:
+    return canonical_broadcast_nav_label(text) is not None
+
+
+# Все варианты подписей, которые не должны перехватываться admin_escape (их обрабатывают broadcast/autopost conv).
+_BROADCAST_AUTOPOST_NAV_SYNONYMS = frozenset({"📢 Рассылка", "📢 Рассылки", "🤖 Авто-рассылки", "🤖 Авторассылки"})
 
 
 class BroadcastKeyboardEntryFilter(filters.MessageFilter):
     def filter(self, message):
         if message is None or not getattr(message, "text", None):
             return False
-        return normalized_reply_keyboard_text(message.text) == "📢 Рассылка"
+        return canonical_broadcast_nav_label(message.text) == "broadcast"
 
 
 class AutopostKeyboardEntryFilter(filters.MessageFilter):
     def filter(self, message):
         if message is None or not getattr(message, "text", None):
             return False
-        return normalized_reply_keyboard_text(message.text) == "🤖 Авто-рассылки"
+        return canonical_broadcast_nav_label(message.text) == "autopost"
 
 
 async def try_route_broadcast_reply_buttons(
     update: Update, context: ContextTypes.DEFAULT_TYPE, message_text: str | None
 ):
     """Если нажата reply-кнопка рассылок — сразу открываем сценарий (в т.ч. из welcome/promo)."""
-    nav = normalized_reply_keyboard_text(message_text)
-    if nav == "📢 Рассылка":
+    kind = canonical_broadcast_nav_label(message_text)
+    if kind == "broadcast":
         return await admin_broadcast_start(update, context)
-    if nav == "🤖 Авто-рассылки":
+    if kind == "autopost":
         return await admin_autopost_start(update, context)
     return None
 
@@ -4321,7 +4346,7 @@ async def admin_projects_content_start(update: Update, context: ContextTypes.DEF
 
 async def admin_info_blocks_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nav = normalized_reply_keyboard_text(update.message.text)
-    if nav in BROADCAST_AUTOPOST_NAV_LABELS:
+    if is_broadcast_autopost_nav(nav):
         return await reply_broadcast_nav_stuck_hint(update, context)
     block_key = parse_info_block_from_label(update.message.text.strip())
     if not block_key:
@@ -4339,7 +4364,7 @@ async def admin_info_blocks_select(update: Update, context: ContextTypes.DEFAULT
 
 async def admin_info_blocks_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nav = normalized_reply_keyboard_text(update.message.text)
-    if nav in BROADCAST_AUTOPOST_NAV_LABELS:
+    if is_broadcast_autopost_nav(nav):
         return await reply_broadcast_nav_stuck_hint(update, context)
     block_key = context.user_data.get("info_block_key")
     if not block_key:
@@ -4363,7 +4388,7 @@ async def admin_info_blocks_save_text(update: Update, context: ContextTypes.DEFA
         return ConversationHandler.END
 
     nav = normalized_reply_keyboard_text(update.message.text)
-    if nav in BROADCAST_AUTOPOST_NAV_LABELS:
+    if is_broadcast_autopost_nav(nav):
         return await reply_broadcast_nav_stuck_hint(update, context)
 
     set_info_block_text(block_key, update.message.text)
@@ -4462,7 +4487,7 @@ async def admin_giveaway_autobroadcast_panel(update: Update, context: ContextTyp
     active = get_active_giveaway()
     intro = (
         "📣 *Авторассылка анонса розыгрыша*\n\n"
-        "Бот периодически рассылает **тот же пост**, что пользователь видит по кнопке «🎁 Розыгрыши» "
+        "Бот периодически рассылает *тот же пост*, что пользователь видит по кнопке «🎁 Розыгрыши» "
         "(описание, фото, кнопки, персональная реферальная ссылка и число приглашений).\n\n"
         "Получатели — все клиенты из базы, кроме чёрного списка.\n\n"
         "Кнопка «📤 Разослать анонс сейчас» шлёт тот же пост *один раз сразу*, без ожидания таймера.\n"
@@ -4869,7 +4894,7 @@ async def admin_blacklist_start(update: Update, context: ContextTypes.DEFAULT_TY
 async def admin_blacklist_manage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.strip()
     nav = normalized_reply_keyboard_text(raw)
-    if nav in BROADCAST_AUTOPOST_NAV_LABELS:
+    if is_broadcast_autopost_nav(nav):
         return await reply_broadcast_nav_stuck_hint(update, context)
     if raw.lower() == "list":
         cursor.execute("SELECT user_id, COALESCE(reason, '') FROM blacklist ORDER BY added_at DESC LIMIT 30")
@@ -4932,7 +4957,7 @@ async def admin_category_discount_start(update: Update, context: ContextTypes.DE
 async def admin_category_discount_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.strip()
     nav = normalized_reply_keyboard_text(raw)
-    if nav in BROADCAST_AUTOPOST_NAV_LABELS:
+    if is_broadcast_autopost_nav(nav):
         return await reply_broadcast_nav_stuck_hint(update, context)
     if "=" not in raw:
         await safe_send(update, "❌ Формат: КАТЕГОРИЯ = 20 / off")
@@ -5269,7 +5294,7 @@ async def admin_autopost_start(update: Update, context: ContextTypes.DEFAULT_TYP
         "2) фото или `skip`\n"
         "3) кнопки: строки `Текст | https://…` или `skip`\n"
         "4) расписание: число *часов* между отправками или слово `время`, "
-        "затем строки `ЧЧ:ММ` (**Екатеринбург**)\n\n"
+        "затем строки `ЧЧ:ММ` (*Екатеринбург*)\n\n"
         "Отправь *текст* первого поста.\n\n"
         "Выйти: /cancel, /stop, /admin_stop или «🛑 Прервать сценарий».",
         parse_mode="Markdown",
@@ -5329,7 +5354,7 @@ async def admin_autopost_button(update: Update, context: ContextTypes.DEFAULT_TY
         "⏱ *Расписание:*\n"
         "• число *часов* между отправками (например `24`)\n"
         "• или слово *время* — следующим сообщением строки `ЧЧ:ММ` "
-        "(**Екатеринбург**), например два раза в день:\n"
+        "(*Екатеринбург*), например два раза в день:\n"
         "`09:00`\n`21:00`",
         parse_mode="Markdown",
     )
@@ -7417,7 +7442,9 @@ ADMIN_ESCAPE_LABELS = frozenset(
         "⤴️ Админка",
         "⚙️ Админка",
         "📢 Рассылка",
+        "📢 Рассылки",
         "🤖 Авто-рассылки",
+        "🤖 Авторассылки",
         "📋 Активные авто-рассылки",
         "🛑 Прервать сценарий",
         "📍 Точки самовывоза",
@@ -7431,7 +7458,7 @@ ADMIN_ESCAPE_LABELS = frozenset(
 )
 
 # Кнопки запуска сценариев рассылок не перехватываем fallback'ом — иначе открывается только подменю без шага ввода.
-ADMIN_ESCAPE_NAV_FILTER_LABELS = frozenset(ADMIN_ESCAPE_LABELS - BROADCAST_AUTOPOST_NAV_LABELS)
+ADMIN_ESCAPE_NAV_FILTER_LABELS = frozenset(ADMIN_ESCAPE_LABELS - _BROADCAST_AUTOPOST_NAV_SYNONYMS)
 
 
 class _AdminEscapeNavFilter(filters.MessageFilter):
@@ -7920,9 +7947,11 @@ def main():
         fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
-    app.add_handler(checkout_conv)
+    # Рассылки раньше checkout: иначе активный сценарий оформления перехватывает текстовые reply-кнопки
+    # «📢 Рассылка» / «🤖 Авто-рассылки» как «телефон»/промокод — ответа нет, сценарий «молчит».
     app.add_handler(broadcast_conv)
     app.add_handler(autopost_conv)
+    app.add_handler(checkout_conv)
     app.add_handler(CallbackQueryHandler(pickup_select_stale_fallback, pattern=r"^pickup_select:\d+$"))
     app.add_handler(info_blocks_conv)
     app.add_handler(referral_hub_photo_conv)
