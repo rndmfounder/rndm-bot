@@ -5298,7 +5298,7 @@ async def admin_autopost_start(update: Update, context: ContextTypes.DEFAULT_TYP
         "4) расписание: число *часов* между отправками или слово `время`, "
         "затем строки `ЧЧ:ММ` (*Екатеринбург*)\n\n"
         "Отправь *текст* первого поста.\n\n"
-        "Выйти: /cancel, /stop, /admin_stop или «🛑 Прервать сценарий».",
+        "Выйти: /cancel, /stop, /admin\\_stop или «🛑 Прервать сценарий».",
         parse_mode="Markdown",
     )
     return ADMIN_AUTOPOST_TEXT_WAITING
@@ -5723,7 +5723,7 @@ async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TY
         "📣 *Ручная рассылка*\n"
         "Шаг 1/2: отправь *текст* или *фото с подписью*.\n\n"
         "Шаг 2: кнопки под постом (несколько строк «Текст | URL») или `skip`.\n"
-        "Отмена: /cancel, /stop, /admin_stop или «🛑 Прервать сценарий».",
+        "Отмена: /cancel, /stop, /admin\\_stop или «🛑 Прервать сценарий».",
         parse_mode="Markdown",
     )
     return ADMIN_BROADCAST_WAITING
