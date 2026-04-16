@@ -51,6 +51,9 @@ DEFAULT_MANAGER_URL = f"tg://user?id={MANAGER_USER_ID}"
 # ВАЖНО: замени на реальный chat_id группы менеджеров
 ORDER_GROUP_ID = int(os.getenv("ORDER_GROUP_ID", "-1003913158040"))
 
+# Фиксированная доплата за доставку (после скидки на товары).
+DELIVERY_FEE_RUB = 200
+
 # SQLite в каталоге контейнера без постоянного диска = после каждого деплоя НОВАЯ пустая база
 # (весь каталог, настройки, ссылки, file_id фото). Прод: DATABASE_URL (Postgres) или volume + SQLITE_PATH.
 DB_PATH = os.getenv("SQLITE_PATH", "rndm.db")
@@ -2924,6 +2927,9 @@ def build_manager_order_message_html(order_row: tuple, claimed_by_user) -> tuple
         blocks.append(f"Скидка по рангу: -{int(discount_percent)}%")
         blocks.append(f"Размер скидки: {int(discount_amount or 0)} ₽")
 
+    if order_type == "delivery" and DELIVERY_FEE_RUB > 0:
+        blocks.append(f"🚚 <b>Доставка:</b> +{DELIVERY_FEE_RUB} ₽")
+
     if (order_comment or "").strip():
         blocks.append(f"💬 <b>Комментарий к заказу:</b>\n{html_esc((order_comment or '').strip())}")
 
@@ -3214,6 +3220,7 @@ def clear_order_context(context: ContextTypes.DEFAULT_TYPE) -> None:
         "checkout_discount_amount",
         "checkout_total_before_discount",
         "checkout_total_after_discount",
+        "checkout_delivery_fee",
     ]:
         context.user_data.pop(key, None)
 
@@ -3251,9 +3258,11 @@ def recalculate_checkout_totals(context: ContextTypes.DEFAULT_TYPE, user_id: int
     eff = promo_pct if promo_pct > ref_pct else ref_pct
     context.user_data["checkout_referral_percent"] = ref_pct
     context.user_data["checkout_discount_percent"] = eff
-    final_sum, discount_amount = apply_discount_to_total(total_sum, eff)
+    after_discount, discount_amount = apply_discount_to_total(total_sum, eff)
+    delivery_fee = DELIVERY_FEE_RUB if context.user_data.get("checkout_mode") == "delivery" else 0
+    context.user_data["checkout_delivery_fee"] = delivery_fee
     context.user_data["checkout_total_before_discount"] = total_sum
-    context.user_data["checkout_total_after_discount"] = final_sum
+    context.user_data["checkout_total_after_discount"] = after_discount + delivery_fee
     context.user_data["checkout_discount_amount"] = discount_amount
 
 
@@ -3398,8 +3407,10 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
         promo_db = None
 
     items_text = build_items_text(items)
-    total_sum = build_total_sum(items)
-    final_sum, discount_amount = apply_discount_to_total(total_sum, discount_percent)
+    items_total = build_total_sum(items)
+    after_discount, discount_amount = apply_discount_to_total(items_total, discount_percent)
+    delivery_fee = DELIVERY_FEE_RUB if order_type == "delivery" else 0
+    final_sum = after_discount + delivery_fee
 
     if USE_POSTGRES:
         cursor.execute(
@@ -3425,7 +3436,7 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
                 items_text,
                 final_sum,
                 now_iso(),
-                total_sum,
+                items_total,
                 promo_db,
                 int(discount_percent or 0),
                 int(discount_amount or 0),
@@ -3456,7 +3467,7 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
                 items_text,
                 final_sum,
                 now_iso(),
-                total_sum,
+                items_total,
                 promo_db,
                 int(discount_percent or 0),
                 int(discount_amount or 0),
@@ -3894,7 +3905,13 @@ async def checkout_choose_delivery(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
     context.user_data["checkout_mode"] = "delivery"
-    await _checkout_reply_after_query(context, query, "1) Ваш телефон в формате +7XXXXXXXXXX")
+    recalculate_checkout_totals(context, query.from_user.id)
+    fee_line = ""
+    if DELIVERY_FEE_RUB > 0:
+        fee_line = f"\n\nК сумме заказа добавится доставка: +{DELIVERY_FEE_RUB} ₽."
+    await _checkout_reply_after_query(
+        context, query, f"1) Ваш телефон в формате +7XXXXXXXXXX{fee_line}"
+    )
     return ORDER_DELIVERY_PHONE_WAITING
 
 
@@ -4017,6 +4034,7 @@ async def checkout_choose_pickup(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     context.user_data["checkout_mode"] = "pickup"
+    recalculate_checkout_totals(context, query.from_user.id)
 
     points = get_pickup_points()
     if not points:
