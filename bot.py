@@ -2488,6 +2488,55 @@ def admin_broadcast_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def normalized_reply_keyboard_text(text: str | None) -> str:
+    """Telegram иногда добавляет U+FE0F к эмодзи в reply-кнопках."""
+    return (text or "").strip().replace("\uFE0F", "")
+
+
+BROADCAST_AUTOPOST_NAV_LABELS = frozenset({"📢 Рассылка", "🤖 Авто-рассылки"})
+
+
+class BroadcastKeyboardEntryFilter(filters.MessageFilter):
+    def filter(self, message):
+        if message is None or not getattr(message, "text", None):
+            return False
+        return normalized_reply_keyboard_text(message.text) == "📢 Рассылка"
+
+
+class AutopostKeyboardEntryFilter(filters.MessageFilter):
+    def filter(self, message):
+        if message is None or not getattr(message, "text", None):
+            return False
+        return normalized_reply_keyboard_text(message.text) == "🤖 Авто-рассылки"
+
+
+async def try_route_broadcast_reply_buttons(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, message_text: str | None
+):
+    """Если нажата reply-кнопка рассылок — сразу открываем сценарий (в т.ч. из welcome/promo)."""
+    nav = normalized_reply_keyboard_text(message_text)
+    if nav == "📢 Рассылка":
+        return await admin_broadcast_start(update, context)
+    if nav == "🤖 Авто-рассылки":
+        return await admin_autopost_start(update, context)
+    return None
+
+
+async def reply_broadcast_nav_stuck_hint(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сценарий перехватил текст кнопки рассылки — выходим и подсказываем команды."""
+    context.user_data.clear()
+    if update.message:
+        await update.message.reply_text(
+            "Сейчас был активен другой сценарий, поэтому кнопка рассылки не открылась.\n\n"
+            "Напиши команду:\n"
+            "• /broadcast — ручная рассылка (текст/фото → кнопки → отправка)\n"
+            "• /autopost — авто-рассылка (текст → фото → кнопки → интервал или «время»)\n\n"
+            "Или нажми «🛑 Прервать сценарий», затем снова кнопку 📢/🤖.",
+            reply_markup=admin_broadcast_keyboard(),
+        )
+    return ConversationHandler.END
+
+
 def admin_giveaways_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
@@ -4218,7 +4267,10 @@ async def admin_referral_hub_photo_save(update: Update, context: ContextTypes.DE
                 reply_markup=admin_links_keyboard(),
             )
             return ConversationHandler.END
-        if raw in ADMIN_ESCAPE_LABELS:
+        routed = await try_route_broadcast_reply_buttons(update, context, raw)
+        if routed is not None:
+            return routed
+        if normalized_reply_keyboard_text(raw) in ADMIN_ESCAPE_LABELS:
             return await admin_escape_conversation(update, context)
 
     if update.message.photo:
@@ -4265,6 +4317,9 @@ async def admin_projects_content_start(update: Update, context: ContextTypes.DEF
 
 
 async def admin_info_blocks_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    nav = normalized_reply_keyboard_text(update.message.text)
+    if nav in BROADCAST_AUTOPOST_NAV_LABELS:
+        return await reply_broadcast_nav_stuck_hint(update, context)
     block_key = parse_info_block_from_label(update.message.text.strip())
     if not block_key:
         await safe_send(update, "❌ Выбери блок кнопкой ниже.", reply_markup=info_block_choice_keyboard())
@@ -4280,6 +4335,9 @@ async def admin_info_blocks_select(update: Update, context: ContextTypes.DEFAULT
 
 
 async def admin_info_blocks_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    nav = normalized_reply_keyboard_text(update.message.text)
+    if nav in BROADCAST_AUTOPOST_NAV_LABELS:
+        return await reply_broadcast_nav_stuck_hint(update, context)
     block_key = context.user_data.get("info_block_key")
     if not block_key:
         return ConversationHandler.END
@@ -4300,6 +4358,10 @@ async def admin_info_blocks_save_text(update: Update, context: ContextTypes.DEFA
     block_key = context.user_data.get("info_block_key")
     if not block_key:
         return ConversationHandler.END
+
+    nav = normalized_reply_keyboard_text(update.message.text)
+    if nav in BROADCAST_AUTOPOST_NAV_LABELS:
+        return await reply_broadcast_nav_stuck_hint(update, context)
 
     set_info_block_text(block_key, update.message.text)
     context.user_data.pop("info_block_key", None)
@@ -4355,7 +4417,13 @@ async def admin_open_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def admin_open_broadcasts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(update.effective_user.id):
-        await safe_send(update, "📣 Раздел: рассылки", reply_markup=admin_broadcast_keyboard())
+        await safe_send(
+            update,
+            "📣 Раздел: рассылки\n\n"
+            "Кнопки 📢/🤖 или команды: /broadcast и /autopost.\n"
+            "Если сценарий «завис» в другом разделе — «🛑 Прервать сценарий» или /admin_stop.",
+            reply_markup=admin_broadcast_keyboard(),
+        )
 
 
 async def admin_open_giveaways(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4797,6 +4865,9 @@ async def admin_blacklist_start(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def admin_blacklist_manage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.strip()
+    nav = normalized_reply_keyboard_text(raw)
+    if nav in BROADCAST_AUTOPOST_NAV_LABELS:
+        return await reply_broadcast_nav_stuck_hint(update, context)
     if raw.lower() == "list":
         cursor.execute("SELECT user_id, COALESCE(reason, '') FROM blacklist ORDER BY added_at DESC LIMIT 30")
         rows = cursor.fetchall()
@@ -4857,6 +4928,9 @@ async def admin_category_discount_start(update: Update, context: ContextTypes.DE
 
 async def admin_category_discount_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.strip()
+    nav = normalized_reply_keyboard_text(raw)
+    if nav in BROADCAST_AUTOPOST_NAV_LABELS:
+        return await reply_broadcast_nav_stuck_hint(update, context)
     if "=" not in raw:
         await safe_send(update, "❌ Формат: КАТЕГОРИЯ = 20 / off")
         return ADMIN_CATEGORY_DISCOUNT_WAITING
@@ -5181,10 +5255,20 @@ async def giveaway_results_skip_callback(update: Update, context: ContextTypes.D
 async def admin_autopost_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
+    if not update.message:
+        return ConversationHandler.END
+    context.user_data.clear()
     await safe_send(
         update,
-        "🤖 Отправь текст автопоста.\n\n"
-        "Выйти из сценария: /cancel, /stop, /admin_stop или кнопка «🛑 Прервать сценарий».",
+        "🤖 *Авто-рассылка* — по шагам:\n"
+        "1) текст поста\n"
+        "2) фото или `skip`\n"
+        "3) кнопки: строки `Текст | https://…` или `skip`\n"
+        "4) расписание: число *часов* между отправками или слово `время`, "
+        "затем строки `ЧЧ:ММ` (**Екатеринбург**)\n\n"
+        "Отправь *текст* первого поста.\n\n"
+        "Выйти: /cancel, /stop, /admin_stop или «🛑 Прервать сценарий».",
+        parse_mode="Markdown",
     )
     return ADMIN_AUTOPOST_TEXT_WAITING
 
@@ -5599,11 +5683,13 @@ async def admin_ref_giveaway_pick(update: Update, context: ContextTypes.DEFAULT_
 async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-    context.user_data.pop("bc_text", None)
-    context.user_data.pop("bc_photo", None)
+    if not update.message:
+        return ConversationHandler.END
+    context.user_data.clear()
     await safe_send(
         update,
-        "📢 Шаг 1/2: отправь *текст* или *фото с подписью*.\n\n"
+        "📢 *Ручная рассылка*\n"
+        "Шаг 1/2: отправь *текст* или *фото с подписью*.\n\n"
         "Шаг 2: кнопки под постом (несколько строк «Текст | URL») или `skip`.\n"
         "Отмена: /cancel, /stop, /admin_stop или «🛑 Прервать сценарий».",
         parse_mode="Markdown",
@@ -6696,7 +6782,11 @@ async def admin_create_promo_code_step(update: Update, context: ContextTypes.DEF
         await safe_send(update, "Нужен текст кодом.", reply_markup=admin_keyboard())
         return ADMIN_CREATE_PROMO_CODE_WAITING
     raw = update.message.text.strip()
-    if raw in ADMIN_ESCAPE_LABELS:
+    nav = normalized_reply_keyboard_text(raw)
+    routed = await try_route_broadcast_reply_buttons(update, context, nav)
+    if routed is not None:
+        return routed
+    if nav in ADMIN_ESCAPE_LABELS:
         context.user_data.pop("admin_new_promo_discount", None)
         context.user_data.pop("admin_new_promo_max_uses", None)
         return await admin_escape_conversation(update, context)
@@ -6743,7 +6833,11 @@ async def admin_create_promo_discount_step(update: Update, context: ContextTypes
         await safe_send(update, "Введи число — процент скидки.", reply_markup=admin_keyboard())
         return ADMIN_CREATE_PROMO_DISCOUNT_WAITING
     raw = update.message.text.strip()
-    if raw in ADMIN_ESCAPE_LABELS:
+    nav = normalized_reply_keyboard_text(raw)
+    routed = await try_route_broadcast_reply_buttons(update, context, nav)
+    if routed is not None:
+        return routed
+    if nav in ADMIN_ESCAPE_LABELS:
         context.user_data.pop("admin_new_promo_code", None)
         context.user_data.pop("admin_new_promo_discount", None)
         return await admin_escape_conversation(update, context)
@@ -6790,7 +6884,11 @@ async def admin_create_promo_max_uses_step(update: Update, context: ContextTypes
         await safe_send(update, "Введи число использований (0 = без лимита).", reply_markup=admin_keyboard())
         return ADMIN_CREATE_PROMO_MAX_USES_WAITING
     raw = update.message.text.strip()
-    if raw in ADMIN_ESCAPE_LABELS:
+    nav = normalized_reply_keyboard_text(raw)
+    routed = await try_route_broadcast_reply_buttons(update, context, nav)
+    if routed is not None:
+        return routed
+    if nav in ADMIN_ESCAPE_LABELS:
         context.user_data.pop("admin_new_promo_code", None)
         context.user_data.pop("admin_new_promo_discount", None)
         context.user_data.pop("admin_new_promo_max_uses", None)
@@ -6848,7 +6946,11 @@ async def admin_create_promo_duration_step(update: Update, context: ContextTypes
         )
         return ADMIN_CREATE_PROMO_DURATION_WAITING
     raw = update.message.text.strip()
-    if raw in ADMIN_ESCAPE_LABELS:
+    nav = normalized_reply_keyboard_text(raw)
+    routed = await try_route_broadcast_reply_buttons(update, context, nav)
+    if routed is not None:
+        return routed
+    if nav in ADMIN_ESCAPE_LABELS:
         context.user_data.pop("admin_new_promo_code", None)
         context.user_data.pop("admin_new_promo_discount", None)
         context.user_data.pop("admin_new_promo_max_uses", None)
@@ -6928,7 +7030,11 @@ async def admin_revoke_promo_code_step(update: Update, context: ContextTypes.DEF
         await safe_send(update, "Отправь код промокода текстом.", reply_markup=admin_keyboard())
         return ADMIN_REVOKE_PROMO_WAITING
     raw = update.message.text.strip()
-    if raw in ADMIN_ESCAPE_LABELS:
+    nav = normalized_reply_keyboard_text(raw)
+    routed = await try_route_broadcast_reply_buttons(update, context, nav)
+    if routed is not None:
+        return routed
+    if nav in ADMIN_ESCAPE_LABELS:
         return await admin_escape_conversation(update, context)
     code = re.sub(r"[^A-Za-z0-9_-]", "", raw).upper()
     if len(code) < 2:
@@ -7007,7 +7113,11 @@ async def admin_welcome_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await safe_send(update, "Выбери пункт меню кнопкой ниже.", reply_markup=admin_welcome_keyboard())
         return ADMIN_WELCOME_MENU_WAITING
     text = update.message.text.strip()
-    if text in ADMIN_ESCAPE_LABELS:
+    nav = normalized_reply_keyboard_text(text)
+    routed = await try_route_broadcast_reply_buttons(update, context, nav)
+    if routed is not None:
+        return routed
+    if nav in ADMIN_ESCAPE_LABELS:
         return await admin_escape_conversation(update, context)
     if text == "📝 Текст приветствия":
         await safe_send(
@@ -7049,7 +7159,12 @@ async def admin_welcome_save_text(update: Update, context: ContextTypes.DEFAULT_
     if not update.message or not update.message.text:
         await safe_send(update, "Нужен текст сообщением.")
         return ADMIN_WELCOME_TEXT_WAITING
-    if update.message.text.strip() in ADMIN_ESCAPE_LABELS:
+    raw = update.message.text.strip()
+    nav = normalized_reply_keyboard_text(raw)
+    routed = await try_route_broadcast_reply_buttons(update, context, nav)
+    if routed is not None:
+        return routed
+    if nav in ADMIN_ESCAPE_LABELS:
         return await admin_escape_conversation(update, context)
     set_welcome_caption_value(update.message.text.strip())
     await safe_send(update, "✅ Текст приветствия сохранён.", reply_markup=admin_welcome_keyboard())
@@ -7061,8 +7176,14 @@ async def admin_welcome_save_photo(update: Update, context: ContextTypes.DEFAULT
         set_welcome_photo_value(update.message.photo[-1].file_id)
         await safe_send(update, "✅ Фото приветствия сохранено.", reply_markup=admin_welcome_keyboard())
         return ADMIN_WELCOME_MENU_WAITING
-    if update.message and update.message.text and update.message.text.strip() in ADMIN_ESCAPE_LABELS:
-        return await admin_escape_conversation(update, context)
+    if update.message and update.message.text:
+        raw = update.message.text.strip()
+        nav = normalized_reply_keyboard_text(raw)
+        routed = await try_route_broadcast_reply_buttons(update, context, nav)
+        if routed is not None:
+            return routed
+        if nav in ADMIN_ESCAPE_LABELS:
+            return await admin_escape_conversation(update, context)
     await safe_send(update, "❌ Нужно отправить фото (или «↩️ Админка» / /cancel для выхода).")
     return ADMIN_WELCOME_PHOTO_WAITING
 
@@ -7072,7 +7193,11 @@ async def admin_welcome_save_buttons(update: Update, context: ContextTypes.DEFAU
         await safe_send(update, "Нужен текст со списком кнопок.")
         return ADMIN_WELCOME_BUTTONS_WAITING
     body = update.message.text.strip()
-    if body in ADMIN_ESCAPE_LABELS:
+    nav = normalized_reply_keyboard_text(body)
+    routed = await try_route_broadcast_reply_buttons(update, context, nav)
+    if routed is not None:
+        return routed
+    if nav in ADMIN_ESCAPE_LABELS:
         return await admin_escape_conversation(update, context)
     if body.lower() == "пусто":
         set_welcome_buttons_raw([])
@@ -7300,6 +7425,9 @@ ADMIN_ESCAPE_LABELS = frozenset(
     }
 )
 
+# Кнопки запуска сценариев рассылок не перехватываем fallback'ом — иначе открывается только подменю без шага ввода.
+ADMIN_ESCAPE_NAV_FILTER_LABELS = frozenset(ADMIN_ESCAPE_LABELS - BROADCAST_AUTOPOST_NAV_LABELS)
+
 
 class _AdminEscapeNavFilter(filters.MessageFilter):
     def filter(self, message):
@@ -7308,7 +7436,7 @@ class _AdminEscapeNavFilter(filters.MessageFilter):
         user = getattr(message, "from_user", None)
         if user is None or not is_admin(user.id):
             return False
-        return message.text.strip() in ADMIN_ESCAPE_LABELS
+        return normalized_reply_keyboard_text(message.text) in ADMIN_ESCAPE_NAV_FILTER_LABELS
 
 
 async def admin_escape_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7316,12 +7444,15 @@ async def admin_escape_conversation(update: Update, context: ContextTypes.DEFAUL
         return ConversationHandler.END
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-    text = update.message.text.strip()
+    text = normalized_reply_keyboard_text(update.message.text)
     if text not in ADMIN_ESCAPE_LABELS:
         return ConversationHandler.END
     if text == "📋 Активные авто-рассылки":
         context.user_data.clear()
         return await admin_autopost_list_screen(update, context)
+    routed = await try_route_broadcast_reply_buttons(update, context, text)
+    if routed is not None:
+        return routed
     context.user_data.clear()
     if text == "⬅️ Назад":
         await safe_send(update, "⬅️ Возвращаю в главное меню.", reply_markup=main_keyboard(update.effective_user.id))
@@ -7335,9 +7466,6 @@ async def admin_escape_conversation(update: Update, context: ContextTypes.DEFAUL
         )
         return ConversationHandler.END
     if text == "📣 Рассылки":
-        await safe_send(update, "📣 Раздел: рассылки", reply_markup=admin_broadcast_keyboard())
-        return ConversationHandler.END
-    if text in ("📢 Рассылка", "🤖 Авто-рассылки"):
         await safe_send(update, "📣 Раздел: рассылки", reply_markup=admin_broadcast_keyboard())
         return ConversationHandler.END
     if text == "🛍 Редактор каталога":
@@ -7476,7 +7604,10 @@ def main():
     )
 
     broadcast_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^📢 Рассылка$"), admin_broadcast_start)],
+        entry_points=[
+            CommandHandler("broadcast", admin_broadcast_start),
+            MessageHandler(BroadcastKeyboardEntryFilter(), admin_broadcast_start),
+        ],
         states={
             ADMIN_BROADCAST_WAITING: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_content),
@@ -7691,7 +7822,10 @@ def main():
     )
 
     autopost_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^🤖 Авто-рассылки$"), admin_autopost_start)],
+        entry_points=[
+            CommandHandler("autopost", admin_autopost_start),
+            MessageHandler(AutopostKeyboardEntryFilter(), admin_autopost_start),
+        ],
         states={
             ADMIN_AUTOPOST_TEXT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_autopost_text)],
             ADMIN_AUTOPOST_PHOTO_WAITING: [
@@ -7779,12 +7913,13 @@ def main():
     )
 
     app.add_handler(checkout_conv)
+    app.add_handler(broadcast_conv)
+    app.add_handler(autopost_conv)
     app.add_handler(CallbackQueryHandler(pickup_select_stale_fallback, pattern=r"^pickup_select:\d+$"))
     app.add_handler(info_blocks_conv)
     app.add_handler(referral_hub_photo_conv)
     app.add_handler(create_promo_conv)
     app.add_handler(revoke_promo_conv)
-    app.add_handler(broadcast_conv)
     app.add_handler(baraholki_conv)
     app.add_handler(giveaways_conv)
     app.add_handler(manager_conv)
@@ -7805,7 +7940,6 @@ def main():
     app.add_handler(create_giveaway_conv)
     app.add_handler(finish_giveaway_conv)
     app.add_handler(giveaway_autobroadcast_conv)
-    app.add_handler(autopost_conv)
     app.add_handler(admins_add_conv)
     app.add_handler(admins_remove_conv)
     app.add_handler(blacklist_conv)
