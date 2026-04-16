@@ -2928,8 +2928,11 @@ async def open_category_view(target_message, category_key: str):
 
 
 async def safe_send(update: Update, text: str, **kwargs):
-    if update.message:
-        await update.message.reply_text(text, **kwargs)
+    msg = update.message or update.effective_message
+    if not msg and update.callback_query and update.callback_query.message:
+        msg = update.callback_query.message
+    if msg:
+        await msg.reply_text(text, **kwargs)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5254,6 +5257,7 @@ async def giveaway_results_skip_callback(update: Update, context: ContextTypes.D
 
 async def admin_autopost_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
+        await safe_send(update, "⛔ У тебя нет доступа.")
         return ConversationHandler.END
     if not update.message:
         return ConversationHandler.END
@@ -5682,6 +5686,7 @@ async def admin_ref_giveaway_pick(update: Update, context: ContextTypes.DEFAULT_
 
 async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
+        await safe_send(update, "⛔ У тебя нет доступа.")
         return ConversationHandler.END
     if not update.message:
         return ConversationHandler.END
@@ -7555,7 +7560,8 @@ def main():
     app.add_handler(CommandHandler("ratecomment", rate_comment))
     app.add_handler(CommandHandler("cnote", cmd_cnote))
     app.add_handler(CommandHandler("cnotes", cmd_cnotes))
-    app.add_handler(CommandHandler("cancel", cancel))
+    # НЕ регистрируй /cancel здесь: иначе он срабатывает раньше ConversationHandler, чистит user_data,
+    # но состояние диалога в PTB остаётся — потом /broadcast и reply-кнопки «молчат».
 
     # ВАЖНО: conversation handlers должны регистрироваться раньше обычных MessageHandler.
     # Иначе кнопки внутри админских сценариев (например "📱 Наш VK" в инфо-блоках)
@@ -7618,6 +7624,7 @@ def main():
             ],
         },
         fallbacks=[*ADMIN_CONV_FALLBACKS],
+        allow_reentry=True,
     )
 
     baraholki_conv = ConversationHandler(
@@ -7837,6 +7844,7 @@ def main():
             ADMIN_AUTOPOST_CLOCK_TIMES: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_autopost_clock_times)],
         },
         fallbacks=[*ADMIN_CONV_FALLBACKS],
+        allow_reentry=True,
     )
 
     admins_add_conv = ConversationHandler(
@@ -7947,6 +7955,7 @@ def main():
     app.add_handler(welcome_screen_conv)
 
     # Срабатывают, когда пользователь не в активном ConversationHandler (внутри сценария — fallbacks).
+    app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("stop", cancel))
     app.add_handler(CommandHandler("admin_stop", cancel))
 
