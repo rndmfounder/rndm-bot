@@ -225,6 +225,7 @@ ORDER_PICKUP_POINT_WAITING = next(_state)
 ORDER_PICKUP_PHONE_WAITING = next(_state)
 ORDER_PICKUP_TIME_WAITING = next(_state)
 ORDER_PICKUP_USERNAME_WAITING = next(_state)
+ORDER_COMMENT_WAITING = next(_state)
 
 logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
@@ -814,6 +815,7 @@ def init_database() -> None:
     ensure_column("orders", "promo_code", "TEXT")
     ensure_column("orders", "discount_percent", "INTEGER NOT NULL DEFAULT 0")
     ensure_column("orders", "discount_amount", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column("orders", "comment", "TEXT")
     ensure_column("broadcast_logs", "blocked", "INTEGER NOT NULL DEFAULT 0")
     ensure_column("broadcast_logs", "details", "TEXT")
     ensure_postgres_cart_items_primary_key()
@@ -2816,7 +2818,8 @@ def fetch_order_row_for_manager_card(order_id: int) -> tuple | None:
         SELECT order_id, user_id, username, first_name, order_type, pickup_point, phone,
                contact_username, address, delivery_time, items_text, total_sum, created_at,
                COALESCE(status, 'new'), status_updated_by,
-               order_subtotal, promo_code, discount_percent, discount_amount
+               order_subtotal, promo_code, discount_percent, discount_amount,
+               COALESCE(comment, '')
         FROM orders WHERE order_id = ?
         """,
         (order_id,),
@@ -2845,6 +2848,7 @@ def build_manager_order_message_html(order_row: tuple, claimed_by_user) -> tuple
         promo_code,
         discount_percent,
         discount_amount,
+        order_comment,
     ) = order_row
 
     subtotal = order_subtotal if order_subtotal is not None else total_sum
@@ -2919,6 +2923,9 @@ def build_manager_order_message_html(order_row: tuple, claimed_by_user) -> tuple
     elif int(discount_percent or 0) > 0:
         blocks.append(f"Скидка по рангу: -{int(discount_percent)}%")
         blocks.append(f"Размер скидки: {int(discount_amount or 0)} ₽")
+
+    if (order_comment or "").strip():
+        blocks.append(f"💬 <b>Комментарий к заказу:</b>\n{html_esc((order_comment or '').strip())}")
 
     try:
         order_time_str = format_dt_yekaterinburg(created_at, "%d.%m.%Y %H:%M:%S")
@@ -3199,6 +3206,7 @@ def clear_order_context(context: ContextTypes.DEFAULT_TYPE) -> None:
         "checkout_username",
         "checkout_address",
         "checkout_time",
+        "checkout_comment",
         "checkout_promocode",
         "checkout_promo_percent",
         "checkout_referral_percent",
@@ -3363,6 +3371,12 @@ def promocode_skip_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def order_comment_skip_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⏭ Без комментария", callback_data="skip_order_comment")]]
+    )
+
+
 async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items: list[dict]) -> int:
     order_type = context.user_data.get("checkout_mode")
     pickup_point = context.user_data.get("checkout_pickup_point")
@@ -3370,6 +3384,9 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
     contact_username = context.user_data.get("checkout_username")
     address = context.user_data.get("checkout_address")
     delivery_time = context.user_data.get("checkout_time")
+    order_comment = (context.user_data.get("checkout_comment") or "").strip()
+    if len(order_comment) > 2000:
+        order_comment = order_comment[:2000]
     promocode_raw = context.user_data.get("checkout_promocode")
     promo_pct = int(context.user_data.get("checkout_promo_percent") or 0)
     ref_pct = get_inviter_personal_discount_percent(user.id)
@@ -3390,9 +3407,9 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
             INSERT INTO orders (
                 user_id, username, first_name, order_type, pickup_point, phone,
                 contact_username, address, delivery_time, items_text, total_sum, created_at,
-                order_subtotal, promo_code, discount_percent, discount_amount
+                order_subtotal, promo_code, discount_percent, discount_amount, comment
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING order_id
             """,
             (
@@ -3412,6 +3429,7 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
                 promo_db,
                 int(discount_percent or 0),
                 int(discount_amount or 0),
+                order_comment or None,
             ),
         )
         order_id = cursor.fetchone()[0]
@@ -3421,9 +3439,9 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
             INSERT INTO orders (
                 user_id, username, first_name, order_type, pickup_point, phone,
                 contact_username, address, delivery_time, items_text, total_sum, created_at,
-                order_subtotal, promo_code, discount_percent, discount_amount
+                order_subtotal, promo_code, discount_percent, discount_amount, comment
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user.id,
@@ -3442,6 +3460,7 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
                 promo_db,
                 int(discount_percent or 0),
                 int(discount_amount or 0),
+                order_comment or None,
             ),
         )
         order_id = cursor.lastrowid
@@ -3919,8 +3938,21 @@ async def checkout_delivery_time(update: Update, context: ContextTypes.DEFAULT_T
         return ORDER_DELIVERY_TIME_WAITING
 
     context.user_data["checkout_time"] = delivery_time
+    await safe_send(
+        update,
+        "5) Комментарий к заказу (пожелания по доставке, подъезд, домофон и т.п.)\n\n"
+        "Напиши текст или нажми кнопку ниже.",
+        reply_markup=order_comment_skip_keyboard(),
+    )
+    return ORDER_COMMENT_WAITING
 
+
+async def checkout_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if not user:
+        clear_order_context(context)
+        return ConversationHandler.END
+
     items = collect_checkout_items(user.id, context.user_data.get("checkout_buy_now_item_id"))
     if not items:
         await safe_send(update, "❌ Не удалось собрать товары для заказа.")
@@ -3950,6 +3982,35 @@ async def checkout_delivery_time(update: Update, context: ContextTypes.DEFAULT_T
     )
     clear_order_context(context)
     return ConversationHandler.END
+
+
+async def checkout_order_comment_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or msg.text is None:
+        await safe_send(
+            update,
+            "Комментарий — только текстом (до 2000 символов) или нажми «⏭ Без комментария».",
+        )
+        return ORDER_COMMENT_WAITING
+    raw = msg.text.strip()
+    if not raw:
+        await safe_send(update, "Напиши текст комментария или нажми «⏭ Без комментария».")
+        return ORDER_COMMENT_WAITING
+    if len(raw) > 2000:
+        raw = raw[:2000]
+    context.user_data["checkout_comment"] = raw
+    return await checkout_finalize_order(update, context)
+
+
+async def checkout_skip_order_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        try:
+            await query.answer()
+        except Exception:
+            logger.exception("checkout_skip_order_comment: answer")
+    context.user_data["checkout_comment"] = ""
+    return await checkout_finalize_order(update, context)
 
 
 async def checkout_choose_pickup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4022,37 +4083,13 @@ async def checkout_pickup_username(update: Update, context: ContextTypes.DEFAULT
         return ORDER_PICKUP_USERNAME_WAITING
 
     context.user_data["checkout_username"] = username
-
-    user = update.effective_user
-    items = collect_checkout_items(user.id, context.user_data.get("checkout_buy_now_item_id"))
-    if not items:
-        await safe_send(update, "❌ Не удалось собрать товары для заказа.")
-        clear_order_context(context)
-        return ConversationHandler.END
-
-    try:
-        order_id = await send_order_to_managers(context, user, items)
-    except Exception as e:
-        await safe_send(update, f"⚠️ Не удалось отправить заказ в группу.\nПроверь ORDER_GROUP_ID.\n\nОшибка: {e}")
-        clear_order_context(context)
-        return ConversationHandler.END
-
-    promo_pct = int(context.user_data.get("checkout_promo_percent") or 0)
-    ref_pct = get_inviter_personal_discount_percent(user.id)
-    promocode = context.user_data.get("checkout_promocode")
-    if promocode and promo_pct > ref_pct:
-        mark_promocode_used(promocode)
-
-    if not context.user_data.get("checkout_buy_now_item_id"):
-        clear_cart(user.id)
-
     await safe_send(
         update,
-        f"✅ Заказ #{order_id} отправлен менеджерам.\nС тобой скоро свяжутся.",
-        reply_markup=main_keyboard(user.id),
+        "4) Комментарий к заказу (цвет, комплектация, пожелания к самовывозу и т.п.)\n\n"
+        "Напиши текст или нажми кнопку ниже.",
+        reply_markup=order_comment_skip_keyboard(),
     )
-    clear_order_context(context)
-    return ConversationHandler.END
+    return ORDER_COMMENT_WAITING
 
 
 async def show_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7672,6 +7709,10 @@ def main():
             ORDER_PICKUP_PHONE_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_pickup_phone)],
             ORDER_PICKUP_TIME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_pickup_time)],
             ORDER_PICKUP_USERNAME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_pickup_username)],
+            ORDER_COMMENT_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_order_comment_step),
+                CallbackQueryHandler(checkout_skip_order_comment, pattern=r"^skip_order_comment$"),
+            ],
         },
         fallbacks=[*ADMIN_CONV_FALLBACKS, MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main)],
         per_chat=False,
