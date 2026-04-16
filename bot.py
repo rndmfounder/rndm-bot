@@ -2479,7 +2479,7 @@ def admin_catalog_keyboard() -> ReplyKeyboardMarkup:
 def admin_broadcast_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            ["📢 Рассылка", "🤖 Авто-рассылки"],
+            ["📣 Рассылка", "🤖 Авто-рассылки"],
             ["📋 Активные авто-рассылки"],
             ["🛑 Прервать сценарий"],
             ["↩️ Админка"],
@@ -2506,7 +2506,7 @@ def normalized_reply_keyboard_text(text: str | None) -> str:
 def canonical_broadcast_nav_label(text: str | None) -> str | None:
     """Канонический сценарий по тексту reply-кнопки: 'broadcast' | 'autopost' | None."""
     nav = normalized_reply_keyboard_text(text)
-    if nav in ("📢 Рассылка", "📢 Рассылки"):
+    if nav in ("📣 Рассылка", "📣 Рассылки", "📢 Рассылка", "📢 Рассылки"):
         return "broadcast"
     if nav in ("🤖 Авто-рассылки", "🤖 Авторассылки"):
         return "autopost"
@@ -2518,7 +2518,9 @@ def is_broadcast_autopost_nav(text: str | None) -> bool:
 
 
 # Все варианты подписей, которые не должны перехватываться admin_escape (их обрабатывают broadcast/autopost conv).
-_BROADCAST_AUTOPOST_NAV_SYNONYMS = frozenset({"📢 Рассылка", "📢 Рассылки", "🤖 Авто-рассылки", "🤖 Авторассылки"})
+_BROADCAST_AUTOPOST_NAV_SYNONYMS = frozenset(
+    {"📣 Рассылка", "📣 Рассылки", "📢 Рассылка", "📢 Рассылки", "🤖 Авто-рассылки", "🤖 Авторассылки"}
+)
 
 
 class BroadcastKeyboardEntryFilter(filters.MessageFilter):
@@ -2556,7 +2558,7 @@ async def reply_broadcast_nav_stuck_hint(update: Update, context: ContextTypes.D
             "Напиши команду:\n"
             "• /broadcast — ручная рассылка (текст/фото → кнопки → отправка)\n"
             "• /autopost — авто-рассылка (текст → фото → кнопки → интервал или «время»)\n\n"
-            "Или нажми «🛑 Прервать сценарий», затем снова кнопку 📢/🤖.",
+            "Или нажми «🛑 Прервать сценарий», затем снова кнопку 📣/🤖.",
             reply_markup=admin_broadcast_keyboard(),
         )
     return ConversationHandler.END
@@ -4448,7 +4450,7 @@ async def admin_open_broadcasts(update: Update, context: ContextTypes.DEFAULT_TY
         await safe_send(
             update,
             "📣 Раздел: рассылки\n\n"
-            "Кнопки 📢/🤖 или команды: /broadcast и /autopost.\n"
+            "Кнопки 📣/🤖 или команды: /broadcast и /autopost.\n"
             "Если сценарий «завис» в другом разделе — «🛑 Прервать сценарий» или /admin_stop.",
             reply_markup=admin_broadcast_keyboard(),
         )
@@ -5718,7 +5720,7 @@ async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data.clear()
     await safe_send(
         update,
-        "📢 *Ручная рассылка*\n"
+        "📣 *Ручная рассылка*\n"
         "Шаг 1/2: отправь *текст* или *фото с подписью*.\n\n"
         "Шаг 2: кнопки под постом (несколько строк «Текст | URL») или `skip`.\n"
         "Отмена: /cancel, /stop, /admin_stop или «🛑 Прервать сценарий».",
@@ -7441,6 +7443,8 @@ ADMIN_ESCAPE_LABELS = frozenset(
         "↩️ Админка",
         "⤴️ Админка",
         "⚙️ Админка",
+        "📣 Рассылка",
+        "📣 Рассылки",
         "📢 Рассылка",
         "📢 Рассылки",
         "🤖 Авто-рассылки",
@@ -7469,6 +7473,18 @@ class _AdminEscapeNavFilter(filters.MessageFilter):
         if user is None or not is_admin(user.id):
             return False
         return normalized_reply_keyboard_text(message.text) in ADMIN_ESCAPE_NAV_FILTER_LABELS
+
+
+class _AdminStopInterruptFilter(filters.MessageFilter):
+    """Срабатывает, когда активного ConversationHandler нет — иначе fallback внутри CH не вызывается."""
+
+    def filter(self, message):
+        if message is None or getattr(message, "text", None) is None:
+            return False
+        user = getattr(message, "from_user", None)
+        if user is None or not is_admin(user.id):
+            return False
+        return normalized_reply_keyboard_text(message.text) == "🛑 Прервать сценарий"
 
 
 async def admin_escape_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7948,7 +7964,7 @@ def main():
     )
 
     # Рассылки раньше checkout: иначе активный сценарий оформления перехватывает текстовые reply-кнопки
-    # «📢 Рассылка» / «🤖 Авто-рассылки» как «телефон»/промокод — ответа нет, сценарий «молчит».
+    # «📣 Рассылка» / «🤖 Авто-рассылки» раньше checkout: иначе оформление заказа ест текст кнопок.
     app.add_handler(broadcast_conv)
     app.add_handler(autopost_conv)
     app.add_handler(checkout_conv)
@@ -8025,6 +8041,8 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^📊 Статистика$"), admin_stats))
     app.add_handler(MessageHandler(filters.Regex(r"^📈 Аналитика PRO$"), admin_advanced_stats))
     app.add_handler(MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main))
+    # Вне активного CH fallback не вызывается — «🛑 Прервать сценарий» иначе без ответа.
+    app.add_handler(MessageHandler(_AdminStopInterruptFilter(), admin_escape_conversation))
 
     if app.job_queue:
         app.job_queue.run_repeating(process_auto_posts, interval=60, first=20)
@@ -8045,4 +8063,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()
