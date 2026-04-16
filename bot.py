@@ -2504,9 +2504,15 @@ def normalized_reply_keyboard_text(text: str | None) -> str:
 
 
 def canonical_broadcast_nav_label(text: str | None) -> str | None:
-    """Канонический сценарий по тексту reply-кнопки: 'broadcast' | 'autopost' | None."""
+    """Канонический сценарий по тексту reply-кнопки: 'broadcast_menu' | 'broadcast' | 'autopost' | None.
+
+    «📣 Рассылки» (мн. ч.) — вход в раздел из корня админки; «📣 Рассылка» — только ручная рассылка.
+    Иначе мн. ч. перехватывается broadcast_conv и пропадают кнопки «🤖 Авто-рассылки».
+    """
     nav = normalized_reply_keyboard_text(text)
-    if nav in ("📣 Рассылка", "📣 Рассылки", "📢 Рассылка", "📢 Рассылки"):
+    if nav in ("📣 Рассылки", "📢 Рассылки"):
+        return "broadcast_menu"
+    if nav in ("📣 Рассылка", "📢 Рассылка"):
         return "broadcast"
     if nav in ("🤖 Авто-рассылки", "🤖 Авторассылки"):
         return "autopost"
@@ -2537,11 +2543,26 @@ class AutopostKeyboardEntryFilter(filters.MessageFilter):
         return canonical_broadcast_nav_label(message.text) == "autopost"
 
 
+class BroadcastSectionKeyboardFilter(filters.MessageFilter):
+    """Корневая кнопка «📣 Рассылки» (с нормализацией эмодзи/NBSP). Обрабатывается до CH рассылки."""
+
+    def filter(self, message):
+        if message is None or not getattr(message, "text", None):
+            return False
+        uid = message.from_user.id if message.from_user else 0
+        if not is_admin(uid):
+            return False
+        nav = normalized_reply_keyboard_text(message.text)
+        return nav in ("📣 Рассылки", "📢 Рассылки")
+
+
 async def try_route_broadcast_reply_buttons(
     update: Update, context: ContextTypes.DEFAULT_TYPE, message_text: str | None
 ):
     """Если нажата reply-кнопка рассылок — сразу открываем сценарий (в т.ч. из welcome/promo)."""
     kind = canonical_broadcast_nav_label(message_text)
+    if kind == "broadcast_menu":
+        return await admin_open_broadcasts(update, context)
     if kind == "broadcast":
         return await admin_broadcast_start(update, context)
     if kind == "autopost":
@@ -4447,6 +4468,7 @@ async def admin_open_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def admin_open_broadcasts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(update.effective_user.id):
+        context.user_data.clear()
         await safe_send(
             update,
             "📣 Раздел: рассылки\n\n"
@@ -4454,6 +4476,8 @@ async def admin_open_broadcasts(update: Update, context: ContextTypes.DEFAULT_TY
             "Если сценарий «завис» в другом разделе — «🛑 Прервать сценарий» или /admin_stop.",
             reply_markup=admin_broadcast_keyboard(),
         )
+        return ConversationHandler.END
+    return None
 
 
 async def admin_open_giveaways(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7513,9 +7537,6 @@ async def admin_escape_conversation(update: Update, context: ContextTypes.DEFAUL
             reply_markup=admin_keyboard(),
         )
         return ConversationHandler.END
-    if text == "📣 Рассылки":
-        await safe_send(update, "📣 Раздел: рассылки", reply_markup=admin_broadcast_keyboard())
-        return ConversationHandler.END
     if text == "🛍 Редактор каталога":
         await admin_open_catalog(update, context)
         return ConversationHandler.END
@@ -7605,6 +7626,9 @@ def main():
     app.add_handler(CommandHandler("cnotes", cmd_cnotes))
     # НЕ регистрируй /cancel здесь: иначе он срабатывает раньше ConversationHandler, чистит user_data,
     # но состояние диалога в PTB остаётся — потом /broadcast и reply-кнопки «молчат».
+
+    # «📣 Рассылки» из корня админки — до broadcast_conv (нормализация текста, сброс зависшего сценария).
+    app.add_handler(MessageHandler(BroadcastSectionKeyboardFilter(), admin_open_broadcasts), group=-1)
 
     # ВАЖНО: conversation handlers должны регистрироваться раньше обычных MessageHandler.
     # Иначе кнопки внутри админских сценариев (например "📱 Наш VK" в инфо-блоках)
@@ -8018,7 +8042,6 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^⚙️ Админка$"), admin_panel))
     app.add_handler(MessageHandler(filters.Regex(r"^↩️ Админка$"), admin_panel))
     app.add_handler(MessageHandler(filters.Regex(r"^🛍 Редактор каталога$"), admin_open_catalog))
-    app.add_handler(MessageHandler(filters.Regex(r"^📣 Рассылки$"), admin_open_broadcasts))
     app.add_handler(MessageHandler(filters.Regex(r"^📋 Активные авто-рассылки$"), admin_autopost_list_screen))
     app.add_handler(MessageHandler(filters.Regex(r"^🎁 Розыгрыши \(админ\)$"), admin_open_giveaways))
     app.add_handler(MessageHandler(filters.Regex(r"^📣 Авторассылка анонса$"), admin_giveaway_autobroadcast_panel))
