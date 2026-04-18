@@ -21,6 +21,8 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
+from vpn.db import ensure_vpn_tables
+
 from telegram.error import Conflict
 from telegram.ext import (
     Application,
@@ -841,6 +843,8 @@ def init_database() -> None:
 
 
 init_database()
+
+ensure_vpn_tables(cursor, conn, USE_POSTGRES)
 
 ensure_column("giveaways", "buttons_json", "TEXT NOT NULL DEFAULT '[]'")
 ensure_column("giveaways", "results_broadcast_at", "TEXT")
@@ -2444,6 +2448,7 @@ def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         ["🛒 Наши барахолки", "🚀 Наши проекты"],
         ["🎁 Розыгрыши", "📱 Наш VK"],
         ["🛒 Корзина", "🎁 Получить халяву"],
+        ["🔐 VPN"],
     ]
     if is_admin(user_id):
         keyboard.append(["⚙️ Админка"])
@@ -7734,6 +7739,30 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main():
     app = Application.builder().token(TOKEN).concurrent_updates(False).build()
+    from vpn.handlers import (
+        configure as vpn_configure,
+        register_vpn_command_handlers,
+        register_vpn_early_handlers,
+        register_vpn_message_handlers,
+    )
+
+    vpn_configure(
+        cursor=cursor,
+        conn=conn,
+        safe_send=safe_send,
+        save_user=save_user,
+        is_user_blacklisted=is_user_blacklisted,
+        log_action=log_action,
+        is_admin=is_admin,
+        get_setting=get_setting,
+        default_manager_url=DEFAULT_MANAGER_URL,
+        is_valid_inline_button_url=is_valid_inline_button_url,
+        now_iso=now_iso,
+    )
+    register_vpn_command_handlers(app)
+    register_vpn_message_handlers(app)
+    register_vpn_early_handlers(app)
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("check", check_code))
     app.add_handler(CommandHandler("use", use_code))
