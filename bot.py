@@ -21,7 +21,6 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
-from vpn.db import ensure_vpn_tables
 
 from telegram.error import Conflict
 from telegram.ext import (
@@ -843,8 +842,6 @@ def init_database() -> None:
 
 
 init_database()
-
-ensure_vpn_tables(cursor, conn, USE_POSTGRES)
 
 ensure_column("giveaways", "buttons_json", "TEXT NOT NULL DEFAULT '[]'")
 ensure_column("giveaways", "results_broadcast_at", "TEXT")
@@ -2448,7 +2445,6 @@ def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         ["🛒 Наши барахолки", "🚀 Наши проекты"],
         ["🎁 Розыгрыши", "📱 Наш VK"],
         ["🛒 Корзина", "🎁 Получить халяву"],
-        ["🔐 VPN"],
     ]
     if is_admin(user_id):
         keyboard.append(["⚙️ Админка"])
@@ -2800,6 +2796,37 @@ def html_esc(s) -> str:
     return html.escape(str(s) if s is not None else "", quote=False)
 
 
+def _humanize_order_age_ru(created_dt: datetime) -> str | None:
+    """Короткая подпись «сколько прошло» с момента created_dt (UTC)."""
+    now = datetime.now(timezone.utc)
+    if created_dt > now + timedelta(seconds=30):
+        return None
+    sec = max(0, int((now - created_dt).total_seconds()))
+    if sec < 45:
+        return "только что"
+    m = sec // 60
+    if m < 60:
+        return f"{m} мин назад"
+    h = m // 60
+    if h < 36:
+        return f"{h} ч назад"
+    d = h // 24
+    return f"{d} дн. назад"
+
+
+def _nonempty_line_count(text: str | None) -> int:
+    return len([ln for ln in (text or "").splitlines() if ln.strip()])
+
+
+def _mono_block_html(s: str) -> str:
+    """Однострочный фрагмент в <code>, многострочный — в <pre> (HTML Telegram)."""
+    raw = s or ""
+    esc = html_esc(raw)
+    if "\n" in raw:
+        return f"<pre>{esc}</pre>"
+    return f"<code>{esc}</code>"
+
+
 def format_claiming_manager_html(user) -> str:
     if not user or not getattr(user, "id", None):
         return ""
@@ -2905,6 +2932,22 @@ def build_manager_order_message_html(order_row: tuple, claimed_by_user) -> tuple
     else:
         type_line = "📍 <b><u>ТИП: САМОВЫВОЗ</u></b>"
 
+    u_key = (username or "").strip().lstrip("@").lower()
+    c_key = (contact_username or "").strip().lstrip("@").lower()
+    show_contact_username = bool(c_key) and c_key != u_key
+
+    cursor.execute("SELECT COUNT(*) FROM orders WHERE user_id = ?", (user_id,))
+    total_orders_user = int((cursor.fetchone() or (0,))[0] or 0)
+    cursor.execute(
+        "SELECT COUNT(*) FROM orders WHERE user_id = ? AND COALESCE(status, '') = ?",
+        (user_id, "done"),
+    )
+    done_orders_user = int((cursor.fetchone() or (0,))[0] or 0)
+
+    created_parsed = _parse_iso_datetime(created_at)
+    age_s = _humanize_order_age_ru(created_parsed) if created_parsed else None
+    item_lines_n = _nonempty_line_count(items_text)
+
     n_notes = count_client_notes(user_id)
     note_snip = latest_client_note_snippet(user_id)
     notes_line = ""
@@ -2913,64 +2956,93 @@ def build_manager_order_message_html(order_row: tuple, claimed_by_user) -> tuple
         if note_snip:
             notes_line += f"\n<i>Последняя:</i> {html_esc(note_snip)}"
 
+    sep = "<b>────────</b>"
+
     blocks: list[str] = [
         header,
         "",
         type_line,
-        f"Клиент: {html_esc(first_name or '-')}",
+        "",
+        "<b>👤 Клиент</b>",
+        f"Имя: {html_esc(first_name or '-')}",
         f"Username: {html_esc(username_line)}",
-        f"User ID: {user_id}",
-        f"Телефон: {html_esc(phone)}",
-        f"Контактный username: {html_esc(contact_username)}",
-        f"Рейтинг клиента: {html_esc(rating_text)} <i>(до 2 оценок за заказ с одного аккаунта)</i>",
-        ref_rank_line,
     ]
+    if show_contact_username:
+        blocks.append(f"Контакт в заказе: {html_esc(contact_username)}")
+    blocks.extend(
+        [
+            f"User ID: <code>{user_id}</code>",
+            f"Телефон: {html_esc(phone or '—')}",
+            f"Рейтинг: {html_esc(rating_text)} <i>(до 2 оценок за заказ с одного аккаунта)</i>",
+            ref_rank_line,
+            f'🔗 <a href="tg://user?id={user_id}">Написать в Telegram</a>',
+        ]
+    )
     if notes_line:
+        blocks.append("")
         blocks.append(notes_line)
 
+    if total_orders_user > 0:
+        stat_bits = (
+            f"📊 Заказов: <b>{total_orders_user}</b> · выдано: <b>{done_orders_user}</b>"
+            + (" · 🌱 первый в боте" if total_orders_user == 1 else "")
+        )
+        blocks.append("")
+        blocks.append(stat_bits)
+
+    blocks.extend(["", sep, ""])
+
+    blocks.append("<b>🚚 Куда и когда</b>" if order_type == "delivery" else "<b>📍 Куда и когда</b>")
     if order_type == "delivery":
         addr_plain = (address or "").strip()
-        blocks.append(f"📍 <b>Адрес:</b> <code>{html_esc(addr_plain)}</code>")
+        blocks.append("Адрес доставки:")
+        blocks.append(_mono_block_html(addr_plain if addr_plain else "—"))
     else:
-        blocks.append(f"Точка самовывоза: {html_esc(pickup_point)}")
+        pp = (pickup_point or "").strip()
+        blocks.append("Точка самовывоза:")
+        blocks.append(_mono_block_html(pp if pp else "—"))
+    dt_part = (delivery_time or "").strip()
+    blocks.append(f"Время: <b>{html_esc(dt_part) if dt_part else '—'}</b>")
 
+    promo_lines: list[str] = []
     if promo_code:
-        blocks.append(f"Промокод: {html_esc(promo_code)}")
-        blocks.append(f"Скидка: -{int(discount_percent or 0)}%")
-        blocks.append(f"Размер скидки: {int(discount_amount or 0)} ₽")
+        promo_lines.append(f"Промокод: {html_esc(promo_code)}")
+        promo_lines.append(f"Скидка: -{int(discount_percent or 0)}%")
+        promo_lines.append(f"Размер скидки: {int(discount_amount or 0)} ₽")
     elif int(discount_percent or 0) > 0:
-        blocks.append(f"Скидка по рангу: -{int(discount_percent)}%")
-        blocks.append(f"Размер скидки: {int(discount_amount or 0)} ₽")
-
+        promo_lines.append(f"Скидка по рангу: -{int(discount_percent)}%")
+        promo_lines.append(f"Размер скидки: {int(discount_amount or 0)} ₽")
     if order_type == "delivery" and DELIVERY_FEE_RUB > 0:
-        blocks.append(f"🚚 <b>Доставка:</b> +{DELIVERY_FEE_RUB} ₽")
+        promo_lines.append(f"🚚 Доставка: +{DELIVERY_FEE_RUB} ₽")
+    if promo_lines:
+        blocks.extend(["", sep, "", "<b>🏷 Скидки и сборы</b>", *promo_lines])
 
     if (order_comment or "").strip():
-        blocks.append(f"💬 <b>Комментарий к заказу:</b>\n{html_esc((order_comment or '').strip())}")
+        blocks.extend(["", sep, "", "<b>💬 Комментарий к заказу</b>", html_esc((order_comment or "").strip())])
 
     try:
         order_time_str = format_dt_yekaterinburg(created_at, "%d.%m.%Y %H:%M:%S")
     except Exception:
         order_time_str = str(created_at)
 
-    pay_block = (
-        "<b>▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬</b>\n"
-        "💰 <b>ИТОГО К ОПЛАТЕ</b>\n"
-        f"<code>  {html_esc(final_line)}  </code>\n"
-        "<b>▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬</b>"
-    )
+    pay_block = f"{sep}\n💰 <b>ИТОГО К ОПЛАТЕ</b>\n<code>{html_esc(final_line)}</code>\n{sep}"
+    items_body = html_esc(items_text) if (items_text or "").strip() else "—"
     blocks.extend(
         [
-            f"Время: {html_esc(delivery_time)}",
             "",
-            "Товары:",
-            html_esc(items_text),
+            sep,
             "",
+            "<b>🧾 Состав заказа</b>",
+            items_body,
+            "",
+            f"<i>Позиций в списке:</i> {item_lines_n}",
             f"<i>Сумма до скидки:</i> {html_esc(total_line)}",
             "",
             pay_block,
             "",
-            f"<i>Время заказа:</i> {html_esc(order_time_str)}",
+            "<b>🕐 Оформление</b>",
+            f"<i>Время заказа:</i> {html_esc(order_time_str)}"
+            + (f" · <i>{html_esc(age_s)}</i>" if age_s else ""),
         ]
     )
 
@@ -7739,29 +7811,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main():
     app = Application.builder().token(TOKEN).concurrent_updates(False).build()
-    from vpn.handlers import (
-        configure as vpn_configure,
-        register_vpn_command_handlers,
-        register_vpn_early_handlers,
-        register_vpn_message_handlers,
-    )
-
-    vpn_configure(
-        cursor=cursor,
-        conn=conn,
-        safe_send=safe_send,
-        save_user=save_user,
-        is_user_blacklisted=is_user_blacklisted,
-        log_action=log_action,
-        is_admin=is_admin,
-        get_setting=get_setting,
-        default_manager_url=DEFAULT_MANAGER_URL,
-        is_valid_inline_button_url=is_valid_inline_button_url,
-        now_iso=now_iso,
-    )
-    register_vpn_command_handlers(app)
-    register_vpn_message_handlers(app)
-    register_vpn_early_handlers(app)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("check", check_code))
