@@ -136,20 +136,33 @@ DEFAULT_ITEMS = [
 DEFAULT_PICKUP_POINTS = [
     "Академ",
     "Сортировка",
-    "Центр",
-    "Юго-Запад",
+    "Пионерка",
     "Железнодорожный",
     "ЖБИ",
-    "Верхняя Пышма",
+    "Верхняя Пышма — ул. Сапожникова",
+    "Верхняя Пышма — ул. Орджоникидзе",
 ]
 
-# Подточки самовывоза внутри района (кнопка на экране → короткое имя в заказе).
-PICKUP_SUBPOINTS: dict[str, list[tuple[str, str]]] = {
-    "Верхняя Пышма": [
-        ("Точка #1 — ул. Орджоникидзе", "ул. Орджоникидзе"),
-        ("Точка #2 — ул. Сапожникова", "ул. Сапожникова"),
-    ],
-}
+# Регионы самовывоза: (название региона, [(подпись кнопки, имя в заказе), ...]).
+PICKUP_REGIONS: list[tuple[str, list[tuple[str, str]]]] = [
+    (
+        "Екатеринбург",
+        [
+            ("Академ", "Академ"),
+            ("Сортировка", "Сортировка"),
+            ("Пионерка", "Пионерка"),
+            ("Железнодорожный", "Железнодорожный"),
+            ("ЖБИ", "ЖБИ"),
+        ],
+    ),
+    (
+        "Верхняя Пышма",
+        [
+            ("ул. Сапожникова", "ул. Сапожникова"),
+            ("ул. Орджоникидзе", "ул. Орджоникидзе"),
+        ],
+    ),
+]
 
 _state = count()
 
@@ -2745,31 +2758,30 @@ def order_type_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def pickup_points_keyboard() -> InlineKeyboardMarkup:
+def pickup_regions_keyboard() -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(name, callback_data=f"pickup_select:{int(pickup_id)}")]
-        for pickup_id, name, _ in get_pickup_points()
+        [InlineKeyboardButton(region_name, callback_data=f"pickup_region:{index}")]
+        for index, (region_name, _) in enumerate(PICKUP_REGIONS)
     ]
     return InlineKeyboardMarkup(rows)
 
 
-def pickup_subpoints_keyboard(district_name: str) -> InlineKeyboardMarkup | None:
-    subpoints = PICKUP_SUBPOINTS.get(district_name)
-    if not subpoints:
+def get_pickup_region(region_index: int) -> tuple[str, list[tuple[str, str]]] | None:
+    if region_index < 0 or region_index >= len(PICKUP_REGIONS):
         return None
+    return PICKUP_REGIONS[region_index]
+
+
+def pickup_region_points_keyboard(region_index: int) -> InlineKeyboardMarkup | None:
+    region = get_pickup_region(region_index)
+    if not region:
+        return None
+    _, points = region
     rows = [
-        [InlineKeyboardButton(label, callback_data=f"pickup_sub:{index}")]
-        for index, (label, _) in enumerate(subpoints)
+        [InlineKeyboardButton(label, callback_data=f"pickup_sub:{point_index}")]
+        for point_index, (label, _) in enumerate(points)
     ]
     return InlineKeyboardMarkup(rows)
-
-
-def pickup_subpoints_message(district_name: str) -> str:
-    lines = [f"📍 {district_name}", ""]
-    for label, _ in PICKUP_SUBPOINTS.get(district_name, []):
-        lines.append(label)
-    lines.extend(["", "Выбери точку:"])
-    return "\n".join(lines)
 
 
 ORDER_STATUS_META = {
@@ -3323,7 +3335,7 @@ def clear_order_context(context: ContextTypes.DEFAULT_TYPE) -> None:
         "checkout_mode",
         "checkout_buy_now_item_id",
         "checkout_pickup_point",
-        "checkout_pickup_district",
+        "checkout_pickup_region",
         "checkout_phone",
         "checkout_username",
         "checkout_address",
@@ -4152,19 +4164,18 @@ async def checkout_choose_pickup(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data["checkout_mode"] = "pickup"
     recalculate_checkout_totals(context, query.from_user.id)
 
-    points = get_pickup_points()
-    if not points:
+    if not PICKUP_REGIONS:
         await _checkout_reply_after_query(context, query, "❌ Нет доступных точек самовывоза.")
         clear_order_context(context)
         return ConversationHandler.END
 
     await _checkout_reply_after_query(
-        context, query, "Выбери точку самовывоза:", reply_markup=pickup_points_keyboard()
+        context, query, "Выбери город:", reply_markup=pickup_regions_keyboard()
     )
     return ORDER_PICKUP_POINT_WAITING
 
 
-async def checkout_pickup_point(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def checkout_pickup_region(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
@@ -4173,31 +4184,30 @@ async def checkout_pickup_point(update: Update, context: ContextTypes.DEFAULT_TY
         await _checkout_reply_after_query(context, query, "❌ Устаревшая кнопка. Начни оформление заново из корзины.")
         return ORDER_PICKUP_POINT_WAITING
     try:
-        pickup_id = int(raw.split(":", 1)[1].strip())
+        region_index = int(raw.split(":", 1)[1].strip())
     except (ValueError, IndexError):
-        await _checkout_reply_after_query(context, query, "❌ Некорректные данные точки. Выбери точку снова.")
+        await _checkout_reply_after_query(context, query, "❌ Некорректные данные. Выбери город снова.")
         return ORDER_PICKUP_POINT_WAITING
 
-    pickup_point = get_pickup_point(pickup_id)
-    if not pickup_point:
-        await _checkout_reply_after_query(context, query, "❌ Точка не найдена.")
+    region = get_pickup_region(region_index)
+    if not region:
+        await _checkout_reply_after_query(context, query, "❌ Город не найден.")
         return ORDER_PICKUP_POINT_WAITING
 
-    district_name = pickup_point[1]
-    subpoints_keyboard = pickup_subpoints_keyboard(district_name)
-    if subpoints_keyboard:
-        context.user_data["checkout_pickup_district"] = district_name
-        await _checkout_reply_after_query(
-            context,
-            query,
-            pickup_subpoints_message(district_name),
-            reply_markup=subpoints_keyboard,
-        )
-        return ORDER_PICKUP_SUBPOINT_WAITING
+    region_name, _ = region
+    points_keyboard = pickup_region_points_keyboard(region_index)
+    if not points_keyboard:
+        await _checkout_reply_after_query(context, query, "❌ Нет точек в этом городе.")
+        return ORDER_PICKUP_POINT_WAITING
 
-    context.user_data["checkout_pickup_point"] = district_name
-    await _checkout_reply_after_query(context, query, "1) Ваш номер телефона в формате +7XXXXXXXXXX")
-    return ORDER_PICKUP_PHONE_WAITING
+    context.user_data["checkout_pickup_region"] = region_index
+    await _checkout_reply_after_query(
+        context,
+        query,
+        f"📍 {region_name}\n\nВыбери точку:",
+        reply_markup=points_keyboard,
+    )
+    return ORDER_PICKUP_SUBPOINT_WAITING
 
 
 async def checkout_pickup_subpoint(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4214,14 +4224,19 @@ async def checkout_pickup_subpoint(update: Update, context: ContextTypes.DEFAULT
         await _checkout_reply_after_query(context, query, "❌ Некорректные данные точки. Выбери точку снова.")
         return ORDER_PICKUP_SUBPOINT_WAITING
 
-    district_name = context.user_data.get("checkout_pickup_district", "")
-    subpoints = PICKUP_SUBPOINTS.get(district_name)
-    if not subpoints or sub_index < 0 or sub_index >= len(subpoints):
+    region_index = context.user_data.get("checkout_pickup_region")
+    region = get_pickup_region(region_index) if isinstance(region_index, int) else None
+    if not region:
+        await _checkout_reply_after_query(context, query, "❌ Сессия сброшена. Начни оформление заново из корзины.")
+        return ORDER_PICKUP_POINT_WAITING
+
+    region_name, points = region
+    if sub_index < 0 or sub_index >= len(points):
         await _checkout_reply_after_query(context, query, "❌ Точка не найдена.")
         return ORDER_PICKUP_SUBPOINT_WAITING
 
-    _, address = subpoints[sub_index]
-    context.user_data["checkout_pickup_point"] = f"{district_name} — {address}"
+    _, address = points[sub_index]
+    context.user_data["checkout_pickup_point"] = f"{region_name} — {address}"
     await _checkout_reply_after_query(context, query, "1) Ваш номер телефона в формате +7XXXXXXXXXX")
     return ORDER_PICKUP_PHONE_WAITING
 
@@ -7805,7 +7820,7 @@ ADMIN_CONV_FALLBACKS = [
 
 
 async def pickup_select_stale_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Если checkout не обработал pickup_select/pickup_sub (нет сессии) — отвечаем на callback."""
+    """Если checkout не обработал pickup_region/pickup_sub (нет сессии) — отвечаем на callback."""
     query = update.callback_query
     if not query:
         return
@@ -7927,7 +7942,7 @@ def main():
             ORDER_DELIVERY_USERNAME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_delivery_username)],
             ORDER_DELIVERY_ADDRESS_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_delivery_address)],
             ORDER_DELIVERY_TIME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_delivery_time)],
-            ORDER_PICKUP_POINT_WAITING: [CallbackQueryHandler(checkout_pickup_point, pattern=r"^pickup_select:\d+$")],
+            ORDER_PICKUP_POINT_WAITING: [CallbackQueryHandler(checkout_pickup_region, pattern=r"^pickup_region:\d+$")],
             ORDER_PICKUP_SUBPOINT_WAITING: [CallbackQueryHandler(checkout_pickup_subpoint, pattern=r"^pickup_sub:\d+$")],
             ORDER_PICKUP_PHONE_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_pickup_phone)],
             ORDER_PICKUP_TIME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_pickup_time)],
@@ -8258,8 +8273,9 @@ def main():
     app.add_handler(broadcast_conv)
     app.add_handler(autopost_conv)
     app.add_handler(checkout_conv)
-    app.add_handler(CallbackQueryHandler(pickup_select_stale_fallback, pattern=r"^pickup_select:\d+$"))
+    app.add_handler(CallbackQueryHandler(pickup_select_stale_fallback, pattern=r"^pickup_region:\d+$"))
     app.add_handler(CallbackQueryHandler(pickup_select_stale_fallback, pattern=r"^pickup_sub:\d+$"))
+    app.add_handler(CallbackQueryHandler(pickup_select_stale_fallback, pattern=r"^pickup_select:\d+$"))
     app.add_handler(info_blocks_conv)
     app.add_handler(referral_hub_photo_conv)
     app.add_handler(create_promo_conv)
