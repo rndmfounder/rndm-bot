@@ -1628,6 +1628,22 @@ def get_active_giveaway():
     return cursor.fetchone()
 
 
+def deactivate_giveaway_silent(giveaway_id: int) -> bool:
+    """Снять розыгрыш с публикации без рассылок и личных уведомлений."""
+    cursor.execute(
+        """
+        UPDATE giveaways
+        SET is_active = 0,
+            finished_at = ?,
+            autobroadcast_enabled = 0
+        WHERE giveaway_id = ? AND is_active = 1
+        """,
+        (now_iso(), giveaway_id),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
 def get_giveaway_by_id(giveaway_id: int):
     cursor.execute(
         """
@@ -2709,6 +2725,7 @@ def admin_giveaways_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["🎯 Создать розыгрыш", "🏁 Завершить розыгрыш"],
+            ["🗑 Удалить розыгрыш (тихо)"],
             ["📣 Авторассылка анонса"],
             ["🎁 Реф. розыгрыш"],
             ["↩️ Админка"],
@@ -5690,6 +5707,94 @@ async def admin_create_giveaway_buttons(update: Update, context: ContextTypes.DE
     return ConversationHandler.END
 
 
+async def admin_delete_giveaway_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    active = get_active_giveaway()
+    if not active:
+        await safe_send(
+            update,
+            "❌ Сейчас нет активного розыгрыша.",
+            reply_markup=admin_giveaways_keyboard(),
+        )
+        return
+
+    giveaway_id, title, _, _, _, _, ab_en, _, _ = active
+    autobroadcast_note = "\nАвторассылка анонса тоже будет выключена." if ab_en else ""
+    confirm_kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Удалить без оповещений", callback_data=f"gwd:{giveaway_id}")],
+            [InlineKeyboardButton("❌ Отмена", callback_data=f"gwdx:{giveaway_id}")],
+        ]
+    )
+    await safe_send(
+        update,
+        f"🗑 Удалить розыгрыш?\n\n"
+        f"{title} (ID {giveaway_id})\n\n"
+        f"Розыгрыш исчезнет из бота для клиентов.{autobroadcast_note}\n"
+        f"Никаких сообщений участникам не отправится.",
+        reply_markup=confirm_kb,
+    )
+
+
+async def giveaway_silent_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.from_user or not is_admin(query.from_user.id):
+        return
+    raw = query.data
+    if not isinstance(raw, str) or not raw.startswith("gwd:"):
+        return
+    try:
+        giveaway_id = int(raw.split(":", 1)[1])
+    except (ValueError, IndexError):
+        try:
+            await query.answer("Некорректные данные", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    row = get_giveaway_by_id(giveaway_id)
+    title = row[1] if row else f"ID {giveaway_id}"
+    if not deactivate_giveaway_silent(giveaway_id):
+        try:
+            await query.answer("Розыгрыш уже не активен", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    log_action(query.from_user.id, "giveaway_silent_delete", f"giveaway_id={giveaway_id}")
+    try:
+        await query.answer("Розыгрыш удалён")
+    except Exception:
+        pass
+    try:
+        if query.message:
+            await query.message.edit_text(
+                f"✅ Розыгрыш «{title}» снят с публикации.\nКлиентам ничего не отправлялось.",
+                reply_markup=None,
+            )
+    except Exception:
+        logger.exception("giveaway_silent_delete_callback: edit_text")
+
+
+async def giveaway_silent_delete_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.from_user or not is_admin(query.from_user.id):
+        return
+    raw = query.data
+    if not isinstance(raw, str) or not raw.startswith("gwdx:"):
+        return
+    try:
+        await query.answer("Отменено")
+    except Exception:
+        pass
+    try:
+        if query.message:
+            await query.message.edit_text("❌ Удаление розыгрыша отменено.", reply_markup=None)
+    except Exception:
+        logger.exception("giveaway_silent_delete_cancel_callback: edit_text")
+
+
 async def admin_finish_giveaway_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
@@ -8423,6 +8528,8 @@ def main():
     app.add_handler(CallbackQueryHandler(order_rate_callback, pattern=r"^order_rate:\d+:\d+$"))
     app.add_handler(CallbackQueryHandler(client_notes_list_callback, pattern=r"^cn_list:\d+$"))
     app.add_handler(CallbackQueryHandler(client_note_help_callback, pattern=r"^cn_help$"))
+    app.add_handler(CallbackQueryHandler(giveaway_silent_delete_callback, pattern=r"^gwd:\d+$"))
+    app.add_handler(CallbackQueryHandler(giveaway_silent_delete_cancel_callback, pattern=r"^gwdx:\d+$"))
     app.add_handler(CallbackQueryHandler(giveaway_condition_callback, pattern=r"^gwc:\d+$"))
     app.add_handler(CallbackQueryHandler(giveaway_ref_link_callback, pattern=r"^gwr:\d+$"))
     app.add_handler(CallbackQueryHandler(giveaway_stats_callback, pattern=r"^gws:\d+$"))
@@ -8870,6 +8977,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^📋 Активные авто-рассылки$"), admin_autopost_list_screen))
     app.add_handler(MessageHandler(filters.Regex(r"^🎁 Розыгрыши \(админ\)$"), admin_open_giveaways))
     app.add_handler(MessageHandler(filters.Regex(r"^📣 Авторассылка анонса$"), admin_giveaway_autobroadcast_panel))
+    app.add_handler(MessageHandler(filters.Regex(r"^🗑 Удалить розыгрыш \(тихо\)$"), admin_delete_giveaway_start))
     app.add_handler(MessageHandler(filters.Regex(r"^▶️ Включить авторассылку$"), admin_giveaway_autobroadcast_enable))
     app.add_handler(MessageHandler(filters.Regex(r"^⏹ Выключить авторассылку$"), admin_giveaway_autobroadcast_disable))
     app.add_handler(
