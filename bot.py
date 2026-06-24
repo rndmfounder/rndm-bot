@@ -591,6 +591,15 @@ def init_database() -> None:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS giveaway_participants (
+                giveaway_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                conditions_met INTEGER NOT NULL DEFAULT 0,
+                marked_at TEXT,
+                PRIMARY KEY (giveaway_id, user_id)
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS auto_posts (
                 post_id BIGSERIAL PRIMARY KEY,
                 text_value TEXT NOT NULL,
@@ -774,6 +783,15 @@ def init_database() -> None:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS giveaway_participants (
+                giveaway_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                conditions_met INTEGER NOT NULL DEFAULT 0,
+                marked_at TEXT,
+                PRIMARY KEY (giveaway_id, user_id)
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS auto_posts (
                 post_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 text_value TEXT NOT NULL,
@@ -876,6 +894,19 @@ ensure_column("promocodes", "expires_at", "TEXT")
 ensure_column("promocodes", "revoked_at", "TEXT")
 ensure_column("promocodes", "max_uses", "INTEGER NOT NULL DEFAULT 1")
 ensure_column("promocodes", "use_count", "INTEGER NOT NULL DEFAULT 0")
+
+cursor.execute(
+    """
+    CREATE TABLE IF NOT EXISTS giveaway_participants (
+        giveaway_id BIGINT NOT NULL,
+        user_id BIGINT NOT NULL,
+        conditions_met INTEGER NOT NULL DEFAULT 0,
+        marked_at TEXT,
+        PRIMARY KEY (giveaway_id, user_id)
+    )
+    """
+)
+conn.commit()
 
 cursor.execute(
     """
@@ -1639,6 +1670,51 @@ def giveaway_buttons_markup_from_json(buttons_json_raw: str | None) -> InlineKey
     return InlineKeyboardMarkup(rows) if rows else None
 
 
+def is_giveaway_condition_met(giveaway_id: int, user_id: int) -> bool:
+    cursor.execute(
+        "SELECT conditions_met FROM giveaway_participants WHERE giveaway_id = ? AND user_id = ?",
+        (giveaway_id, user_id),
+    )
+    row = cursor.fetchone()
+    return bool(row and row[0])
+
+
+def set_giveaway_condition_met(giveaway_id: int, user_id: int) -> None:
+    cursor.execute(
+        """
+        INSERT INTO giveaway_participants (giveaway_id, user_id, conditions_met, marked_at)
+        VALUES (?, ?, 1, ?)
+        ON CONFLICT(giveaway_id, user_id) DO UPDATE SET
+            conditions_met = 1,
+            marked_at = excluded.marked_at
+        """,
+        (giveaway_id, user_id, now_iso()),
+    )
+    conn.commit()
+
+
+def build_giveaway_post_markup(
+    giveaway_id: int, user_id: int, buttons_json_raw: str | None
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    custom = giveaway_buttons_markup_from_json(buttons_json_raw)
+    if custom:
+        rows.extend(list(custom.inline_keyboard))
+
+    if is_giveaway_condition_met(giveaway_id, user_id):
+        cond_btn = InlineKeyboardButton("✅ Условие выполнено", callback_data=f"gwc:{giveaway_id}")
+    else:
+        cond_btn = InlineKeyboardButton("☐ Выполнить условие", callback_data=f"gwc:{giveaway_id}")
+    rows.append([cond_btn])
+    rows.append(
+        [
+            InlineKeyboardButton("🔗 Моя реф.ссылка", callback_data=f"gwr:{giveaway_id}"),
+            InlineKeyboardButton("📊 Мой счёт", callback_data=f"gws:{giveaway_id}"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
 def autopost_reply_markup_from_row(
     buttons_json_raw: str | None, button_text: str | None, button_url: str | None
 ) -> InlineKeyboardMarkup | None:
@@ -1911,8 +1987,10 @@ def build_giveaway_announce_caption(
     return (
         f"🎁 <b>{t}</b>\n\n"
         f"{body}\n\n"
+        f"👥 Приглашай друзей по ссылке — <b>чем больше приглашений, тем выше шанс выиграть</b>.\n"
         f"Твои приглашения в этом розыгрыше: <b>{my_count}</b>\n"
-        f"Твоя ссылка для участия:\n<code>{link}</code>"
+        f"Твоя ссылка для участия:\n<code>{link}</code>\n\n"
+        f"<i>Когда выполнишь условия розыгрыша — нажми кнопку под постом.</i>"
     )
 
 
@@ -1932,8 +2010,10 @@ def build_giveaway_announce_caption_plain(
     return (
         f"🎁 {t}\n\n"
         f"{body}\n\n"
+        f"👥 Приглашай друзей по ссылке — чем больше приглашений, тем выше шанс выиграть.\n"
         f"Твои приглашения в этом розыгрыше: {my_count}\n"
-        f"Твоя ссылка для участия:\n{link}"
+        f"Твоя ссылка для участия:\n{link}\n\n"
+        f"Когда выполнишь условия розыгрыша — нажми кнопку под постом."
     )
 
 
@@ -2749,11 +2829,18 @@ def item_card_keyboard(item_id: int, category_key: str) -> InlineKeyboardMarkup:
     )
 
 
+def checkout_back_keyboard(back_target: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⬅️ Назад", callback_data=f"checkout_back:{back_target}")]]
+    )
+
+
 def order_type_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🚚 Доставка", callback_data="checkout_delivery")],
             [InlineKeyboardButton("📍 Самовывоз", callback_data="checkout_pickup")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="checkout_back:promo")],
         ]
     )
 
@@ -2763,6 +2850,7 @@ def pickup_regions_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(region_name, callback_data=f"pickup_region:{index}")]
         for index, (region_name, _) in enumerate(PICKUP_REGIONS)
     ]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="checkout_back:choice")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -2781,6 +2869,7 @@ def pickup_region_points_keyboard(region_index: int) -> InlineKeyboardMarkup | N
         [InlineKeyboardButton(label, callback_data=f"pickup_sub:{point_index}")]
         for point_index, (label, _) in enumerate(points)
     ]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="checkout_back:pickup_regions")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -3504,13 +3593,20 @@ def apply_discount_to_total(total_sum: int, discount_percent: int) -> tuple[int,
 
 def promocode_skip_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("⏭ Пропустить", callback_data="skip_promocode")]]
+        [
+            [InlineKeyboardButton("⏭ Пропустить", callback_data="skip_promocode")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="checkout_back:cart")],
+        ]
     )
 
 
-def order_comment_skip_keyboard() -> InlineKeyboardMarkup:
+def order_comment_skip_keyboard(checkout_mode: str | None = None) -> InlineKeyboardMarkup:
+    back_target = "pickup_username" if checkout_mode == "pickup" else "delivery_time"
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("⏭ Без комментария", callback_data="skip_order_comment")]]
+        [
+            [InlineKeyboardButton("⏭ Без комментария", callback_data="skip_order_comment")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=f"checkout_back:{back_target}")],
+        ]
     )
 
 
@@ -3918,24 +4014,14 @@ async def rate_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_send(update, "✅ Комментарий к клиенту сохранён.")
 
 
-async def begin_checkout(query, context: ContextTypes.DEFAULT_TYPE, buy_now_item_id=None):
-    items = collect_checkout_items(query.from_user.id, buy_now_item_id)
-    if not items:
-        await _checkout_reply_after_query(context, query, "🛒 Корзина пустая.")
-        return ConversationHandler.END
-
-    clear_order_context(context)
-    context.user_data["checkout_buy_now_item_id"] = buy_now_item_id
-
+def build_checkout_promo_text(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str:
+    items = collect_checkout_items(user_id, context.user_data.get("checkout_buy_now_item_id"))
     items_text = build_items_text(items)
     total_sum = build_total_sum(items)
     total_line = format_price(total_sum) if total_sum > 0 else "цена уточняется"
-
-    context.user_data["checkout_promocode"] = None
-    context.user_data["checkout_promo_percent"] = 0
-    recalculate_checkout_totals(context, query.from_user.id)
+    recalculate_checkout_totals(context, user_id)
     ref_pct = int(context.user_data.get("checkout_referral_percent") or 0)
-    q_ok = get_qualified_referrals_count(query.from_user.id)
+    q_ok = get_qualified_referrals_count(user_id)
     tier_key, tier_em, _ = referral_tier_from_qualified_count(q_ok)
     after_ref = int(context.user_data.get("checkout_total_after_discount") or total_sum)
     pay_hint = format_price(after_ref) if after_ref > 0 else "цена уточняется"
@@ -3945,16 +4031,211 @@ async def begin_checkout(query, context: ContextTypes.DEFAULT_TYPE, buy_now_item
         f"При оформлении действует *лучшая* из скидок: промокод или ранг.\n"
         f"Сейчас к оплате с учётом ранга: *{pay_hint}* (если без промокода).\n\n"
     )
-
-    await _checkout_reply_after_query(
-        context,
-        query,
+    return (
         f"🧾 ОФОРМЛЕНИЕ ЗАКАЗА\n\n"
         f"{ref_line}"
         f"Товары:\n{items_text}\n\n"
         f"Итого без скидки: {total_line}\n\n"
         f"Если у тебя есть промокод — отправь его сейчас сообщением.\n"
-        f"Если промокода нет, нажми кнопку ниже:",
+        f"Если промокода нет, нажми кнопку ниже:"
+    )
+
+
+def _clear_checkout_delivery_fields(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for key in (
+        "checkout_mode",
+        "checkout_pickup_point",
+        "checkout_pickup_region",
+        "checkout_phone",
+        "checkout_username",
+        "checkout_address",
+        "checkout_time",
+        "checkout_comment",
+    ):
+        context.user_data.pop(key, None)
+
+
+async def checkout_goto_step(query, context: ContextTypes.DEFAULT_TYPE, step: str):
+    user = query.from_user
+    if not user:
+        return ConversationHandler.END
+
+    if step == "cart":
+        clear_order_context(context)
+        await _checkout_reply_after_query(
+            context,
+            query,
+            cart_text(user.id),
+            parse_mode="Markdown",
+            reply_markup=cart_keyboard(user.id),
+        )
+        return ConversationHandler.END
+
+    if step == "promo":
+        await _checkout_reply_after_query(
+            context,
+            query,
+            build_checkout_promo_text(context, user.id),
+            parse_mode="Markdown",
+            reply_markup=promocode_skip_keyboard(),
+        )
+        return ORDER_PROMOCODE_WAITING
+
+    if step == "choice":
+        _clear_checkout_delivery_fields(context)
+        await _checkout_reply_after_query(
+            context,
+            query,
+            "Выбери тип заказа:",
+            reply_markup=order_type_keyboard(),
+        )
+        return ORDER_CHOICE_WAITING
+
+    if step == "delivery_phone":
+        context.user_data["checkout_mode"] = "delivery"
+        recalculate_checkout_totals(context, user.id)
+        fee_line = ""
+        if DELIVERY_FEE_RUB > 0:
+            fee_line = f"\n\nК сумме заказа добавится доставка: +{DELIVERY_FEE_RUB} ₽."
+        await _checkout_reply_after_query(
+            context,
+            query,
+            f"1) Ваш телефон в формате +7XXXXXXXXXX{fee_line}",
+            reply_markup=checkout_back_keyboard("choice"),
+        )
+        return ORDER_DELIVERY_PHONE_WAITING
+
+    if step == "delivery_username":
+        await _checkout_reply_after_query(
+            context,
+            query,
+            "2) Ваш юзернейм в Telegram для связи.\nПример: @ivan1997",
+            reply_markup=checkout_back_keyboard("delivery_phone"),
+        )
+        return ORDER_DELIVERY_USERNAME_WAITING
+
+    if step == "delivery_address":
+        await _checkout_reply_after_query(
+            context,
+            query,
+            "3) Ваш адрес (Район, улица, дом)",
+            reply_markup=checkout_back_keyboard("delivery_username"),
+        )
+        return ORDER_DELIVERY_ADDRESS_WAITING
+
+    if step == "delivery_time":
+        await _checkout_reply_after_query(
+            context,
+            query,
+            "4) Укажи удобное время",
+            reply_markup=checkout_back_keyboard("delivery_address"),
+        )
+        return ORDER_DELIVERY_TIME_WAITING
+
+    if step == "pickup_regions":
+        context.user_data.pop("checkout_pickup_region", None)
+        context.user_data.pop("checkout_pickup_point", None)
+        await _checkout_reply_after_query(
+            context,
+            query,
+            "Выбери город:",
+            reply_markup=pickup_regions_keyboard(),
+        )
+        return ORDER_PICKUP_POINT_WAITING
+
+    if step == "pickup_points":
+        region_index = context.user_data.get("checkout_pickup_region")
+        region = get_pickup_region(region_index) if isinstance(region_index, int) else None
+        if not region:
+            return await checkout_goto_step(query, context, "pickup_regions")
+        region_name, _ = region
+        points_keyboard = pickup_region_points_keyboard(region_index)
+        if not points_keyboard:
+            return await checkout_goto_step(query, context, "pickup_regions")
+        await _checkout_reply_after_query(
+            context,
+            query,
+            f"📍 {region_name}\n\nВыбери точку:",
+            reply_markup=points_keyboard,
+        )
+        return ORDER_PICKUP_SUBPOINT_WAITING
+
+    if step == "pickup_phone":
+        await _checkout_reply_after_query(
+            context,
+            query,
+            "1) Ваш номер телефона в формате +7XXXXXXXXXX",
+            reply_markup=checkout_back_keyboard("pickup_points"),
+        )
+        return ORDER_PICKUP_PHONE_WAITING
+
+    if step == "pickup_time":
+        await _checkout_reply_after_query(
+            context,
+            query,
+            "2) Укажите удобное время",
+            reply_markup=checkout_back_keyboard("pickup_phone"),
+        )
+        return ORDER_PICKUP_TIME_WAITING
+
+    if step == "pickup_username":
+        await _checkout_reply_after_query(
+            context,
+            query,
+            "3) Ваш юзернейм в Telegram.\nПример: @ivan1997",
+            reply_markup=checkout_back_keyboard("pickup_time"),
+        )
+        return ORDER_PICKUP_USERNAME_WAITING
+
+    if step == "comment":
+        mode = context.user_data.get("checkout_mode")
+        back_target = "pickup_username" if mode == "pickup" else "delivery_time"
+        if mode == "pickup":
+            prompt = (
+                "4) Комментарий к заказу (цвет, комплектация, пожелания к самовывозу и т.п.)\n\n"
+                "Напиши текст или нажми кнопку ниже."
+            )
+        else:
+            prompt = (
+                "5) Комментарий к заказу (пожелания по доставке, подъезд, домофон и т.п.)\n\n"
+                "Напиши текст или нажми кнопку ниже."
+            )
+        await _checkout_reply_after_query(
+            context,
+            query,
+            prompt,
+            reply_markup=order_comment_skip_keyboard(mode),
+        )
+        return ORDER_COMMENT_WAITING
+
+    return await checkout_goto_step(query, context, "choice")
+
+
+async def checkout_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not isinstance(query.data, str):
+        return ORDER_PROMOCODE_WAITING
+    await query.answer()
+    step = query.data.split(":", 1)[1].strip()
+    return await checkout_goto_step(query, context, step)
+
+
+async def begin_checkout(query, context: ContextTypes.DEFAULT_TYPE, buy_now_item_id=None):
+    items = collect_checkout_items(query.from_user.id, buy_now_item_id)
+    if not items:
+        await _checkout_reply_after_query(context, query, "🛒 Корзина пустая.")
+        return ConversationHandler.END
+
+    clear_order_context(context)
+    context.user_data["checkout_buy_now_item_id"] = buy_now_item_id
+    context.user_data["checkout_promocode"] = None
+    context.user_data["checkout_promo_percent"] = 0
+
+    await _checkout_reply_after_query(
+        context,
+        query,
+        build_checkout_promo_text(context, query.from_user.id),
+        parse_mode="Markdown",
         reply_markup=promocode_skip_keyboard(),
     )
     return ORDER_PROMOCODE_WAITING
@@ -3968,7 +4249,8 @@ async def checkout_promocode_input(update: Update, context: ContextTypes.DEFAULT
     if not ok:
         await safe_send(
             update,
-            f"{message}\n\nОтправь другой промокод или нажми /cancel для отмены заказа."
+            f"{message}\n\nОтправь другой промокод или нажми кнопку «Назад».",
+            reply_markup=promocode_skip_keyboard(),
         )
         return ORDER_PROMOCODE_WAITING
 
@@ -4038,7 +4320,10 @@ async def checkout_choose_delivery(update: Update, context: ContextTypes.DEFAULT
     if DELIVERY_FEE_RUB > 0:
         fee_line = f"\n\nК сумме заказа добавится доставка: +{DELIVERY_FEE_RUB} ₽."
     await _checkout_reply_after_query(
-        context, query, f"1) Ваш телефон в формате +7XXXXXXXXXX{fee_line}"
+        context,
+        query,
+        f"1) Ваш телефон в формате +7XXXXXXXXXX{fee_line}",
+        reply_markup=checkout_back_keyboard("choice"),
     )
     return ORDER_DELIVERY_PHONE_WAITING
 
@@ -4046,40 +4331,68 @@ async def checkout_choose_delivery(update: Update, context: ContextTypes.DEFAULT
 async def checkout_delivery_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text.strip()
     if not is_valid_phone(phone):
-        await safe_send(update, "❌ Неверный формат. Пример: +79991234567")
+        await safe_send(
+            update,
+            "❌ Неверный формат. Пример: +79991234567",
+            reply_markup=checkout_back_keyboard("choice"),
+        )
         return ORDER_DELIVERY_PHONE_WAITING
 
     context.user_data["checkout_phone"] = phone
-    await safe_send(update, "2) Ваш юзернейм в Telegram для связи.\nПример: @ivan1997")
+    await safe_send(
+        update,
+        "2) Ваш юзернейм в Telegram для связи.\nПример: @ivan1997",
+        reply_markup=checkout_back_keyboard("delivery_phone"),
+    )
     return ORDER_DELIVERY_USERNAME_WAITING
 
 
 async def checkout_delivery_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.message.text.strip()
     if not is_valid_username(username):
-        await safe_send(update, "❌ Неверный формат. Пример: @ivan1997")
+        await safe_send(
+            update,
+            "❌ Неверный формат. Пример: @ivan1997",
+            reply_markup=checkout_back_keyboard("delivery_phone"),
+        )
         return ORDER_DELIVERY_USERNAME_WAITING
 
     context.user_data["checkout_username"] = username
-    await safe_send(update, "3) Ваш адрес (Район, улица, дом)")
+    await safe_send(
+        update,
+        "3) Ваш адрес (Район, улица, дом)",
+        reply_markup=checkout_back_keyboard("delivery_username"),
+    )
     return ORDER_DELIVERY_ADDRESS_WAITING
 
 
 async def checkout_delivery_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     address = update.message.text.strip()
     if len(address) < 5:
-        await safe_send(update, "❌ Адрес слишком короткий.")
+        await safe_send(
+            update,
+            "❌ Адрес слишком короткий.",
+            reply_markup=checkout_back_keyboard("delivery_username"),
+        )
         return ORDER_DELIVERY_ADDRESS_WAITING
 
     context.user_data["checkout_address"] = address
-    await safe_send(update, "4) Укажи удобное время")
+    await safe_send(
+        update,
+        "4) Укажи удобное время",
+        reply_markup=checkout_back_keyboard("delivery_address"),
+    )
     return ORDER_DELIVERY_TIME_WAITING
 
 
 async def checkout_delivery_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     delivery_time = update.message.text.strip()
     if len(delivery_time) < 2:
-        await safe_send(update, "❌ Укажи время нормально.")
+        await safe_send(
+            update,
+            "❌ Укажи время нормально.",
+            reply_markup=checkout_back_keyboard("delivery_address"),
+        )
         return ORDER_DELIVERY_TIME_WAITING
 
     context.user_data["checkout_time"] = delivery_time
@@ -4087,7 +4400,7 @@ async def checkout_delivery_time(update: Update, context: ContextTypes.DEFAULT_T
         update,
         "5) Комментарий к заказу (пожелания по доставке, подъезд, домофон и т.п.)\n\n"
         "Напиши текст или нажми кнопку ниже.",
-        reply_markup=order_comment_skip_keyboard(),
+        reply_markup=order_comment_skip_keyboard("delivery"),
     )
     return ORDER_COMMENT_WAITING
 
@@ -4131,15 +4444,21 @@ async def checkout_finalize_order(update: Update, context: ContextTypes.DEFAULT_
 
 async def checkout_order_comment_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
+    mode = context.user_data.get("checkout_mode")
     if not msg or msg.text is None:
         await safe_send(
             update,
             "Комментарий — только текстом (до 2000 символов) или нажми «⏭ Без комментария».",
+            reply_markup=order_comment_skip_keyboard(mode),
         )
         return ORDER_COMMENT_WAITING
     raw = msg.text.strip()
     if not raw:
-        await safe_send(update, "Напиши текст комментария или нажми «⏭ Без комментария».")
+        await safe_send(
+            update,
+            "Напиши текст комментария или нажми «⏭ Без комментария».",
+            reply_markup=order_comment_skip_keyboard(mode),
+        )
         return ORDER_COMMENT_WAITING
     if len(raw) > 2000:
         raw = raw[:2000]
@@ -4237,36 +4556,61 @@ async def checkout_pickup_subpoint(update: Update, context: ContextTypes.DEFAULT
 
     _, address = points[sub_index]
     context.user_data["checkout_pickup_point"] = f"{region_name} — {address}"
-    await _checkout_reply_after_query(context, query, "1) Ваш номер телефона в формате +7XXXXXXXXXX")
+    await _checkout_reply_after_query(
+        context,
+        query,
+        "1) Ваш номер телефона в формате +7XXXXXXXXXX",
+        reply_markup=checkout_back_keyboard("pickup_points"),
+    )
     return ORDER_PICKUP_PHONE_WAITING
 
 
 async def checkout_pickup_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text.strip()
     if not is_valid_phone(phone):
-        await safe_send(update, "❌ Неверный формат. Пример: +79991234567")
+        await safe_send(
+            update,
+            "❌ Неверный формат. Пример: +79991234567",
+            reply_markup=checkout_back_keyboard("pickup_points"),
+        )
         return ORDER_PICKUP_PHONE_WAITING
 
     context.user_data["checkout_phone"] = phone
-    await safe_send(update, "2) Укажите удобное время")
+    await safe_send(
+        update,
+        "2) Укажите удобное время",
+        reply_markup=checkout_back_keyboard("pickup_phone"),
+    )
     return ORDER_PICKUP_TIME_WAITING
 
 
 async def checkout_pickup_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pickup_time = update.message.text.strip()
     if len(pickup_time) < 2:
-        await safe_send(update, "❌ Укажи время нормально.")
+        await safe_send(
+            update,
+            "❌ Укажи время нормально.",
+            reply_markup=checkout_back_keyboard("pickup_phone"),
+        )
         return ORDER_PICKUP_TIME_WAITING
 
     context.user_data["checkout_time"] = pickup_time
-    await safe_send(update, "3) Ваш юзернейм в Telegram.\nПример: @ivan1997")
+    await safe_send(
+        update,
+        "3) Ваш юзернейм в Telegram.\nПример: @ivan1997",
+        reply_markup=checkout_back_keyboard("pickup_time"),
+    )
     return ORDER_PICKUP_USERNAME_WAITING
 
 
 async def checkout_pickup_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.message.text.strip()
     if not is_valid_username(username):
-        await safe_send(update, "❌ Неверный формат. Пример: @ivan1997")
+        await safe_send(
+            update,
+            "❌ Неверный формат. Пример: @ivan1997",
+            reply_markup=checkout_back_keyboard("pickup_time"),
+        )
         return ORDER_PICKUP_USERNAME_WAITING
 
     context.user_data["checkout_username"] = username
@@ -4274,7 +4618,7 @@ async def checkout_pickup_username(update: Update, context: ContextTypes.DEFAULT
         update,
         "4) Комментарий к заказу (цвет, комплектация, пожелания к самовывозу и т.п.)\n\n"
         "Напиши текст или нажми кнопку ниже.",
-        reply_markup=order_comment_skip_keyboard(),
+        reply_markup=order_comment_skip_keyboard("pickup"),
     )
     return ORDER_COMMENT_WAITING
 
@@ -4401,7 +4745,7 @@ async def giveaways(update: Update, context: ContextTypes.DEFAULT_TYPE):
     giveaway_id, title, text_value, photo, _, buttons_json, _, _, _ = active
     uname = context.bot.username or ""
     uid = update.effective_user.id
-    markup = giveaway_buttons_markup_from_json(buttons_json)
+    markup = build_giveaway_post_markup(giveaway_id, uid, buttons_json)
     if update.message:
         if photo:
             cap = _fit_giveaway_caption(
@@ -5282,8 +5626,9 @@ async def admin_create_giveaway_image(update: Update, context: ContextTypes.DEFA
         return ADMIN_GIVEAWAY_CREATE_IMAGE_WAITING
     await safe_send(
         update,
-        "🔗 Кнопки под постом: каждая строка «Текст | URL» (http/https/tg://).\n"
-        "Несколько кнопок — несколько строк. Напиши `skip`, если кнопки не нужны.",
+        "🔗 Доп. кнопки под постом (канал, пост ВК и т.п.): каждая строка «Текст | URL».\n"
+        "Кнопки «Выполнить условие», «Реф.ссылка» и «Мой счёт» добавятся автоматически.\n"
+        "Несколько строк — несколько кнопок. Напиши `skip`, если доп. кнопки не нужны.",
     )
     return ADMIN_GIVEAWAY_CREATE_BUTTONS_WAITING
 
@@ -5333,7 +5678,15 @@ async def admin_create_giveaway_buttons(update: Update, context: ContextTypes.DE
 
     for key in ("new_giveaway_title", "new_giveaway_text", "new_giveaway_photo"):
         context.user_data.pop(key, None)
-    await safe_send(update, f"✅ Розыгрыш создан и активирован. ID: {giveaway_id}", reply_markup=admin_keyboard())
+    await safe_send(
+        update,
+        f"✅ Розыгрыш создан и активирован. ID: {giveaway_id}\n\n"
+        "Под постом у клиентов автоматически появятся кнопки:\n"
+        "• выполнение условия\n"
+        "• реф.ссылка и счёт приглашений\n\n"
+        "Итоги выбираешь ты в «🏁 Завершить розыгрыш».",
+        reply_markup=admin_keyboard(),
+    )
     return ConversationHandler.END
 
 
@@ -5348,11 +5701,20 @@ async def admin_finish_giveaway_start(update: Update, context: ContextTypes.DEFA
     giveaway_id, title, _, _, _, _, _, _, _ = active
     context.user_data["finish_giveaway_id"] = giveaway_id
     top_rows = get_giveaway_top(giveaway_id, limit=20)
-    lines = [f"🏁 Завершение розыгрыша: *{title}* (ID {giveaway_id})\n", "Топ участников:"]
+    lines = [
+        f"🏁 Завершение розыгрыша: *{title}* (ID {giveaway_id})\n",
+        "Топ участников (приглашения · условие):",
+    ]
     for idx, (inviter_id, username, first_name, invites_count) in enumerate(top_rows, start=1):
         uname = f"@{username}" if username else "-"
-        lines.append(f"{idx}. {first_name or '-'} ({uname}) — ID `{inviter_id}` — *{invites_count}*")
-    lines.append("\nОтправь ID победителя (или несколько через запятую).")
+        cond = "✅" if is_giveaway_condition_met(giveaway_id, inviter_id) else "☐"
+        lines.append(
+            f"{idx}. {first_name or '-'} ({uname}) — ID `{inviter_id}` — *{invites_count}* пригл. · {cond}"
+        )
+    lines.append(
+        "\nОтправь ID победителя (или несколько через запятую).\n"
+        "_Итоги выбираешь ты — бот только показывает статистику._"
+    )
     await safe_send(update, "\n".join(lines), parse_mode="Markdown")
     return ADMIN_GIVEAWAY_FINISH_WAITING
 
@@ -5419,6 +5781,147 @@ async def admin_finish_giveaway_pick(update: Update, context: ContextTypes.DEFAU
             await update.message.reply_text(f"{intro}\n\n{caption_body}\n\n{tail}", reply_markup=preview_kb)
     await safe_send(update, "Кнопки под предпросмотром: разослать или отменить рассылку.", reply_markup=admin_keyboard())
     return ConversationHandler.END
+
+
+async def _active_giveaway_row_for_callback(giveaway_id: int) -> tuple | None:
+    active = get_active_giveaway()
+    if not active or int(active[0]) != int(giveaway_id):
+        return None
+    return active
+
+
+async def giveaway_condition_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.from_user:
+        return
+    raw = query.data
+    if not isinstance(raw, str) or not raw.startswith("gwc:"):
+        return
+    try:
+        giveaway_id = int(raw.split(":", 1)[1])
+    except (ValueError, IndexError):
+        try:
+            await query.answer("Некорректные данные", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    active = _active_giveaway_row_for_callback(giveaway_id)
+    if not active:
+        try:
+            await query.answer("Розыгрыш уже завершён", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    user = query.from_user
+    save_user(user)
+    uid = user.id
+    invites = get_giveaway_referrals_count(giveaway_id, uid)
+
+    if is_giveaway_condition_met(giveaway_id, uid):
+        try:
+            await query.answer("✅ Ты уже отметил выполнение условия", show_alert=True)
+        except Exception:
+            pass
+    else:
+        set_giveaway_condition_met(giveaway_id, uid)
+        try:
+            await query.answer(
+                f"✅ Условие отмечено! Приглашений: {invites}. Чем больше друзей — тем выше шанс.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+
+    try:
+        if query.message:
+            markup = build_giveaway_post_markup(giveaway_id, uid, active[5])
+            await query.message.edit_reply_markup(reply_markup=markup)
+    except Exception:
+        logger.exception("giveaway_condition_callback: edit_reply_markup")
+
+
+async def giveaway_ref_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.from_user:
+        return
+    raw = query.data
+    if not isinstance(raw, str) or not raw.startswith("gwr:"):
+        return
+    try:
+        giveaway_id = int(raw.split(":", 1)[1])
+    except (ValueError, IndexError):
+        try:
+            await query.answer("Некорректные данные", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    if not _active_giveaway_row_for_callback(giveaway_id):
+        try:
+            await query.answer("Розыгрыш уже завершён", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    user = query.from_user
+    save_user(user)
+    link = build_ref_link(context.bot.username or "", user.id)
+    invites = get_giveaway_referrals_count(giveaway_id, user.id)
+    cond = "✅ выполнено" if is_giveaway_condition_met(giveaway_id, user.id) else "☐ не отмечено"
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    text = (
+        "🔗 <b>Твоя реферальная ссылка для розыгрыша</b>\n\n"
+        f"<code>{html_esc(link) if link else '—'}</code>\n\n"
+        f"Приглашений в этом розыгрыше: <b>{invites}</b>\n"
+        f"Условие участия: <b>{cond}</b>\n\n"
+        "<i>Друг засчитывается, когда перейдёт по ссылке и впервые зайдёт в бота.</i>"
+    )
+    try:
+        await context.bot.send_message(chat_id=user.id, text=text, parse_mode="HTML")
+    except Exception:
+        logger.exception("giveaway_ref_link_callback: send_message")
+
+
+async def giveaway_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.from_user:
+        return
+    raw = query.data
+    if not isinstance(raw, str) or not raw.startswith("gws:"):
+        return
+    try:
+        giveaway_id = int(raw.split(":", 1)[1])
+    except (ValueError, IndexError):
+        try:
+            await query.answer("Некорректные данные", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    active = _active_giveaway_row_for_callback(giveaway_id)
+    if not active:
+        try:
+            await query.answer("Розыгрыш уже завершён", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    user = query.from_user
+    save_user(user)
+    invites = get_giveaway_referrals_count(giveaway_id, user.id)
+    cond = "выполнено ✅" if is_giveaway_condition_met(giveaway_id, user.id) else "не отмечено ☐"
+    try:
+        await query.answer(
+            f"Приглашений: {invites}. Условие: {cond}. Больше друзей — выше шанс!",
+            show_alert=True,
+        )
+    except Exception:
+        pass
 
 
 async def giveaway_results_broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6068,7 +6571,6 @@ async def send_giveaway_announce_broadcast(
     """Один проход: анонс активного розыгрыша всем получателям (как «🎁 Розыгрыши»)."""
     gid, title, text_value, photo, _, buttons_json, _, _, _ = row
     bot_username = context.bot.username or ""
-    markup = giveaway_buttons_markup_from_json(buttons_json)
     user_ids = get_broadcast_recipient_user_ids()
     if not user_ids:
         return 0, 0, 0, {}
@@ -6081,6 +6583,7 @@ async def send_giveaway_announce_broadcast(
         caption = _fit_giveaway_caption(
             bot_username, uid, gid, title, text_value, cap_limit, use_html=True
         )
+        markup = build_giveaway_post_markup(gid, uid, buttons_json)
         try:
             if has_photo:
                 await context.bot.send_photo(
@@ -7920,39 +8423,78 @@ def main():
     app.add_handler(CallbackQueryHandler(order_rate_callback, pattern=r"^order_rate:\d+:\d+$"))
     app.add_handler(CallbackQueryHandler(client_notes_list_callback, pattern=r"^cn_list:\d+$"))
     app.add_handler(CallbackQueryHandler(client_note_help_callback, pattern=r"^cn_help$"))
+    app.add_handler(CallbackQueryHandler(giveaway_condition_callback, pattern=r"^gwc:\d+$"))
+    app.add_handler(CallbackQueryHandler(giveaway_ref_link_callback, pattern=r"^gwr:\d+$"))
+    app.add_handler(CallbackQueryHandler(giveaway_stats_callback, pattern=r"^gws:\d+$"))
     app.add_handler(CallbackQueryHandler(giveaway_results_broadcast_callback, pattern=r"^gwb:\d+$"))
     app.add_handler(CallbackQueryHandler(giveaway_results_skip_callback, pattern=r"^gwx:\d+$"))
     app.add_handler(CallbackQueryHandler(autopost_manage_callback, pattern=r"^autopost_(pause|resume|delete):\d+$"))
 
+    checkout_back_handler = CallbackQueryHandler(checkout_back, pattern=r"^checkout_back:\w+$")
+    checkout_restart_handlers = [
+        CallbackQueryHandler(start_checkout_from_cart, pattern=r"^cart_checkout$"),
+        CallbackQueryHandler(start_checkout_buy_now, pattern=r"^buy_now:\d+$"),
+    ]
+
+    def checkout_state(handlers):
+        return [*handlers, checkout_back_handler, *checkout_restart_handlers]
+
     checkout_conv = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(start_checkout_from_cart, pattern=r"^cart_checkout$"),
-            CallbackQueryHandler(start_checkout_buy_now, pattern=r"^buy_now:\d+$"),
-        ],
+        entry_points=list(checkout_restart_handlers),
         states={
-            ORDER_PROMOCODE_WAITING: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_promocode_input),
-                CallbackQueryHandler(checkout_skip_promocode, pattern=r"^skip_promocode$"),
-            ],
-            ORDER_CHOICE_WAITING: [
-                CallbackQueryHandler(checkout_choose_delivery, pattern=r"^checkout_delivery$"),
-                CallbackQueryHandler(checkout_choose_pickup, pattern=r"^checkout_pickup$"),
-            ],
-            ORDER_DELIVERY_PHONE_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_delivery_phone)],
-            ORDER_DELIVERY_USERNAME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_delivery_username)],
-            ORDER_DELIVERY_ADDRESS_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_delivery_address)],
-            ORDER_DELIVERY_TIME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_delivery_time)],
-            ORDER_PICKUP_POINT_WAITING: [CallbackQueryHandler(checkout_pickup_region, pattern=r"^pickup_region:\d+$")],
-            ORDER_PICKUP_SUBPOINT_WAITING: [CallbackQueryHandler(checkout_pickup_subpoint, pattern=r"^pickup_sub:\d+$")],
-            ORDER_PICKUP_PHONE_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_pickup_phone)],
-            ORDER_PICKUP_TIME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_pickup_time)],
-            ORDER_PICKUP_USERNAME_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_pickup_username)],
-            ORDER_COMMENT_WAITING: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_order_comment_step),
-                CallbackQueryHandler(checkout_skip_order_comment, pattern=r"^skip_order_comment$"),
-            ],
+            ORDER_PROMOCODE_WAITING: checkout_state(
+                [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_promocode_input),
+                    CallbackQueryHandler(checkout_skip_promocode, pattern=r"^skip_promocode$"),
+                ]
+            ),
+            ORDER_CHOICE_WAITING: checkout_state(
+                [
+                    CallbackQueryHandler(checkout_choose_delivery, pattern=r"^checkout_delivery$"),
+                    CallbackQueryHandler(checkout_choose_pickup, pattern=r"^checkout_pickup$"),
+                ]
+            ),
+            ORDER_DELIVERY_PHONE_WAITING: checkout_state(
+                [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_delivery_phone)]
+            ),
+            ORDER_DELIVERY_USERNAME_WAITING: checkout_state(
+                [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_delivery_username)]
+            ),
+            ORDER_DELIVERY_ADDRESS_WAITING: checkout_state(
+                [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_delivery_address)]
+            ),
+            ORDER_DELIVERY_TIME_WAITING: checkout_state(
+                [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_delivery_time)]
+            ),
+            ORDER_PICKUP_POINT_WAITING: checkout_state(
+                [CallbackQueryHandler(checkout_pickup_region, pattern=r"^pickup_region:\d+$")]
+            ),
+            ORDER_PICKUP_SUBPOINT_WAITING: checkout_state(
+                [CallbackQueryHandler(checkout_pickup_subpoint, pattern=r"^pickup_sub:\d+$")]
+            ),
+            ORDER_PICKUP_PHONE_WAITING: checkout_state(
+                [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_pickup_phone)]
+            ),
+            ORDER_PICKUP_TIME_WAITING: checkout_state(
+                [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_pickup_time)]
+            ),
+            ORDER_PICKUP_USERNAME_WAITING: checkout_state(
+                [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_pickup_username)]
+            ),
+            ORDER_COMMENT_WAITING: checkout_state(
+                [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_order_comment_step),
+                    CallbackQueryHandler(checkout_skip_order_comment, pattern=r"^skip_order_comment$"),
+                ]
+            ),
         },
-        fallbacks=[*ADMIN_CONV_FALLBACKS, MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main)],
+        fallbacks=[
+            *ADMIN_CONV_FALLBACKS,
+            checkout_back_handler,
+            *checkout_restart_handlers,
+            MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main),
+        ],
+        allow_reentry=True,
         per_chat=False,
         per_user=True,
     )
