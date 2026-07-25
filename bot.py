@@ -18,6 +18,9 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputFile,
+    InputMediaPhoto,
+    InputMediaVideo,
+    MessageEntity,
     ReplyKeyboardMarkup,
     Update,
 )
@@ -221,6 +224,8 @@ ADMIN_GIVEAWAY_CREATE_IMAGE_WAITING = next(_state)
 ADMIN_GIVEAWAY_CREATE_BUTTONS_WAITING = next(_state)
 ADMIN_GIVEAWAY_FINISH_WAITING = next(_state)
 ADMIN_GIVEAWAY_AUTOBROADCAST_PER_DAY_WAITING = next(_state)
+ADMIN_GIVEAWAY_EDIT_TEXT_WAITING = next(_state)
+ADMIN_GIVEAWAY_EDIT_PHOTO_WAITING = next(_state)
 ADMIN_AUTOPOST_TEXT_WAITING = next(_state)
 ADMIN_AUTOPOST_PHOTO_WAITING = next(_state)
 ADMIN_AUTOPOST_BUTTON_WAITING = next(_state)
@@ -923,6 +928,8 @@ ensure_column("auto_posts", "buttons_json", "TEXT NOT NULL DEFAULT ''")
 ensure_column("auto_posts", "schedule_mode", "TEXT NOT NULL DEFAULT 'interval'")
 ensure_column("auto_posts", "clock_times_json", "TEXT")
 ensure_column("auto_posts", "last_clock_slot_key", "TEXT")
+ensure_column("auto_posts", "media_json", "TEXT NOT NULL DEFAULT '[]'")
+ensure_column("auto_posts", "text_entities_json", "TEXT NOT NULL DEFAULT '[]'")
 
 if USE_POSTGRES:
     cursor.execute(
@@ -1863,6 +1870,63 @@ def get_giveaway_referrals_count(giveaway_id: int, inviter_id: int) -> int:
     return cursor.fetchone()[0]
 
 
+def get_giveaway_live_stats(giveaway_id: int) -> tuple[int, int, int, int]:
+    """Участник = отметил условие и пригласил хотя бы одного человека."""
+    cursor.execute(
+        """
+        SELECT
+            (
+                SELECT COUNT(DISTINCT p.user_id)
+                FROM giveaway_participants p
+                WHERE p.giveaway_id = ? AND p.conditions_met = 1
+            ) AS marked_count,
+            (
+                SELECT COUNT(DISTINCT gr.inviter_id)
+                FROM giveaway_referrals gr
+                WHERE gr.giveaway_id = ?
+            ) AS inviters_count,
+            (
+                SELECT COUNT(DISTINCT p.user_id)
+                FROM giveaway_participants p
+                WHERE p.giveaway_id = ?
+                  AND p.conditions_met = 1
+                  AND EXISTS (
+                      SELECT 1
+                      FROM giveaway_referrals gr
+                      WHERE gr.giveaway_id = p.giveaway_id
+                        AND gr.inviter_id = p.user_id
+                  )
+            ) AS participants_count,
+            (
+                SELECT COUNT(DISTINCT gr.invited_id)
+                FROM giveaway_referrals gr
+                WHERE gr.giveaway_id = ?
+            ) AS invited_count
+        """,
+        (giveaway_id, giveaway_id, giveaway_id, giveaway_id),
+    )
+    row = cursor.fetchone() or (0, 0, 0, 0)
+    return tuple(int(value or 0) for value in row)
+
+
+def format_giveaway_admin_stats_html(giveaway_id: int, *, title: str | None = None) -> str:
+    """Админская сводка: сколько пришло + участники."""
+    marked, inviters, participants, invited = get_giveaway_live_stats(giveaway_id)
+    checked_at = datetime.now(BOT_DISPLAY_TZ).strftime("%d.%m.%Y %H:%M:%S")
+    head = ""
+    if title is not None:
+        head = f"🎁 {html.escape(str(title))} (ID <code>{giveaway_id}</code>)\n\n"
+    return (
+        f"{head}"
+        f"📥 <b>Пришло людей за розыгрыш: {invited}</b>\n"
+        f"<i>(новые пользователи, зашедшие по реф.ссылке участника)</i>\n\n"
+        f"✅ Участников (условие + ≥1 инвайт): <b>{participants}</b>\n"
+        f"Отметили условие: <b>{marked}</b>\n"
+        f"Пригласили хотя бы одного: <b>{inviters}</b>\n\n"
+        f"<i>Данные на {checked_at}</i>"
+    )
+
+
 def track_giveaway_referral_if_active(inviter_id: int, invited_id: int) -> None:
     giveaway = get_active_giveaway()
     if not giveaway:
@@ -2713,8 +2777,8 @@ async def reply_broadcast_nav_stuck_hint(update: Update, context: ContextTypes.D
         await update.message.reply_text(
             "Сейчас был активен другой сценарий, поэтому кнопка рассылки не открылась.\n\n"
             "Напиши команду:\n"
-            "• /broadcast — ручная рассылка (текст/фото → кнопки → отправка)\n"
-            "• /autopost — авто-рассылка (текст → фото → кнопки → интервал или «время»)\n\n"
+            "• /broadcast — ручная рассылка (текст/фото/видео/стикеры → кнопки → отправка)\n"
+            "• /autopost — авто-рассылка (текст → медиа → кнопки → интервал или «время»)\n\n"
             "Или нажми «🛑 Прервать сценарий», затем снова кнопку 📣/🤖.",
             reply_markup=admin_broadcast_keyboard(),
         )
@@ -2725,6 +2789,7 @@ def admin_giveaways_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["🎯 Создать розыгрыш", "🏁 Завершить розыгрыш"],
+            ["📊 Статистика розыгрыша", "✏️ Текст и фото розыгрыша"],
             ["🗑 Удалить розыгрыш (тихо)"],
             ["📣 Авторассылка анонса"],
             ["🎁 Реф. розыгрыш"],
@@ -2739,8 +2804,21 @@ def admin_giveaway_autobroadcast_keyboard() -> ReplyKeyboardMarkup:
         [
             ["▶️ Включить авторассылку", "⏹ Выключить авторассылку"],
             ["⚙ Раз в сутки"],
+            ["✏️ Текст и фото розыгрыша"],
             ["📤 Разослать анонс сейчас (1 раз)"],
             ["📊 Статус авторассылки"],
+            ["↩️ К розыгрышам"],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def admin_giveaway_edit_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["📝 Изменить текст розыгрыша"],
+            ["🖼 Изменить фото розыгрыша"],
+            ["👁 Предпросмотр розыгрыша"],
             ["↩️ К розыгрышам"],
         ],
         resize_keyboard=True,
@@ -5060,6 +5138,8 @@ async def admin_open_broadcasts(update: Update, context: ContextTypes.DEFAULT_TY
             update,
             "📣 Раздел: рассылки\n\n"
             "Кнопки 📣/🤖 или команды: /broadcast и /autopost.\n"
+            "В рассылках можно: несколько фото, видео, GIF, стикеры; "
+            "премиум-эмодзи — если Telegram разрешит боту (Premium у владельца бота).\n"
             "Если сценарий «завис» в другом разделе — «🛑 Прервать сценарий» или /admin_stop.",
             reply_markup=admin_broadcast_keyboard(),
         )
@@ -5070,6 +5150,199 @@ async def admin_open_broadcasts(update: Update, context: ContextTypes.DEFAULT_TY
 async def admin_open_giveaways(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(update.effective_user.id):
         await safe_send(update, "🎁 Раздел: розыгрыши", reply_markup=admin_giveaways_keyboard())
+
+
+async def admin_giveaway_live_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    active = get_active_giveaway()
+    if not active:
+        await safe_send(update, "❌ Сейчас нет активного розыгрыша.", reply_markup=admin_giveaways_keyboard())
+        return
+
+    giveaway_id, title, _, _, _, _, _, _, _ = active
+    await safe_send(
+        update,
+        "📊 <b>Статистика розыгрыша (онлайн)</b>\n\n"
+        + format_giveaway_admin_stats_html(giveaway_id, title=title)
+        + "\n\n"
+        "Участником считается пользователь, который:\n"
+        "• нажал «Выполнить условие»;\n"
+        "• пригласил хотя бы 1 человека.\n\n"
+        "<i>Можно смотреть хоть каждый день — нажми кнопку ещё раз для обновления.</i>",
+        parse_mode="HTML",
+        reply_markup=admin_giveaways_keyboard(),
+    )
+
+
+async def admin_giveaway_edit_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    active = get_active_giveaway()
+    if not active:
+        await safe_send(update, "❌ Сейчас нет активного розыгрыша.", reply_markup=admin_giveaways_keyboard())
+        return
+    giveaway_id, title, _, photo, _, _, _, _, _ = active
+    await safe_send(
+        update,
+        "✏️ <b>Редактор активного розыгрыша</b>\n\n"
+        f"🎁 {html.escape(str(title))} (ID <code>{giveaway_id}</code>)\n"
+        f"Фото: <b>{'установлено' if photo else 'нет'}</b>\n\n"
+        "Изменения сразу применятся к карточке розыгрыша и ко всем следующим "
+        "автоматическим и ручным анонсам. Уже отправленные сообщения не изменятся.",
+        parse_mode="HTML",
+        reply_markup=admin_giveaway_edit_keyboard(),
+    )
+
+
+async def admin_giveaway_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    active = get_active_giveaway()
+    if not active:
+        await safe_send(update, "❌ Сейчас нет активного розыгрыша.", reply_markup=admin_giveaways_keyboard())
+        return
+
+    giveaway_id, title, text_value, photo, _, buttons_json, _, _, _ = active
+    uid = update.effective_user.id
+    bot_username = context.bot.username or ""
+    markup = build_giveaway_post_markup(giveaway_id, uid, buttons_json)
+    if update.message and photo:
+        caption = _fit_giveaway_caption(
+            bot_username, uid, giveaway_id, title, text_value, GIVEAWAY_PHOTO_CAPTION_MAX, use_html=True
+        )
+        try:
+            await update.message.reply_photo(
+                photo=photo, caption=caption, parse_mode="HTML", reply_markup=markup
+            )
+            await safe_send(
+                update,
+                "👁 Выше — актуальный вид розыгрыша и будущей авторассылки.",
+                reply_markup=admin_giveaway_edit_keyboard(),
+            )
+            return
+        except Exception:
+            logger.exception("Не удалось показать фото в предпросмотре активного розыгрыша")
+
+    text = _fit_giveaway_caption(
+        bot_username, uid, giveaway_id, title, text_value, GIVEAWAY_TEXT_MESSAGE_MAX, use_html=True
+    )
+    if update.message:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+    await safe_send(
+        update,
+        "👁 Выше — актуальный вид розыгрыша и будущей авторассылки.",
+        reply_markup=admin_giveaway_edit_keyboard(),
+    )
+
+
+async def admin_giveaway_edit_text_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    active = get_active_giveaway()
+    if not active:
+        await safe_send(update, "❌ Сейчас нет активного розыгрыша.", reply_markup=admin_giveaways_keyboard())
+        return ConversationHandler.END
+    context.user_data["edit_giveaway_id"] = active[0]
+    await safe_send(
+        update,
+        "📝 Отправь новый текст активного розыгрыша.\n\n"
+        "Он сразу будет использоваться в карточке и в следующих авторассылках.\n"
+        "/cancel — отмена.",
+        reply_markup=admin_giveaway_edit_keyboard(),
+    )
+    return ADMIN_GIVEAWAY_EDIT_TEXT_WAITING
+
+
+async def admin_giveaway_edit_text_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    giveaway_id = context.user_data.get("edit_giveaway_id")
+    text_value = (update.message.text or "").strip() if update.message else ""
+    if not giveaway_id or not text_value:
+        await safe_send(update, "❌ Текст не может быть пустым. Отправь новый текст или /cancel.")
+        return ADMIN_GIVEAWAY_EDIT_TEXT_WAITING
+
+    cursor.execute(
+        "UPDATE giveaways SET text_value = ? WHERE giveaway_id = ? AND is_active = 1",
+        (text_value, giveaway_id),
+    )
+    if not cursor.rowcount:
+        conn.rollback()
+        context.user_data.pop("edit_giveaway_id", None)
+        await safe_send(update, "❌ Розыгрыш уже не активен.", reply_markup=admin_giveaways_keyboard())
+        return ConversationHandler.END
+    conn.commit()
+    log_action(update.effective_user.id, "giveaway_edit_text", f"giveaway_id={giveaway_id}")
+    context.user_data.pop("edit_giveaway_id", None)
+    await safe_send(
+        update,
+        "✅ Текст обновлён. Он уже применяется к розыгрышу и следующим рассылкам.",
+        reply_markup=admin_giveaway_edit_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+async def admin_giveaway_edit_photo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    active = get_active_giveaway()
+    if not active:
+        await safe_send(update, "❌ Сейчас нет активного розыгрыша.", reply_markup=admin_giveaways_keyboard())
+        return ConversationHandler.END
+    context.user_data["edit_giveaway_id"] = active[0]
+    await safe_send(
+        update,
+        "🖼 Отправь новое фото активного розыгрыша.\n\n"
+        "Чтобы убрать текущее фото, напиши <code>удалить</code>.\n"
+        "/cancel — отмена.",
+        parse_mode="HTML",
+        reply_markup=admin_giveaway_edit_keyboard(),
+    )
+    return ADMIN_GIVEAWAY_EDIT_PHOTO_WAITING
+
+
+async def admin_giveaway_edit_photo_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    giveaway_id = context.user_data.get("edit_giveaway_id")
+    if not giveaway_id or not update.message:
+        return ConversationHandler.END
+
+    raw = (update.message.text or "").strip().lower()
+    if update.message.photo:
+        photo = update.message.photo[-1].file_id
+        action_text = "обновлено"
+    elif raw in {"удалить", "delete", "remove", "skip", "без фото"}:
+        photo = ""
+        action_text = "удалено"
+    else:
+        await safe_send(
+            update,
+            "❌ Отправь фото или напиши <code>удалить</code>.",
+            parse_mode="HTML",
+            reply_markup=admin_giveaway_edit_keyboard(),
+        )
+        return ADMIN_GIVEAWAY_EDIT_PHOTO_WAITING
+
+    cursor.execute(
+        "UPDATE giveaways SET photo = ? WHERE giveaway_id = ? AND is_active = 1",
+        (photo, giveaway_id),
+    )
+    if not cursor.rowcount:
+        conn.rollback()
+        context.user_data.pop("edit_giveaway_id", None)
+        await safe_send(update, "❌ Розыгрыш уже не активен.", reply_markup=admin_giveaways_keyboard())
+        return ConversationHandler.END
+    conn.commit()
+    log_action(update.effective_user.id, "giveaway_edit_photo", f"giveaway_id={giveaway_id};{action_text}")
+    context.user_data.pop("edit_giveaway_id", None)
+    await safe_send(
+        update,
+        f"✅ Фото {action_text}. Изменение уже применяется к розыгрышу и следующим рассылкам.",
+        reply_markup=admin_giveaway_edit_keyboard(),
+    )
+    return ConversationHandler.END
 
 
 def _giveaway_autobroadcast_status_lines(active: tuple | None) -> list[str]:
@@ -5806,21 +6079,28 @@ async def admin_finish_giveaway_start(update: Update, context: ContextTypes.DEFA
     giveaway_id, title, _, _, _, _, _, _, _ = active
     context.user_data["finish_giveaway_id"] = giveaway_id
     top_rows = get_giveaway_top(giveaway_id, limit=20)
+    stats_html = format_giveaway_admin_stats_html(giveaway_id, title=title)
     lines = [
-        f"🏁 Завершение розыгрыша: *{title}* (ID {giveaway_id})\n",
-        "Топ участников (приглашения · условие):",
+        f"🏁 <b>Завершение розыгрыша</b>\n",
+        stats_html,
+        "",
+        "<b>Топ участников</b> (приглашения · условие):",
     ]
+    if not top_rows:
+        lines.append("— пока никого с приглашениями")
     for idx, (inviter_id, username, first_name, invites_count) in enumerate(top_rows, start=1):
-        uname = f"@{username}" if username else "-"
+        uname = f"@{html.escape(username)}" if username else "-"
+        who = html.escape(first_name or "-")
         cond = "✅" if is_giveaway_condition_met(giveaway_id, inviter_id) else "☐"
         lines.append(
-            f"{idx}. {first_name or '-'} ({uname}) — ID `{inviter_id}` — *{invites_count}* пригл. · {cond}"
+            f"{idx}. {who} ({uname}) — ID <code>{inviter_id}</code> — "
+            f"<b>{invites_count}</b> пригл. · {cond}"
         )
     lines.append(
         "\nОтправь ID победителя (или несколько через запятую).\n"
-        "_Итоги выбираешь ты — бот только показывает статистику._"
+        "<i>Итоги выбираешь ты — бот только показывает статистику.</i>"
     )
-    await safe_send(update, "\n".join(lines), parse_mode="Markdown")
+    await safe_send(update, "\n".join(lines), parse_mode="HTML")
     return ADMIN_GIVEAWAY_FINISH_WAITING
 
 
@@ -5835,6 +6115,7 @@ async def admin_finish_giveaway_pick(update: Update, context: ContextTypes.DEFAU
         return ADMIN_GIVEAWAY_FINISH_WAITING
 
     winner_ids = list(dict.fromkeys(winner_ids))
+    final_stats_html = format_giveaway_admin_stats_html(giveaway_id)
     for winner_id in winner_ids:
         invites_count = get_giveaway_referrals_count(giveaway_id, winner_id)
         cursor.execute(
@@ -5856,11 +6137,16 @@ async def admin_finish_giveaway_pick(update: Update, context: ContextTypes.DEFAU
     conn.commit()
     context.user_data.pop("finish_giveaway_id", None)
 
+    await safe_send(
+        update,
+        "✅ <b>Розыгрыш завершён.</b>\n\n" + final_stats_html,
+        parse_mode="HTML",
+    )
+
     caption_body = build_giveaway_results_caption(giveaway_id) or "Итоги розыгрыша"
     g_row = get_giveaway_by_id(giveaway_id)
     photo = (g_row[3] or "").strip() if g_row else ""
     intro = (
-        "✅ Розыгрыш завершён, победители зафиксированы.\n\n"
         "👁 Предпросмотр рассылки — так увидят сообщение пользователи (кроме чёрного списка):\n"
         "────────"
     )
@@ -6147,48 +6433,153 @@ async def admin_autopost_start(update: Update, context: ContextTypes.DEFAULT_TYP
     if not update.message:
         return ConversationHandler.END
     context.user_data.clear()
+    context.user_data["autopost_media"] = []
+    context.user_data["autopost_entities"] = []
     await safe_send(
         update,
-        "🤖 *Авто-рассылка* — по шагам:\n"
-        "1) текст поста\n"
-        "2) фото или `skip`\n"
-        "3) кнопки: строки `Текст | https://…` или `skip`\n"
-        "4) расписание: число *часов* между отправками или слово `время`, "
-        "затем строки `ЧЧ:ММ` (*Екатеринбург*)\n\n"
-        "Отправь *текст* первого поста.\n\n"
-        "Выйти: /cancel, /stop, /admin\\_stop или «🛑 Прервать сценарий».",
-        parse_mode="Markdown",
+        "🤖 <b>Авто-рассылка</b> — по шагам:\n"
+        "1) текст поста (можно с премиум-эмодзи)\n"
+        "2) медиа: фото/альбом/видео/GIF/стикер или <code>skip</code>, затем <code>готово</code>\n"
+        "3) кнопки: строки <code>Текст | https://…</code> или <code>skip</code>\n"
+        "4) расписание: число <b>часов</b> или слово <code>время</code>\n\n"
+        "Отправь <b>текст</b> первого поста.\n\n"
+        "Выйти: /cancel",
+        parse_mode="HTML",
     )
     return ADMIN_AUTOPOST_TEXT_WAITING
 
 
 async def admin_autopost_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        await safe_send(update, "❌ Нужен текст поста.")
+        return ADMIN_AUTOPOST_TEXT_WAITING
     context.user_data["autopost_text"] = update.message.text
+    context.user_data["autopost_entities"] = serialize_message_entities(update.message.entities)
+    context.user_data["autopost_media"] = []
     await safe_send(
         update,
-        "🖼 Отправь фото для поста или напиши `skip`.\n"
-        "Выйти: /cancel, /stop или «🛑 Прервать сценарий».",
+        "🖼 Отправь медиа для поста:\n"
+        "• одно или несколько фото / альбом\n"
+        "• видео / GIF / стикер\n"
+        "• или <code>skip</code>, если медиа не нужно\n\n"
+        "Можно несколькими сообщениями. Когда закончишь — <code>готово</code>.\n"
+        "Выйти: /cancel",
+        parse_mode="HTML",
     )
     return ADMIN_AUTOPOST_PHOTO_WAITING
 
 
+async def _autopost_media_status_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    media = context.user_data.get("autopost_media") or []
+    await safe_send(
+        update,
+        f"✅ Медиа: {media_summary_ru(media)} ({len(media)}/{BROADCAST_MEDIA_MAX})\n"
+        "Ещё файл или <code>готово</code> / <code>skip</code>.",
+        parse_mode="HTML",
+    )
+
+
+async def _finalize_autopost_media_group(context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = context.job.data if context.job else {}
+    chat_id = data.get("chat_id")
+    user_id = data.get("user_id")
+    mgid = data.get("media_group_id")
+    if not chat_id or not user_id or not mgid:
+        return
+    buckets = context.application.bot_data.setdefault("ap_media_groups", {})
+    key = f"{user_id}:{mgid}"
+    payload = buckets.pop(key, None)
+    if not payload:
+        return
+    pending = context.application.bot_data.setdefault("ap_pending_merge", {})
+    pending[user_id] = payload
+    try:
+        media = payload.get("media") or []
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"✅ Альбом принят: {media_summary_ru(media)} ({len(media)}/{BROADCAST_MEDIA_MAX})\n"
+                "Ещё файл или напиши готово."
+            ),
+        )
+    except Exception:
+        logger.exception("finalize autopost media group notify")
+
+
+def _merge_pending_autopost_media(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    pending = context.application.bot_data.get("ap_pending_merge") or {}
+    payload = pending.pop(user_id, None)
+    if not payload:
+        buckets = context.application.bot_data.get("ap_media_groups") or {}
+        leftover_keys = [k for k in list(buckets.keys()) if k.startswith(f"{user_id}:")]
+        if leftover_keys:
+            key = leftover_keys[-1]
+            payload = buckets.pop(key, None)
+            for k in leftover_keys[:-1]:
+                buckets.pop(k, None)
+    if not payload:
+        return
+    for item in payload.get("media") or []:
+        append_autopost_media_item(context, item)
+    # Caption from album can supplement empty text, but autopost already has text from step 1.
+
+
 async def admin_autopost_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.photo:
-        context.user_data["autopost_photo"] = update.message.photo[-1].file_id
-    elif update.message.text.strip().lower() == "skip":
-        context.user_data["autopost_photo"] = ""
-    else:
-        await safe_send(update, "❌ Отправь фото или `skip`.")
+    if not update.message or not is_admin(update.effective_user.id):
+        return ADMIN_AUTOPOST_PHOTO_WAITING
+
+    uid = update.effective_user.id
+    _merge_pending_autopost_media(context, uid)
+
+    raw = (update.message.text or "").strip()
+    low = raw.lower()
+    if low in BROADCAST_DONE_WORDS or low == "skip":
+        if low == "skip":
+            context.user_data["autopost_media"] = []
+        media = context.user_data.get("autopost_media") or []
+        # legacy single photo field for old readers
+        first_photo = next((m["file_id"] for m in media if m["type"] == "photo"), "")
+        context.user_data["autopost_photo"] = first_photo
+        await safe_send(
+            update,
+            "🔗 Кнопки под постом: <b>каждая строка</b> <code>Текст | https://…</code>\n"
+            "Или одно слово <code>skip</code> — без кнопок.\n"
+            "Выйти: /cancel",
+            parse_mode="HTML",
+        )
+        return ADMIN_AUTOPOST_BUTTON_WAITING
+
+    mgid = update.message.media_group_id
+    media_item = extract_media_item_from_message(update.message)
+    if mgid and media_item:
+        buckets = context.application.bot_data.setdefault("ap_media_groups", {})
+        key = f"{uid}:{mgid}"
+        bucket = buckets.setdefault(key, {"media": []})
+        if not any(m.get("file_id") == media_item["file_id"] for m in bucket["media"]):
+            if len(bucket["media"]) < BROADCAST_MEDIA_MAX:
+                bucket["media"].append(media_item)
+        job_name = f"ap_mg_{uid}_{mgid}"
+        for job in context.application.job_queue.get_jobs_by_name(job_name):
+            job.schedule_removal()
+        context.application.job_queue.run_once(
+            _finalize_autopost_media_group,
+            when=BROADCAST_MEDIA_GROUP_DELAY_SEC,
+            data={"chat_id": update.effective_chat.id, "user_id": uid, "media_group_id": mgid},
+            name=job_name,
+        )
+        return ADMIN_AUTOPOST_PHOTO_WAITING
+
+    if media_item:
+        append_autopost_media_item(context, media_item)
+        await _autopost_media_status_reply(update, context)
         return ADMIN_AUTOPOST_PHOTO_WAITING
 
     await safe_send(
         update,
-        "🔗 Кнопки под постом: *каждая строка* `Текст | https://…`\n"
-        "Или одно слово `skip` — без кнопок.\n"
-        "Выйти: /cancel, /stop или «🛑 Прервать сценарий».",
-        parse_mode="Markdown",
+        "❌ Отправь фото/видео/GIF/стикер/альбом, или <code>skip</code> / <code>готово</code>.",
+        parse_mode="HTML",
     )
-    return ADMIN_AUTOPOST_BUTTON_WAITING
+    return ADMIN_AUTOPOST_PHOTO_WAITING
 
 
 async def admin_autopost_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6211,14 +6602,40 @@ async def admin_autopost_button(update: Update, context: ContextTypes.DEFAULT_TY
 
     await safe_send(
         update,
-        "⏱ *Расписание:*\n"
-        "• число *часов* между отправками (например `24`)\n"
-        "• или слово *время* — следующим сообщением строки `ЧЧ:ММ` "
-        "(*Екатеринбург*), например два раза в день:\n"
-        "`09:00`\n`21:00`",
-        parse_mode="Markdown",
+        "⏱ <b>Расписание:</b>\n"
+        "• число <b>часов</b> между отправками (например <code>24</code>)\n"
+        "• или слово <code>время</code> — следующим сообщением строки <code>ЧЧ:ММ</code> "
+        "(Екатеринбург)",
+        parse_mode="HTML",
     )
     return ADMIN_AUTOPOST_INTERVAL_WAITING
+
+
+def _autopost_insert_values(context: ContextTypes.DEFAULT_TYPE, admin_id: int) -> tuple:
+    text_value = context.user_data.get("autopost_text", "") or ""
+    media_items = list(context.user_data.get("autopost_media") or [])
+    photo = next((m["file_id"] for m in media_items if m["type"] == "photo"), "") or (
+        context.user_data.get("autopost_photo") or ""
+    )
+    media_json = json.dumps(media_items, ensure_ascii=False)
+    entities_json = json.dumps(context.user_data.get("autopost_entities") or [], ensure_ascii=False)
+    button_text = context.user_data.get("autopost_button_text", "")
+    button_url = context.user_data.get("autopost_button_url", "")
+    buttons_json = context.user_data.get("autopost_buttons_json", "[]")
+    return text_value, photo, media_json, entities_json, button_text, button_url, buttons_json, admin_id
+
+
+def _clear_autopost_user_data(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for key in (
+        "autopost_text",
+        "autopost_photo",
+        "autopost_media",
+        "autopost_entities",
+        "autopost_button_text",
+        "autopost_button_url",
+        "autopost_buttons_json",
+    ):
+        context.user_data.pop(key, None)
 
 
 async def admin_autopost_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6237,43 +6654,35 @@ async def admin_autopost_interval(update: Update, context: ContextTypes.DEFAULT_
 
     interval_hours = int(raw)
     next_send_at = now_iso()
-    text_value = context.user_data.get("autopost_text", "")
-    photo = context.user_data.get("autopost_photo", "")
-    button_text = context.user_data.get("autopost_button_text", "")
-    button_url = context.user_data.get("autopost_button_url", "")
-    buttons_json = context.user_data.get("autopost_buttons_json", "[]")
+    text_value, photo, media_json, entities_json, button_text, button_url, buttons_json, admin_id = _autopost_insert_values(
+        context, update.effective_user.id
+    )
 
     cursor.execute(
         """
         INSERT INTO auto_posts (
-            text_value, photo, button_text, button_url, buttons_json,
+            text_value, photo, media_json, text_entities_json, button_text, button_url, buttons_json,
             interval_hours, schedule_mode, clock_times_json, last_clock_slot_key,
             is_active, last_sent_at, next_send_at, sent_count, created_at, created_by
         )
-        VALUES (?, ?, ?, ?, ?, ?, 'interval', NULL, NULL, 1, NULL, ?, 0, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'interval', NULL, NULL, 1, NULL, ?, 0, ?, ?)
         """,
         (
             text_value,
             photo,
+            media_json,
+            entities_json,
             button_text,
             button_url,
             buttons_json,
             interval_hours,
             next_send_at,
             now_iso(),
-            update.effective_user.id,
+            admin_id,
         ),
     )
     conn.commit()
-
-    for key in (
-        "autopost_text",
-        "autopost_photo",
-        "autopost_button_text",
-        "autopost_button_url",
-        "autopost_buttons_json",
-    ):
-        context.user_data.pop(key, None)
+    _clear_autopost_user_data(context)
     await safe_send(update, "✅ Авто-рассылка создана и активирована.", reply_markup=admin_broadcast_keyboard())
     return ConversationHandler.END
 
@@ -6288,34 +6697,35 @@ async def admin_autopost_clock_times(update: Update, context: ContextTypes.DEFAU
         await safe_send(update, "❌ Нужна хотя бы одна строка с временем.")
         return ADMIN_AUTOPOST_CLOCK_TIMES
 
-    text_value = context.user_data.get("autopost_text", "")
-    photo = context.user_data.get("autopost_photo", "")
-    button_text = context.user_data.get("autopost_button_text", "")
-    button_url = context.user_data.get("autopost_button_url", "")
-    buttons_json = context.user_data.get("autopost_buttons_json", "[]")
+    text_value, photo, media_json, entities_json, button_text, button_url, buttons_json, admin_id = _autopost_insert_values(
+        context, update.effective_user.id
+    )
     clock_json = json.dumps(times, ensure_ascii=False)
 
     cursor.execute(
         """
         INSERT INTO auto_posts (
-            text_value, photo, button_text, button_url, buttons_json,
+            text_value, photo, media_json, text_entities_json, button_text, button_url, buttons_json,
             interval_hours, schedule_mode, clock_times_json, last_clock_slot_key,
             is_active, last_sent_at, next_send_at, sent_count, created_at, created_by
         )
-        VALUES (?, ?, ?, ?, ?, 24, 'clock', ?, NULL, 1, NULL, NULL, 0, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 24, 'clock', ?, NULL, 1, NULL, NULL, 0, ?, ?)
         """,
-        (text_value, photo, button_text, button_url, buttons_json, clock_json, now_iso(), update.effective_user.id),
+        (
+            text_value,
+            photo,
+            media_json,
+            entities_json,
+            button_text,
+            button_url,
+            buttons_json,
+            clock_json,
+            now_iso(),
+            admin_id,
+        ),
     )
     conn.commit()
-
-    for key in (
-        "autopost_text",
-        "autopost_photo",
-        "autopost_button_text",
-        "autopost_button_url",
-        "autopost_buttons_json",
-    ):
-        context.user_data.pop(key, None)
+    _clear_autopost_user_data(context)
     await safe_send(
         update,
         f"✅ Авто-рассылка по времени (Екатеринбург): {', '.join(times)}",
@@ -6336,12 +6746,14 @@ def _build_autopost_card_text(row) -> str:
         sent_count,
         schedule_mode,
         clock_json,
+        media_json,
     ) = row
     preview = (text_value or "").replace("\n", " ").strip()
     if len(preview) > 100:
         preview = preview[:100] + "…"
     status = "▶ Активна" if is_active else "⏸ На паузе"
-    photo_mark = "🖼 фото" if photo else "📄 только текст"
+    media_items = media_items_from_legacy_photo(photo, media_json)
+    photo_mark = media_summary_ru(media_items)
     sm = (schedule_mode or "interval").strip().lower()
     if sm == "clock" and (clock_json or "").strip():
         try:
@@ -6387,7 +6799,8 @@ def _fetch_autopost_row(post_id: int):
     cursor.execute(
         """
         SELECT post_id, text_value, photo, interval_hours, is_active, next_send_at, last_sent_at, sent_count,
-               COALESCE(schedule_mode, 'interval'), COALESCE(clock_times_json, '')
+               COALESCE(schedule_mode, 'interval'), COALESCE(clock_times_json, ''),
+               COALESCE(media_json, '[]')
         FROM auto_posts
         WHERE post_id = ?
         """,
@@ -6405,7 +6818,8 @@ async def admin_autopost_list_screen(update: Update, context: ContextTypes.DEFAU
     cursor.execute(
         """
         SELECT post_id, text_value, photo, interval_hours, is_active, next_send_at, last_sent_at, sent_count,
-               COALESCE(schedule_mode, 'interval'), COALESCE(clock_times_json, '')
+               COALESCE(schedule_mode, 'interval'), COALESCE(clock_times_json, ''),
+               COALESCE(media_json, '[]')
         FROM auto_posts
         ORDER BY post_id DESC
         """
@@ -6569,6 +6983,282 @@ async def admin_ref_giveaway_pick(update: Update, context: ContextTypes.DEFAULT_
     return ConversationHandler.END
 
 
+BROADCAST_MEDIA_MAX = 10
+BROADCAST_DONE_WORDS = frozenset({"готово", "далее", "done", "ok", "ок"})
+BROADCAST_MEDIA_GROUP_DELAY_SEC = 1.2
+
+
+def serialize_message_entities(entities) -> list[dict]:
+    if not entities:
+        return []
+    out: list[dict] = []
+    for ent in entities:
+        item: dict = {
+            "type": ent.type,
+            "offset": int(ent.offset),
+            "length": int(ent.length),
+        }
+        if getattr(ent, "url", None):
+            item["url"] = ent.url
+        if getattr(ent, "language", None):
+            item["language"] = ent.language
+        if getattr(ent, "custom_emoji_id", None):
+            item["custom_emoji_id"] = str(ent.custom_emoji_id)
+        user = getattr(ent, "user", None)
+        if user is not None and getattr(user, "id", None) is not None:
+            item["user_id"] = int(user.id)
+        out.append(item)
+    return out
+
+
+def deserialize_message_entities(raw) -> list[MessageEntity] | None:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    else:
+        data = raw
+    if not isinstance(data, list) or not data:
+        return None
+    entities: list[MessageEntity] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        ent_type = item.get("type")
+        if not ent_type:
+            continue
+        kwargs = {
+            "type": ent_type,
+            "offset": int(item.get("offset", 0)),
+            "length": int(item.get("length", 0)),
+        }
+        if item.get("url"):
+            kwargs["url"] = item["url"]
+        if item.get("language"):
+            kwargs["language"] = item["language"]
+        if item.get("custom_emoji_id"):
+            kwargs["custom_emoji_id"] = str(item["custom_emoji_id"])
+        try:
+            entities.append(MessageEntity(**kwargs))
+        except Exception:
+            logger.exception("deserialize_message_entities: skip entity %s", item)
+    return entities or None
+
+
+def extract_media_item_from_message(message) -> dict | None:
+    if message is None:
+        return None
+    if message.photo:
+        return {"type": "photo", "file_id": message.photo[-1].file_id}
+    if message.video:
+        return {"type": "video", "file_id": message.video.file_id}
+    if message.animation:
+        return {"type": "animation", "file_id": message.animation.file_id}
+    if message.sticker:
+        return {"type": "sticker", "file_id": message.sticker.file_id}
+    return None
+
+
+def parse_media_json(raw) -> list[dict]:
+    if isinstance(raw, list):
+        data = raw
+    else:
+        text = (raw or "").strip() or "[]"
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(data, list):
+        return []
+    out: list[dict] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        kind = (item.get("type") or "").strip().lower()
+        file_id = (item.get("file_id") or "").strip()
+        if kind in {"photo", "video", "animation", "sticker"} and file_id:
+            out.append({"type": kind, "file_id": file_id})
+    return out[:BROADCAST_MEDIA_MAX]
+
+
+def media_items_from_legacy_photo(photo: str | None, media_json_raw=None) -> list[dict]:
+    items = parse_media_json(media_json_raw)
+    if items:
+        return items
+    photo_id = (photo or "").strip()
+    if photo_id:
+        return [{"type": "photo", "file_id": photo_id}]
+    return []
+
+
+def media_summary_ru(media_items: list[dict]) -> str:
+    if not media_items:
+        return "без медиа"
+    counts: dict[str, int] = {}
+    for item in media_items:
+        counts[item["type"]] = counts.get(item["type"], 0) + 1
+    labels = {
+        "photo": "фото",
+        "video": "видео",
+        "animation": "GIF",
+        "sticker": "стикер",
+    }
+    parts = [f"{labels.get(k, k)}×{v}" for k, v in counts.items()]
+    return ", ".join(parts)
+
+
+def append_broadcast_media_item(context: ContextTypes.DEFAULT_TYPE, item: dict) -> list[dict]:
+    media = list(context.user_data.get("bc_media") or [])
+    if len(media) >= BROADCAST_MEDIA_MAX:
+        return media
+    # Avoid exact duplicates from media_group retries.
+    if not any(m.get("file_id") == item.get("file_id") for m in media):
+        media.append(item)
+    context.user_data["bc_media"] = media[:BROADCAST_MEDIA_MAX]
+    return context.user_data["bc_media"]
+
+
+def append_autopost_media_item(context: ContextTypes.DEFAULT_TYPE, item: dict) -> list[dict]:
+    media = list(context.user_data.get("autopost_media") or [])
+    if len(media) >= BROADCAST_MEDIA_MAX:
+        return media
+    if not any(m.get("file_id") == item.get("file_id") for m in media):
+        media.append(item)
+    context.user_data["autopost_media"] = media[:BROADCAST_MEDIA_MAX]
+    return context.user_data["autopost_media"]
+
+
+def _set_text_and_entities_from_message(context: ContextTypes.DEFAULT_TYPE, message, *, text_key: str, entities_key: str) -> None:
+    text = message.text or message.caption
+    if not text:
+        return
+    # Keep first non-empty text; albums may repeat empty captions.
+    if context.user_data.get(text_key):
+        return
+    context.user_data[text_key] = text
+    ents = message.entities if message.text else message.caption_entities
+    context.user_data[entities_key] = serialize_message_entities(ents)
+
+
+async def send_rich_broadcast_payload(
+    bot,
+    chat_id: int,
+    *,
+    text: str = "",
+    entities_raw=None,
+    media_items: list[dict] | None = None,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    """Отправка текста/медиа с сохранением custom_emoji entities, если Telegram это разрешает."""
+    text = text or ""
+    media_items = list(media_items or [])
+    entities = deserialize_message_entities(entities_raw)
+
+    album_types = {"photo", "video"}
+    album = [m for m in media_items if m["type"] in album_types][:BROADCAST_MEDIA_MAX]
+    stickers = [m for m in media_items if m["type"] == "sticker"]
+    animations = [m for m in media_items if m["type"] == "animation"]
+    markup_sent = False
+
+    async def _send_text_with_markup(force_markup: bool = False):
+        nonlocal markup_sent
+        if not text and not (force_markup and reply_markup and not markup_sent):
+            return
+        kwargs = {"chat_id": chat_id, "text": text or " "}
+        if entities and text:
+            kwargs["entities"] = entities
+        if reply_markup and not markup_sent:
+            kwargs["reply_markup"] = reply_markup
+            markup_sent = True
+        try:
+            await bot.send_message(**kwargs)
+        except Exception:
+            # Premium/custom emoji may be rejected — fallback without entities.
+            kwargs.pop("entities", None)
+            await bot.send_message(**kwargs)
+
+    for st in stickers:
+        await bot.send_sticker(chat_id=chat_id, sticker=st["file_id"])
+
+    for an in animations:
+        kwargs = {"chat_id": chat_id, "animation": an["file_id"]}
+        if text and not album:
+            kwargs["caption"] = text
+            if entities:
+                kwargs["caption_entities"] = entities
+            if reply_markup and not markup_sent:
+                kwargs["reply_markup"] = reply_markup
+                markup_sent = True
+            try:
+                await bot.send_animation(**kwargs)
+            except Exception:
+                kwargs.pop("caption_entities", None)
+                await bot.send_animation(**kwargs)
+            text = ""
+            entities = None
+        else:
+            await bot.send_animation(**kwargs)
+
+    if len(album) >= 2:
+        media_group = []
+        for idx, item in enumerate(album):
+            cap = text if idx == 0 and text else None
+            ents = entities if idx == 0 and text and entities else None
+            if item["type"] == "video":
+                media_obj = InputMediaVideo(media=item["file_id"], caption=cap, caption_entities=ents)
+            else:
+                media_obj = InputMediaPhoto(media=item["file_id"], caption=cap, caption_entities=ents)
+            media_group.append(media_obj)
+        try:
+            await bot.send_media_group(chat_id=chat_id, media=media_group)
+        except Exception:
+            # Retry album without caption entities (premium emoji may be rejected).
+            retry_group = []
+            for idx, item in enumerate(album):
+                cap = text if idx == 0 and text else None
+                if item["type"] == "video":
+                    retry_group.append(InputMediaVideo(media=item["file_id"], caption=cap))
+                else:
+                    retry_group.append(InputMediaPhoto(media=item["file_id"], caption=cap))
+            await bot.send_media_group(chat_id=chat_id, media=retry_group)
+        text = ""
+        entities = None
+        if reply_markup and not markup_sent:
+            await bot.send_message(chat_id=chat_id, text="👇", reply_markup=reply_markup)
+            markup_sent = True
+    elif len(album) == 1:
+        item = album[0]
+        if item["type"] == "video":
+            kwargs = {"chat_id": chat_id, "video": item["file_id"]}
+            send = bot.send_video
+        else:
+            kwargs = {"chat_id": chat_id, "photo": item["file_id"]}
+            send = bot.send_photo
+        if text:
+            kwargs["caption"] = text
+            if entities:
+                kwargs["caption_entities"] = entities
+        if reply_markup and not markup_sent:
+            kwargs["reply_markup"] = reply_markup
+            markup_sent = True
+        try:
+            await send(**kwargs)
+        except Exception:
+            kwargs.pop("caption_entities", None)
+            await send(**kwargs)
+        text = ""
+        entities = None
+
+    if text or (reply_markup and not markup_sent):
+        await _send_text_with_markup(force_markup=True)
+
+
 async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await safe_send(update, "⛔ У тебя нет доступа.")
@@ -6576,42 +7266,173 @@ async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TY
     if not update.message:
         return ConversationHandler.END
     context.user_data.clear()
+    context.user_data["bc_media"] = []
+    context.user_data["bc_text"] = ""
+    context.user_data["bc_entities"] = []
     await safe_send(
         update,
-        "📣 *Ручная рассылка*\n"
-        "Шаг 1/2: отправь *текст* или *фото с подписью*.\n\n"
-        "Шаг 2: кнопки под постом (несколько строк «Текст | URL») или `skip`.\n"
-        "Отмена: /cancel, /stop, /admin\\_stop или «🛑 Прервать сценарий».",
-        parse_mode="Markdown",
+        "📣 <b>Ручная рассылка</b>\n\n"
+        "Шаг 1: отправь контент — можно несколькими сообщениями:\n"
+        "• текст (в т.ч. с премиум-эмодзи, если Telegram разрешит боту)\n"
+        "• одно или несколько фото / альбом\n"
+        "• видео / GIF\n"
+        "• стикер\n\n"
+        "Когда всё готово — напиши <code>готово</code>.\n"
+        "Шаг 2: кнопки (<code>Текст | URL</code>) или <code>skip</code>.\n\n"
+        "Отмена: /cancel",
+        parse_mode="HTML",
     )
     return ADMIN_BROADCAST_WAITING
 
 
-async def admin_broadcast_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return ADMIN_BROADCAST_WAITING
-    text = update.message.text or update.message.caption or ""
-    photo = update.message.photo[-1].file_id if update.message.photo else ""
-    if not text and not photo:
-        await safe_send(update, "❌ Нужен текст или фото.")
-        return ADMIN_BROADCAST_WAITING
-    context.user_data["bc_text"] = text
-    context.user_data["bc_photo"] = photo
+async def _broadcast_content_status_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    media = context.user_data.get("bc_media") or []
+    text = context.user_data.get("bc_text") or ""
     await safe_send(
         update,
-        "Шаг 2: отправь кнопки — *каждая строка*: `Текст кнопки | https://…`\n"
-        "Или одно слово `skip` — без кнопок.",
-        parse_mode="Markdown",
+        f"✅ Принято.\n"
+        f"Текст: {'да' if text else 'нет'}\n"
+        f"Медиа: {media_summary_ru(media)} ({len(media)}/{BROADCAST_MEDIA_MAX})\n\n"
+        "Можно прислать ещё или напиши <code>готово</code>.",
+        parse_mode="HTML",
     )
-    return ADMIN_BROADCAST_BUTTONS_WAITING
+
+
+async def _finalize_broadcast_media_group(context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = context.job.data if context.job else {}
+    chat_id = data.get("chat_id")
+    user_id = data.get("user_id")
+    mgid = data.get("media_group_id")
+    if not chat_id or not user_id or not mgid:
+        return
+    # Conversation user_data is per-user; job runs in application context — use bot_data bridge.
+    buckets = context.application.bot_data.setdefault("bc_media_groups", {})
+    key = f"{user_id}:{mgid}"
+    payload = buckets.pop(key, None)
+    if not payload:
+        return
+    # Merge into a side store that admin_broadcast_content / ready can read via bot_data pending.
+    pending = context.application.bot_data.setdefault("bc_pending_merge", {})
+    pending[user_id] = payload
+    try:
+        media = payload.get("media") or []
+        text_mark = "да" if payload.get("text") else "нет"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"✅ Альбом принят.\n"
+                f"Текст/подпись: {text_mark}\n"
+                f"Медиа: {media_summary_ru(media)} ({len(media)}/{BROADCAST_MEDIA_MAX})\n\n"
+                "Можно прислать ещё или напиши готово."
+            ),
+        )
+    except Exception:
+        logger.exception("finalize broadcast media group notify")
+
+
+def _merge_pending_broadcast_media(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    pending = context.application.bot_data.get("bc_pending_merge") or {}
+    payload = pending.pop(user_id, None)
+    if not payload:
+        # Album still buffering — pull unfinished bucket.
+        buckets = context.application.bot_data.get("bc_media_groups") or {}
+        leftover_keys = [k for k in list(buckets.keys()) if k.startswith(f"{user_id}:")]
+        if leftover_keys:
+            # Prefer the newest bucket.
+            key = leftover_keys[-1]
+            payload = buckets.pop(key, None)
+            for k in leftover_keys[:-1]:
+                buckets.pop(k, None)
+    if not payload:
+        return
+    for item in payload.get("media") or []:
+        append_broadcast_media_item(context, item)
+    if payload.get("text") and not context.user_data.get("bc_text"):
+        context.user_data["bc_text"] = payload["text"]
+        context.user_data["bc_entities"] = payload.get("entities") or []
+
+
+async def admin_broadcast_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not is_admin(update.effective_user.id):
+        return ADMIN_BROADCAST_WAITING
+
+    uid = update.effective_user.id
+    _merge_pending_broadcast_media(context, uid)
+
+    raw_text = (update.message.text or "").strip()
+    low = raw_text.lower()
+    if low in BROADCAST_DONE_WORDS:
+        media = context.user_data.get("bc_media") or []
+        text = context.user_data.get("bc_text") or ""
+        if not text and not media:
+            await safe_send(update, "❌ Сначала отправь текст или медиа.")
+            return ADMIN_BROADCAST_WAITING
+        await safe_send(
+            update,
+            "Шаг 2: отправь кнопки — <b>каждая строка</b>: <code>Текст кнопки | https://…</code>\n"
+            "Или одно слово <code>skip</code> — без кнопок.",
+            parse_mode="HTML",
+        )
+        return ADMIN_BROADCAST_BUTTONS_WAITING
+
+    mgid = update.message.media_group_id
+    media_item = extract_media_item_from_message(update.message)
+
+    if mgid and media_item:
+        buckets = context.application.bot_data.setdefault("bc_media_groups", {})
+        key = f"{uid}:{mgid}"
+        bucket = buckets.setdefault(key, {"media": [], "text": "", "entities": []})
+        if not any(m.get("file_id") == media_item["file_id"] for m in bucket["media"]):
+            if len(bucket["media"]) < BROADCAST_MEDIA_MAX:
+                bucket["media"].append(media_item)
+        if (update.message.caption or "") and not bucket["text"]:
+            bucket["text"] = update.message.caption
+            bucket["entities"] = serialize_message_entities(update.message.caption_entities)
+        # Debounce finalize
+        job_name = f"bc_mg_{uid}_{mgid}"
+        for job in context.application.job_queue.get_jobs_by_name(job_name):
+            job.schedule_removal()
+        context.application.job_queue.run_once(
+            _finalize_broadcast_media_group,
+            when=BROADCAST_MEDIA_GROUP_DELAY_SEC,
+            data={"chat_id": update.effective_chat.id, "user_id": uid, "media_group_id": mgid},
+            name=job_name,
+        )
+        return ADMIN_BROADCAST_WAITING
+
+    if media_item:
+        media = append_broadcast_media_item(context, media_item)
+        if len(media) >= BROADCAST_MEDIA_MAX and media[-1].get("file_id") != media_item.get("file_id"):
+            await safe_send(update, f"❌ Максимум {BROADCAST_MEDIA_MAX} медиафайлов.")
+        _set_text_and_entities_from_message(context, update.message, text_key="bc_text", entities_key="bc_entities")
+        await _broadcast_content_status_reply(update, context)
+        return ADMIN_BROADCAST_WAITING
+
+    if raw_text:
+        # Plain text (may include premium custom emoji entities)
+        context.user_data["bc_text"] = update.message.text
+        context.user_data["bc_entities"] = serialize_message_entities(update.message.entities)
+        await _broadcast_content_status_reply(update, context)
+        return ADMIN_BROADCAST_WAITING
+
+    await safe_send(
+        update,
+        "❌ Нужен текст, фото, видео, GIF, стикер или альбом. Когда закончишь — <code>готово</code>.",
+        parse_mode="HTML",
+    )
+    return ADMIN_BROADCAST_WAITING
 
 
 async def admin_broadcast_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not is_admin(update.effective_user.id):
         return ConversationHandler.END
+
+    _merge_pending_broadcast_media(context, update.effective_user.id)
+
     raw = (update.message.text or "").strip()
     text = context.user_data.get("bc_text") or ""
-    photo = context.user_data.get("bc_photo") or ""
+    media_items = list(context.user_data.get("bc_media") or [])
+    entities = context.user_data.get("bc_entities") or []
 
     markup: InlineKeyboardMarkup | None = None
     if raw.lower() == "skip":
@@ -6626,6 +7447,10 @@ async def admin_broadcast_buttons(update: Update, context: ContextTypes.DEFAULT_
             return ADMIN_BROADCAST_BUTTONS_WAITING
         markup = giveaway_buttons_markup_from_json(json.dumps(parsed, ensure_ascii=False))
 
+    if not text and not media_items:
+        await safe_send(update, "❌ Нет контента для рассылки. Начни заново: /broadcast")
+        return ConversationHandler.END
+
     cursor.execute("SELECT user_id FROM users")
     user_ids = [row[0] for row in cursor.fetchall()]
 
@@ -6633,14 +7458,17 @@ async def admin_broadcast_buttons(update: Update, context: ContextTypes.DEFAULT_
     failed = 0
     blocked = 0
     reason_stats: dict[str, int] = {}
+    await safe_send(update, "⏳ Рассылаю… Это может занять время.")
     for user_id in user_ids:
         try:
-            if photo:
-                await context.bot.send_photo(
-                    chat_id=user_id, photo=photo, caption=text or None, reply_markup=markup
-                )
-            else:
-                await context.bot.send_message(chat_id=user_id, text=text, reply_markup=markup)
+            await send_rich_broadcast_payload(
+                context.bot,
+                user_id,
+                text=text,
+                entities_raw=entities,
+                media_items=media_items,
+                reply_markup=markup,
+            )
             sent += 1
         except Exception as e:
             failed += 1
@@ -6660,8 +7488,8 @@ async def admin_broadcast_buttons(update: Update, context: ContextTypes.DEFAULT_
     conn.commit()
     log_action(update.effective_user.id, "broadcast_manual", f"sent={sent};failed={failed};blocked={blocked}")
 
-    context.user_data.pop("bc_text", None)
-    context.user_data.pop("bc_photo", None)
+    for key in ("bc_text", "bc_photo", "bc_media", "bc_entities"):
+        context.user_data.pop(key, None)
     await safe_send(
         update,
         f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}\nБлокировок: {blocked}",
@@ -6833,7 +7661,7 @@ async def process_auto_posts(context: ContextTypes.DEFAULT_TYPE):
     cursor.execute(
         """
         SELECT post_id, text_value, photo, button_text, button_url, COALESCE(buttons_json, '') AS buttons_json,
-               interval_hours
+               interval_hours, COALESCE(media_json, '[]'), COALESCE(text_entities_json, '[]')
         FROM auto_posts
         WHERE is_active = 1
           AND COALESCE(schedule_mode, 'interval') = 'interval'
@@ -6847,7 +7675,8 @@ async def process_auto_posts(context: ContextTypes.DEFAULT_TYPE):
     cursor.execute(
         """
         SELECT post_id, text_value, photo, button_text, button_url, COALESCE(buttons_json, '') AS buttons_json,
-               COALESCE(clock_times_json, ''), COALESCE(last_clock_slot_key, '')
+               COALESCE(clock_times_json, ''), COALESCE(last_clock_slot_key, ''),
+               COALESCE(media_json, '[]'), COALESCE(text_entities_json, '[]')
         FROM auto_posts
         WHERE is_active = 1 AND COALESCE(schedule_mode, 'interval') = 'clock'
         ORDER BY post_id ASC
@@ -6859,7 +7688,18 @@ async def process_auto_posts(context: ContextTypes.DEFAULT_TYPE):
     for row in interval_posts:
         posts_to_run.append(("interval", row))
     for row in clock_posts:
-        post_id, text_value, photo, button_text, button_url, buttons_json, clock_raw, last_key = row
+        (
+            post_id,
+            text_value,
+            photo,
+            button_text,
+            button_url,
+            buttons_json,
+            clock_raw,
+            last_key,
+            media_json,
+            entities_json,
+        ) = row
         try:
             times_list = json.loads(clock_raw or "[]")
         except json.JSONDecodeError:
@@ -6879,13 +7719,34 @@ async def process_auto_posts(context: ContextTypes.DEFAULT_TYPE):
         if user_ids:
             for kind, row in posts_to_run:
                 if kind == "interval":
-                    post_id, text_value, photo, button_text, button_url, buttons_json, interval_hours = row
+                    (
+                        post_id,
+                        text_value,
+                        photo,
+                        button_text,
+                        button_url,
+                        buttons_json,
+                        interval_hours,
+                        media_json,
+                        entities_json,
+                    ) = row
                     last_key_update = None
                     next_send = (
                         datetime.now(timezone.utc) + timedelta(hours=interval_hours)
                     ).replace(microsecond=0).isoformat()
                 else:
-                    post_id, text_value, photo, button_text, button_url, buttons_json, _, _ = row
+                    (
+                        post_id,
+                        text_value,
+                        photo,
+                        button_text,
+                        button_url,
+                        buttons_json,
+                        _,
+                        _,
+                        media_json,
+                        entities_json,
+                    ) = row
                     last_key_update = slot_key
                     next_send = None
 
@@ -6894,17 +7755,18 @@ async def process_auto_posts(context: ContextTypes.DEFAULT_TYPE):
                 blocked = 0
                 reason_stats: dict[str, int] = {}
                 markup = autopost_reply_markup_from_row(buttons_json, button_text, button_url)
+                media_items = media_items_from_legacy_photo(photo, media_json)
 
                 for user_id in user_ids:
                     try:
-                        if photo:
-                            await context.bot.send_photo(
-                                chat_id=user_id, photo=photo, caption=text_value, reply_markup=markup
-                            )
-                        else:
-                            await context.bot.send_message(
-                                chat_id=user_id, text=text_value, reply_markup=markup
-                            )
+                        await send_rich_broadcast_payload(
+                            context.bot,
+                            user_id,
+                            text=text_value or "",
+                            entities_raw=entities_json,
+                            media_items=media_items,
+                            reply_markup=markup,
+                        )
                         sent += 1
                     except Exception as e:
                         failed += 1
@@ -8312,6 +9174,9 @@ ADMIN_ESCAPE_LABELS = frozenset(
         "📍 Точки самовывоза",
         "↩️ К розыгрышам",
         "📣 Авторассылка анонса",
+        "📊 Статистика розыгрыша",
+        "✏️ Текст и фото розыгрыша",
+        "👁 Предпросмотр розыгрыша",
         "👤 Админы",
         "📋 Кто админ",
         "👥 Пользователи (список)",
@@ -8379,6 +9244,15 @@ async def admin_escape_conversation(update: Update, context: ContextTypes.DEFAUL
         return ConversationHandler.END
     if text == "📣 Авторассылка анонса":
         await admin_giveaway_autobroadcast_panel(update, context)
+        return ConversationHandler.END
+    if text == "📊 Статистика розыгрыша":
+        await admin_giveaway_live_stats(update, context)
+        return ConversationHandler.END
+    if text == "✏️ Текст и фото розыгрыша":
+        await admin_giveaway_edit_panel(update, context)
+        return ConversationHandler.END
+    if text == "👁 Предпросмотр розыгрыша":
+        await admin_giveaway_preview(update, context)
         return ConversationHandler.END
     if text == "👥 Клиенты":
         await admin_open_clients(update, context)
@@ -8615,6 +9489,9 @@ def main():
             ADMIN_BROADCAST_WAITING: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_content),
                 MessageHandler(filters.PHOTO, admin_broadcast_content),
+                MessageHandler(filters.VIDEO, admin_broadcast_content),
+                MessageHandler(filters.ANIMATION, admin_broadcast_content),
+                MessageHandler(filters.Sticker.ALL, admin_broadcast_content),
             ],
             ADMIN_BROADCAST_BUTTONS_WAITING: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_buttons),
@@ -8825,6 +9702,23 @@ def main():
         fallbacks=[*ADMIN_CONV_FALLBACKS],
     )
 
+    edit_giveaway_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex(r"^📝 Изменить текст розыгрыша$"), admin_giveaway_edit_text_start),
+            MessageHandler(filters.Regex(r"^🖼 Изменить фото розыгрыша$"), admin_giveaway_edit_photo_start),
+        ],
+        states={
+            ADMIN_GIVEAWAY_EDIT_TEXT_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_giveaway_edit_text_save),
+            ],
+            ADMIN_GIVEAWAY_EDIT_PHOTO_WAITING: [
+                MessageHandler(filters.PHOTO, admin_giveaway_edit_photo_save),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_giveaway_edit_photo_save),
+            ],
+        },
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
+    )
+
     autopost_conv = ConversationHandler(
         entry_points=[
             CommandHandler("autopost", admin_autopost_start),
@@ -8834,6 +9728,9 @@ def main():
             ADMIN_AUTOPOST_TEXT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_autopost_text)],
             ADMIN_AUTOPOST_PHOTO_WAITING: [
                 MessageHandler(filters.PHOTO, admin_autopost_photo),
+                MessageHandler(filters.VIDEO, admin_autopost_photo),
+                MessageHandler(filters.ANIMATION, admin_autopost_photo),
+                MessageHandler(filters.Sticker.ALL, admin_autopost_photo),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_autopost_photo),
             ],
             ADMIN_AUTOPOST_BUTTON_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_autopost_button)],
@@ -8949,6 +9846,7 @@ def main():
     app.add_handler(create_giveaway_conv)
     app.add_handler(finish_giveaway_conv)
     app.add_handler(giveaway_autobroadcast_conv)
+    app.add_handler(edit_giveaway_conv)
     app.add_handler(admins_add_conv)
     app.add_handler(admins_remove_conv)
     app.add_handler(blacklist_conv)
@@ -8976,6 +9874,9 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^🛍 Редактор каталога$"), admin_open_catalog))
     app.add_handler(MessageHandler(filters.Regex(r"^📋 Активные авто-рассылки$"), admin_autopost_list_screen))
     app.add_handler(MessageHandler(filters.Regex(r"^🎁 Розыгрыши \(админ\)$"), admin_open_giveaways))
+    app.add_handler(MessageHandler(filters.Regex(r"^📊 Статистика розыгрыша$"), admin_giveaway_live_stats))
+    app.add_handler(MessageHandler(filters.Regex(r"^✏️ Текст и фото розыгрыша$"), admin_giveaway_edit_panel))
+    app.add_handler(MessageHandler(filters.Regex(r"^👁 Предпросмотр розыгрыша$"), admin_giveaway_preview))
     app.add_handler(MessageHandler(filters.Regex(r"^📣 Авторассылка анонса$"), admin_giveaway_autobroadcast_panel))
     app.add_handler(MessageHandler(filters.Regex(r"^🗑 Удалить розыгрыш \(тихо\)$"), admin_delete_giveaway_start))
     app.add_handler(MessageHandler(filters.Regex(r"^▶️ Включить авторассылку$"), admin_giveaway_autobroadcast_enable))
