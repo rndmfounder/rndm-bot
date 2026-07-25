@@ -59,6 +59,10 @@ DEFAULT_MANAGER_URL = f"tg://user?id={MANAGER_USER_ID}"
 ORDER_GROUP_ID = int(os.getenv("ORDER_GROUP_ID", "-1003913158040"))
 
 # Фиксированная доплата за доставку (после скидки на товары).
+# Сортировка каталога: популярные → новинки → слабые продажи (раз в неделю).
+ITEM_AUTOSORT_INTERVAL_DAYS = 7
+ITEM_NEW_DAYS = 14
+ITEM_SALES_LOOKBACK_DAYS = 30
 DELIVERY_FEE_RUB = 200
 
 # SQLite в каталоге контейнера без постоянного диска = после каждого деплоя НОВАЯ пустая база
@@ -930,6 +934,33 @@ ensure_column("auto_posts", "clock_times_json", "TEXT")
 ensure_column("auto_posts", "last_clock_slot_key", "TEXT")
 ensure_column("auto_posts", "media_json", "TEXT NOT NULL DEFAULT '[]'")
 ensure_column("auto_posts", "text_entities_json", "TEXT NOT NULL DEFAULT '[]'")
+ensure_column("items", "created_at", "TEXT")
+ensure_column("items", "manual_lock", "INTEGER NOT NULL DEFAULT 0")
+ensure_column("items", "sales_score", "INTEGER NOT NULL DEFAULT 0")
+
+if USE_POSTGRES:
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS order_items (
+            order_id BIGINT NOT NULL,
+            item_id BIGINT NOT NULL,
+            quantity INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (order_id, item_id)
+        )
+        """
+    )
+else:
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS order_items (
+            order_id INTEGER NOT NULL,
+            item_id INTEGER NOT NULL,
+            quantity INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (order_id, item_id)
+        )
+        """
+    )
+conn.commit()
 
 if USE_POSTGRES:
     cursor.execute(
@@ -1134,8 +1165,8 @@ if cursor.fetchone()[0] == 0:
     for item in DEFAULT_ITEMS:
         cursor.execute(
             """
-            INSERT INTO items (item_key, category_key, label, description, image, sort_order, price)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO items (item_key, category_key, label, description, image, sort_order, price, created_at, manual_lock, sales_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
             """,
             (
                 item["item_key"],
@@ -1145,9 +1176,16 @@ if cursor.fetchone()[0] == 0:
                 item["image"],
                 item["sort_order"],
                 item["price"],
+                now_iso(),
             ),
         )
     conn.commit()
+
+cursor.execute(
+    "UPDATE items SET created_at = ? WHERE created_at IS NULL OR TRIM(COALESCE(created_at, '')) = ''",
+    (now_iso(),),
+)
+conn.commit()
 
 cursor.execute("SELECT COUNT(*) FROM pickup_points")
 if cursor.fetchone()[0] == 0:
@@ -2334,23 +2372,30 @@ def get_next_item_order(category_key: str) -> int:
 def add_item(category_key: str, label: str, description: str, image: str, price: int) -> int:
     item_key = generate_unique_item_key(label)
     sort_order = get_next_item_order(category_key)
+    created = now_iso()
     if USE_POSTGRES:
         cursor.execute(
             """
-            INSERT INTO items (item_key, category_key, label, description, image, sort_order, price)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO items (
+                item_key, category_key, label, description, image, sort_order, price,
+                created_at, manual_lock, sales_score
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
             RETURNING item_id
             """,
-            (item_key, category_key, label, description, image, sort_order, price),
+            (item_key, category_key, label, description, image, sort_order, price, created),
         )
         new_item_id = cursor.fetchone()[0]
     else:
         cursor.execute(
             """
-            INSERT INTO items (item_key, category_key, label, description, image, sort_order, price)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO items (
+                item_key, category_key, label, description, image, sort_order, price,
+                created_at, manual_lock, sales_score
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
             """,
-            (item_key, category_key, label, description, image, sort_order, price),
+            (item_key, category_key, label, description, image, sort_order, price, created),
         )
         new_item_id = cursor.lastrowid
     conn.commit()
@@ -2423,6 +2468,238 @@ def move_item(item_id: int, direction: str) -> bool:
     cursor.execute("UPDATE items SET sort_order = ? WHERE item_id = ?", (current_order, neighbor_id))
     conn.commit()
     return True
+
+
+def save_order_items(order_id: int, items: list[dict], *, do_commit: bool = True) -> None:
+    """Сохраняет позиции заказа для подсчёта популярности."""
+    for item in items:
+        item_id = item.get("item_id")
+        qty = int(item.get("quantity") or 0)
+        if not item_id or qty <= 0:
+            continue
+        cursor.execute(
+            """
+            INSERT INTO order_items (order_id, item_id, quantity)
+            VALUES (?, ?, ?)
+            ON CONFLICT(order_id, item_id) DO UPDATE SET
+                quantity = order_items.quantity + EXCLUDED.quantity
+            """,
+            (order_id, int(item_id), qty),
+        )
+    if do_commit:
+        conn.commit()
+
+
+def get_item_sales_map(lookback_days: int = ITEM_SALES_LOOKBACK_DAYS) -> dict[int, int]:
+    """item_id -> суммарное количество штук за период (из order_items + fallback по label в старых заказах)."""
+    since = (datetime.now(timezone.utc) - timedelta(days=max(1, int(lookback_days)))).replace(microsecond=0).isoformat()
+    sales: dict[int, int] = {}
+
+    cursor.execute(
+        """
+        SELECT oi.item_id, COALESCE(SUM(oi.quantity), 0)
+        FROM order_items oi
+        JOIN orders o ON o.order_id = oi.order_id
+        WHERE o.created_at >= ?
+        GROUP BY oi.item_id
+        """,
+        (since,),
+    )
+    for item_id, qty in cursor.fetchall():
+        sales[int(item_id)] = int(qty or 0)
+
+    # Fallback: старые заказы без order_items — грубый разбор по названию.
+    cursor.execute(
+        """
+        SELECT o.order_id, o.items_text
+        FROM orders o
+        WHERE o.created_at >= ?
+          AND NOT EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = o.order_id)
+        """,
+        (since,),
+    )
+    old_orders = cursor.fetchall()
+    if old_orders:
+        cursor.execute("SELECT item_id, label FROM items")
+        label_to_ids: dict[str, list[int]] = {}
+        for item_id, label in cursor.fetchall():
+            key = (label or "").strip().lower()
+            if key:
+                label_to_ids.setdefault(key, []).append(int(item_id))
+
+        for _oid, items_text in old_orders:
+            for line in (items_text or "").splitlines():
+                line = line.strip()
+                if " — " not in line:
+                    continue
+                label_part, rest = line.split(" — ", 1)
+                label_key = label_part.strip().lower()
+                ids = label_to_ids.get(label_key)
+                if not ids:
+                    continue
+                qty = 1
+                m = re.search(r"(\d+)\s*шт", rest)
+                if m:
+                    qty = int(m.group(1))
+                # Если несколько товаров с одним именем — засчитываем первому.
+                sales[ids[0]] = sales.get(ids[0], 0) + qty
+
+    return sales
+
+
+def _item_age_days(created_at: str | None) -> int:
+    dt = _parse_iso_datetime(created_at) if created_at else None
+    if not dt:
+        return 9999
+    return max(0, int((datetime.now(timezone.utc) - dt).total_seconds() // 86400))
+
+
+def compute_item_sort_score(sales_qty: int, created_at: str | None) -> int:
+    """Выше score = выше в ассортименте: продажи, затем новинки, затем «неликвиды» вниз."""
+    age = _item_age_days(created_at)
+    is_new = age <= ITEM_NEW_DAYS
+    sales_qty = max(0, int(sales_qty or 0))
+    # Популярные >> новинки без продаж >> старые с нулём продаж.
+    novelty_bonus = 5_000 if is_new else 0
+    return sales_qty * 10_000 + novelty_bonus - age
+
+
+def recalculate_items_sort_orders(category_key: str | None = None) -> int:
+    """
+    Пересчитывает sort_order внутри категорий.
+    Закреплённые (manual_lock=1) остаются в своих «слотах», остальные переставляются по score.
+    Возвращает число затронутых товаров.
+    """
+    sales_map = get_item_sales_map(ITEM_SALES_LOOKBACK_DAYS)
+    if category_key:
+        categories = [category_key]
+    else:
+        cursor.execute("SELECT DISTINCT category_key FROM items")
+        categories = [row[0] for row in cursor.fetchall()]
+
+    touched = 0
+    for cat in categories:
+        cursor.execute(
+            """
+            SELECT item_id, COALESCE(manual_lock, 0), COALESCE(created_at, ''), sort_order
+            FROM items
+            WHERE category_key = ?
+            ORDER BY sort_order ASC, item_id ASC
+            """,
+            (cat,),
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            continue
+
+        unlocked = []
+        for item_id, locked, created_at, _sort in rows:
+            if int(locked or 0):
+                continue
+            score = compute_item_sort_score(sales_map.get(int(item_id), 0), created_at)
+            unlocked.append((score, int(item_id)))
+        unlocked.sort(key=lambda x: (-x[0], x[1]))
+        unlocked_ids = [item_id for _score, item_id in unlocked]
+        unlocked_iter = iter(unlocked_ids)
+
+        new_order: list[tuple[int, int, int]] = []  # item_id, sort_order, score
+        pos = 1
+        for item_id, locked, created_at, _sort in rows:
+            if int(locked or 0):
+                chosen = int(item_id)
+                score = compute_item_sort_score(sales_map.get(chosen, 0), created_at)
+            else:
+                chosen = next(unlocked_iter)
+                score = next(s for s, i in unlocked if i == chosen)
+            new_order.append((chosen, pos, score))
+            pos += 1
+
+        for item_id, sort_order, score in new_order:
+            cursor.execute(
+                "UPDATE items SET sort_order = ?, sales_score = ? WHERE item_id = ?",
+                (sort_order, int(score), item_id),
+            )
+            touched += 1
+
+    conn.commit()
+    return touched
+
+
+def toggle_item_manual_lock(item_id: int) -> bool | None:
+    """True=закреплён, False=снят, None=не найден."""
+    cursor.execute("SELECT COALESCE(manual_lock, 0) FROM items WHERE item_id = ?", (item_id,))
+    row = cursor.fetchone()
+    if not row:
+        return None
+    new_val = 0 if int(row[0] or 0) else 1
+    cursor.execute("UPDATE items SET manual_lock = ? WHERE item_id = ?", (new_val, item_id))
+    conn.commit()
+    return bool(new_val)
+
+
+def get_items_for_admin_sort(category_key: str):
+    cursor.execute(
+        """
+        SELECT item_id, label, sort_order, COALESCE(manual_lock, 0), COALESCE(sales_score, 0),
+               COALESCE(created_at, '')
+        FROM items
+        WHERE category_key = ?
+        ORDER BY sort_order ASC, label ASC
+        """,
+        (category_key,),
+    )
+    return cursor.fetchall()
+
+
+def build_admin_sort_panel(category_key: str) -> tuple[str, InlineKeyboardMarkup]:
+    rows = get_items_for_admin_sort(category_key)
+    cat_label = CATEGORY_LABELS.get(category_key, category_key)
+    sales_map = get_item_sales_map(ITEM_SALES_LOOKBACK_DAYS)
+    lines = [
+        f"↕️ <b>Порядок: {html.escape(cat_label)}</b>\n",
+        "Покупатель видит товары сверху вниз.",
+        "Автосортировка: популярные → новинки → слабые продажи.",
+        "📌 закрепляет позицию от автосортировки.\n",
+    ]
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    if not rows:
+        lines.append("В категории пока нет товаров.")
+    for item_id, label, sort_order, locked, _score, created_at in rows:
+        pin = "📌" if int(locked or 0) else "📍"
+        sold = sales_map.get(int(item_id), 0)
+        age = _item_age_days(created_at)
+        new_mark = " 🆕" if age <= ITEM_NEW_DAYS else ""
+        lines.append(
+            f"{sort_order}. {html.escape(label or '—')}{new_mark} "
+            f"— продаж {sold} шт · {pin}"
+        )
+        kb_rows.append(
+            [
+                InlineKeyboardButton("⬆️", callback_data=f"isort:up:{item_id}"),
+                InlineKeyboardButton("⬇️", callback_data=f"isort:down:{item_id}"),
+                InlineKeyboardButton(
+                    "📌 Снять" if int(locked or 0) else "📌 Закрепить",
+                    callback_data=f"isort:pin:{item_id}",
+                ),
+            ]
+        )
+    kb_rows.append(
+        [
+            InlineKeyboardButton("🔄 Пересчитать категорию", callback_data=f"isort:run:{category_key}"),
+            InlineKeyboardButton("♻️ Обновить", callback_data=f"isort:view:{category_key}"),
+        ]
+    )
+    kb_rows.append([InlineKeyboardButton("⬅️ К категориям", callback_data="isort:cats")])
+    return "\n".join(lines), InlineKeyboardMarkup(kb_rows)
+
+
+def build_admin_sort_categories_markup() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(CATEGORY_LABELS[key], callback_data=f"isort:view:{key}")]
+        for key in CATEGORY_ORDER
+    ]
+    rows.append([InlineKeyboardButton("🔄 Пересчитать весь каталог", callback_data="isort:run:all")])
+    return InlineKeyboardMarkup(rows)
 
 
 def get_pickup_points():
@@ -2668,6 +2945,7 @@ def admin_catalog_keyboard() -> ReplyKeyboardMarkup:
             ["📝 Изменить описание", "🖼 Изменить фото"],
             ["💰 Изменить цену", "🗑 Удалить кнопку"],
             ["📍 Точки самовывоза", "↕️ Порядок кнопок"],
+            ["🔄 Автосортировка каталога"],
             ["🖼 Фото категорий", "🗑 Удалить фото категории"],
             ["🏷 Акции категорий"],
             ["↩️ Админка"],
@@ -3794,6 +4072,9 @@ async def send_order_to_managers(context: ContextTypes.DEFAULT_TYPE, user, items
             ),
         )
         order_id = cursor.lastrowid
+
+    save_order_items(order_id, items, do_commit=False)
+
     conn.commit()
     log_action(user.id, "order_created", f"order_id={order_id};total={final_sum};type={order_type}")
 
@@ -8170,7 +8451,15 @@ async def admin_delete_item_select(update: Update, context: ContextTypes.DEFAULT
 async def admin_reorder_item_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-    await safe_send(update, "↕️ Выбери категорию.", reply_markup=admin_category_choice_keyboard())
+    await safe_send(
+        update,
+        "↕️ <b>Порядок товаров в ассортименте</b>\n\n"
+        "Выбери категорию. Дальше можно двигать ⬆️⬇️ и закреплять 📌.\n"
+        "Автосортировка (раз в неделю) не трогает закреплённые позиции.\n\n"
+        "Также можно по старинке: <code>НАЗВАНИЕ = up</code> / <code>down</code>.",
+        parse_mode="HTML",
+        reply_markup=admin_category_choice_keyboard(),
+    )
     return ADMIN_REORDER_ITEM_CATEGORY_WAITING
 
 
@@ -8182,16 +8471,19 @@ async def admin_reorder_item_category(update: Update, context: ContextTypes.DEFA
 
     items = get_items_by_category(category_key)
     if not items:
-        await safe_send(update, "❌ В этой категории пока нет кнопок.", reply_markup=admin_keyboard())
+        await safe_send(update, "❌ В этой категории пока нет кнопок.", reply_markup=admin_catalog_keyboard())
         return ConversationHandler.END
 
     context.user_data["reorder_category_key"] = category_key
-    text = "Отправь сообщение в формате:\n\nНАЗВАНИЕ КНОПКИ = up\nили\nНАЗВАНИЕ КНОПКИ = down\n\n"
-    text += "Текущий порядок:\n"
-    for item in items:
-        text += f"{item[6]}. {item[3]}\n"
-
-    await safe_send(update, text)
+    text, markup = build_admin_sort_panel(category_key)
+    await safe_send(update, text, parse_mode="HTML", reply_markup=markup)
+    await safe_send(
+        update,
+        "Или текст: <code>НАЗВАНИЕ = up</code> / <code>down</code>\n"
+        "Каталог: кнопка «↩️ Админка» / «🛍 Редактор каталога».",
+        parse_mode="HTML",
+        reply_markup=admin_catalog_keyboard(),
+    )
     return ADMIN_REORDER_ITEM_WAITING
 
 
@@ -8200,7 +8492,7 @@ async def admin_reorder_item_save(update: Update, context: ContextTypes.DEFAULT_
     raw = update.message.text.strip()
 
     if "=" not in raw:
-        await safe_send(update, "❌ Формат: НАЗВАНИЕ КНОПКИ = up/down")
+        await safe_send(update, "❌ Формат: НАЗВАНИЕ КНОПКИ = up/down\nИли пользуйся кнопками ⬆️⬇️ под списком.")
         return ADMIN_REORDER_ITEM_WAITING
 
     label, direction = [part.strip() for part in raw.split("=", 1)]
@@ -8220,9 +8512,138 @@ async def admin_reorder_item_save(update: Update, context: ContextTypes.DEFAULT_
         await safe_send(update, "⚠️ Дальше двигать уже некуда.")
         return ADMIN_REORDER_ITEM_WAITING
 
-    context.user_data.pop("reorder_category_key", None)
-    await safe_send(update, "✅ Порядок кнопок обновлён.", reply_markup=admin_keyboard())
-    return ConversationHandler.END
+    text, markup = build_admin_sort_panel(category_key)
+    await safe_send(update, "✅ Сдвинул.\n\n" + text, parse_mode="HTML", reply_markup=markup)
+    return ADMIN_REORDER_ITEM_WAITING
+
+
+async def admin_items_autosort_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    touched = recalculate_items_sort_orders()
+    set_setting("items_autosort_last_at", now_iso())
+    log_action(update.effective_user.id, "items_autosort_manual", f"touched={touched}")
+    await safe_send(
+        update,
+        f"🔄 Автосортировка выполнена.\n"
+        f"Обновлено позиций: <b>{touched}</b>\n"
+        f"Закреплённые (📌) остались на своих местах.\n\n"
+        f"Правило: популярные → новинки (≤{ITEM_NEW_DAYS} дн.) → слабые продажи.",
+        parse_mode="HTML",
+        reply_markup=admin_catalog_keyboard(),
+    )
+
+
+async def admin_item_sort_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.from_user or not is_admin(query.from_user.id):
+        return
+    raw = query.data if isinstance(query.data, str) else ""
+    parts = raw.split(":")
+    if len(parts) < 2 or parts[0] != "isort":
+        return
+
+    action = parts[1]
+
+    async def answer(text: str | None = None, *, show_alert: bool = False):
+        try:
+            await query.answer(text=text, show_alert=show_alert)
+        except Exception:
+            pass
+
+    if action == "cats":
+        await answer()
+        try:
+            await query.edit_message_text(
+                "↕️ Выбери категорию для сортировки:",
+                reply_markup=build_admin_sort_categories_markup(),
+            )
+        except Exception:
+            logger.exception("isort cats edit")
+        return
+
+    if action == "view" and len(parts) >= 3:
+        category_key = parts[2]
+        if category_key not in CATEGORY_LABELS:
+            await answer("Неизвестная категория", show_alert=True)
+            return
+        await answer()
+        text, markup = build_admin_sort_panel(category_key)
+        try:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            logger.exception("isort view edit")
+        return
+
+    if action == "run" and len(parts) >= 3:
+        target = parts[2]
+        if target == "all":
+            touched = recalculate_items_sort_orders()
+            set_setting("items_autosort_last_at", now_iso())
+            log_action(query.from_user.id, "items_autosort_manual", f"touched={touched};all=1")
+            await answer(f"Готово: {touched}", show_alert=True)
+            try:
+                await query.edit_message_text(
+                    f"🔄 Весь каталог пересчитан ({touched} позиций).\nВыбери категорию:",
+                    reply_markup=build_admin_sort_categories_markup(),
+                )
+            except Exception:
+                logger.exception("isort run all edit")
+            return
+        if target not in CATEGORY_LABELS:
+            await answer("Неизвестная категория", show_alert=True)
+            return
+        touched = recalculate_items_sort_orders(target)
+        set_setting("items_autosort_last_at", now_iso())
+        log_action(query.from_user.id, "items_autosort_manual", f"touched={touched};cat={target}")
+        await answer(f"Пересчитано: {touched}", show_alert=True)
+        text, markup = build_admin_sort_panel(target)
+        try:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            logger.exception("isort run cat edit")
+        return
+
+    if action in {"up", "down", "pin"} and len(parts) >= 3 and parts[2].isdigit():
+        item_id = int(parts[2])
+        item = get_item(item_id)
+        if not item:
+            await answer("Товар не найден", show_alert=True)
+            return
+        category_key = item[2]
+        if action == "pin":
+            locked = toggle_item_manual_lock(item_id)
+            await answer("Закреплено" if locked else "Снято", show_alert=False)
+        else:
+            ok = move_item(item_id, action)
+            if not ok:
+                await answer("Дальше некуда", show_alert=True)
+                return
+            await answer("Ок")
+        text, markup = build_admin_sort_panel(category_key)
+        try:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            logger.exception("isort move/pin edit")
+        return
+
+    await answer("Неизвестная команда", show_alert=True)
+
+
+async def process_item_autosort(context: ContextTypes.DEFAULT_TYPE):
+    """Еженедельный пересчёт порядка товаров (проверка каждый час)."""
+    last_raw = get_setting("items_autosort_last_at", "")
+    last_dt = _parse_iso_datetime(last_raw) if last_raw else None
+    now = datetime.now(timezone.utc)
+    if last_dt and (now - last_dt).total_seconds() < ITEM_AUTOSORT_INTERVAL_DAYS * 86400:
+        return
+    try:
+        touched = recalculate_items_sort_orders()
+        set_setting("items_autosort_last_at", now_iso())
+        log_action(None, "items_autosort_weekly", f"touched={touched}")
+        logger.info("Автосортировка каталога: обновлено %s позиций", touched)
+    except Exception:
+        logger.exception("process_item_autosort")
 
 
 async def admin_add_pickup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9155,6 +9576,7 @@ ADMIN_ESCAPE_LABELS = frozenset(
         "⬅️ Назад",
         "📣 Рассылки",
         "🛍 Редактор каталога",
+        "🔄 Автосортировка каталога",
         "🎁 Розыгрыши (админ)",
         "👥 Клиенты",
         "🔗 Ссылки и инфо",
@@ -9238,6 +9660,9 @@ async def admin_escape_conversation(update: Update, context: ContextTypes.DEFAUL
         return ConversationHandler.END
     if text == "🛍 Редактор каталога":
         await admin_open_catalog(update, context)
+        return ConversationHandler.END
+    if text == "🔄 Автосортировка каталога":
+        await admin_items_autosort_now(update, context)
         return ConversationHandler.END
     if text == "🎁 Розыгрыши (админ)":
         await admin_open_giveaways(update, context)
@@ -9410,6 +9835,7 @@ def main():
     app.add_handler(CallbackQueryHandler(giveaway_results_broadcast_callback, pattern=r"^gwb:\d+$"))
     app.add_handler(CallbackQueryHandler(giveaway_results_skip_callback, pattern=r"^gwx:\d+$"))
     app.add_handler(CallbackQueryHandler(autopost_manage_callback, pattern=r"^autopost_(pause|resume|delete):\d+$"))
+    app.add_handler(CallbackQueryHandler(admin_item_sort_callback, pattern=r"^isort:"))
 
     checkout_back_handler = CallbackQueryHandler(checkout_back, pattern=r"^checkout_back:\w+$")
     checkout_restart_handlers = [
@@ -9895,6 +10321,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^👥 Пользователи \(список\)$"), admin_users_preview))
     app.add_handler(MessageHandler(filters.Regex(r"^📥 Скачать пользователей$"), admin_users_export))
     app.add_handler(MessageHandler(filters.Regex(r"^📍 Точки самовывоза$"), admin_pickup_panel))
+    app.add_handler(MessageHandler(filters.Regex(r"^🔄 Автосортировка каталога$"), admin_items_autosort_now))
     app.add_handler(MessageHandler(filters.Regex(r"^📊 Статистика$"), admin_stats))
     app.add_handler(MessageHandler(filters.Regex(r"^📈 Аналитика PRO$"), admin_advanced_stats))
     app.add_handler(MessageHandler(filters.Regex(r"^⬅️ Назад$"), back_to_main))
@@ -9903,6 +10330,7 @@ def main():
 
     if app.job_queue:
         app.job_queue.run_repeating(process_auto_posts, interval=60, first=20)
+        app.job_queue.run_repeating(process_item_autosort, interval=3600, first=90)
 
     app.add_error_handler(error_handler)
 
