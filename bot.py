@@ -6720,7 +6720,7 @@ async def admin_autopost_start(update: Update, context: ContextTypes.DEFAULT_TYP
         update,
         "🤖 <b>Авто-рассылка</b> — по шагам:\n"
         "1) текст поста (можно с премиум-эмодзи)\n"
-        "2) медиа: фото/альбом/видео/GIF/стикер или <code>skip</code>, затем <code>готово</code>\n"
+        "2) фото (сразу дальше) / альбом+<code>готово</code> / <code>skip</code>\n"
         "3) кнопки: строки <code>Текст | https://…</code> или <code>skip</code>\n"
         "4) расписание: число <b>часов</b> или слово <code>время</code>\n\n"
         "Отправь <b>текст</b> первого поста.\n\n"
@@ -6739,11 +6739,9 @@ async def admin_autopost_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data["autopost_media"] = []
     await safe_send(
         update,
-        "🖼 Отправь медиа для поста:\n"
-        "• одно или несколько фото / альбом\n"
-        "• видео / GIF / стикер\n"
-        "• или <code>skip</code>, если медиа не нужно\n\n"
-        "Можно несколькими сообщениями. Когда закончишь — <code>готово</code>.\n"
+        "🖼 Отправь <b>фото</b> (или видео/GIF/стикер) для поста.\n"
+        "Альбом: пришли несколько фото, затем <code>готово</code>.\n"
+        "Без медиа — <code>skip</code>.\n\n"
         "Выйти: /cancel",
         parse_mode="HTML",
     )
@@ -6805,6 +6803,24 @@ def _merge_pending_autopost_media(context: ContextTypes.DEFAULT_TYPE, user_id: i
     # Caption from album can supplement empty text, but autopost already has text from step 1.
 
 
+async def _autopost_finish_media_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Переход с шага медиа на кнопки; уже принятые файлы не сбрасываем."""
+    _merge_pending_autopost_media(context, update.effective_user.id)
+    media = list(context.user_data.get("autopost_media") or [])
+    first_photo = next((m["file_id"] for m in media if m["type"] == "photo"), "")
+    context.user_data["autopost_photo"] = first_photo
+    media_line = media_summary_ru(media) if media else "без медиа"
+    await safe_send(
+        update,
+        f"✅ Медиа зафиксировано: <b>{media_line}</b>\n\n"
+        "🔗 Кнопки под постом: <b>каждая строка</b> <code>Текст | https://…</code>\n"
+        "Или одно слово <code>skip</code> — без кнопок.\n"
+        "Выйти: /cancel",
+        parse_mode="HTML",
+    )
+    return ADMIN_AUTOPOST_BUTTON_WAITING
+
+
 async def admin_autopost_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not is_admin(update.effective_user.id):
         return ADMIN_AUTOPOST_PHOTO_WAITING
@@ -6815,20 +6831,11 @@ async def admin_autopost_photo(update: Update, context: ContextTypes.DEFAULT_TYP
     raw = (update.message.text or "").strip()
     low = raw.lower()
     if low in BROADCAST_DONE_WORDS or low == "skip":
-        if low == "skip":
+        # Важно: skip больше НЕ чистит уже принятое фото.
+        # Раньше сценарий «фото → skip» (как шаг кнопок) затирал медиа → уходила только текст.
+        if low == "skip" and not (context.user_data.get("autopost_media") or []):
             context.user_data["autopost_media"] = []
-        media = context.user_data.get("autopost_media") or []
-        # legacy single photo field for old readers
-        first_photo = next((m["file_id"] for m in media if m["type"] == "photo"), "")
-        context.user_data["autopost_photo"] = first_photo
-        await safe_send(
-            update,
-            "🔗 Кнопки под постом: <b>каждая строка</b> <code>Текст | https://…</code>\n"
-            "Или одно слово <code>skip</code> — без кнопок.\n"
-            "Выйти: /cancel",
-            parse_mode="HTML",
-        )
-        return ADMIN_AUTOPOST_BUTTON_WAITING
+        return await _autopost_finish_media_step(update, context)
 
     mgid = update.message.media_group_id
     media_item = extract_media_item_from_message(update.message)
@@ -6852,12 +6859,13 @@ async def admin_autopost_photo(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if media_item:
         append_autopost_media_item(context, media_item)
-        await _autopost_media_status_reply(update, context)
-        return ADMIN_AUTOPOST_PHOTO_WAITING
+        # Одно фото/видео — сразу к кнопкам (привычный сценарий). Альбом ждёт «готово».
+        return await _autopost_finish_media_step(update, context)
 
     await safe_send(
         update,
-        "❌ Отправь фото/видео/GIF/стикер/альбом, или <code>skip</code> / <code>готово</code>.",
+        "❌ Отправь фото/видео/GIF/стикер/альбом.\n"
+        "Без медиа — <code>skip</code>. Для альбома после файлов — <code>готово</code>.",
         parse_mode="HTML",
     )
     return ADMIN_AUTOPOST_PHOTO_WAITING
@@ -7447,13 +7455,16 @@ async def send_rich_broadcast_payload(
     animations = [m for m in media_items if m["type"] == "animation"]
     markup_sent = False
 
-    async def _send_text_with_markup(force_markup: bool = False):
+    async def _send_text_with_markup(force_markup: bool = False, body: str | None = None, ents=None):
         nonlocal markup_sent
-        if not text and not (force_markup and reply_markup and not markup_sent):
+        body = text if body is None else body
+        if ents is None:
+            ents = entities
+        if not body and not (force_markup and reply_markup and not markup_sent):
             return
-        kwargs = {"chat_id": chat_id, "text": text or " "}
-        if entities and text:
-            kwargs["entities"] = entities
+        kwargs = {"chat_id": chat_id, "text": body or " "}
+        if ents and body:
+            kwargs["entities"] = ents
         if reply_markup and not markup_sent:
             kwargs["reply_markup"] = reply_markup
             markup_sent = True
@@ -7470,8 +7481,9 @@ async def send_rich_broadcast_payload(
     for an in animations:
         kwargs = {"chat_id": chat_id, "animation": an["file_id"]}
         if text and not album:
-            kwargs["caption"] = text
-            if entities:
+            use_caption = text if len(text) <= GIVEAWAY_PHOTO_CAPTION_MAX else text[: GIVEAWAY_PHOTO_CAPTION_MAX - 1] + "…"
+            kwargs["caption"] = use_caption
+            if entities and use_caption == text:
                 kwargs["caption_entities"] = entities
             if reply_markup and not markup_sent:
                 kwargs["reply_markup"] = reply_markup
@@ -7481,16 +7493,27 @@ async def send_rich_broadcast_payload(
             except Exception:
                 kwargs.pop("caption_entities", None)
                 await bot.send_animation(**kwargs)
-            text = ""
-            entities = None
+            if use_caption == text:
+                text = ""
+                entities = None
+            else:
+                # Полный текст отдельным сообщением
+                await _send_text_with_markup(body=text, ents=entities)
+                text = ""
+                entities = None
         else:
             await bot.send_animation(**kwargs)
 
     if len(album) >= 2:
         media_group = []
+        use_caption = None
+        use_ents = None
+        if text:
+            use_caption = text if len(text) <= GIVEAWAY_PHOTO_CAPTION_MAX else text[: GIVEAWAY_PHOTO_CAPTION_MAX - 1] + "…"
+            use_ents = entities if use_caption == text else None
         for idx, item in enumerate(album):
-            cap = text if idx == 0 and text else None
-            ents = entities if idx == 0 and text and entities else None
+            cap = use_caption if idx == 0 else None
+            ents = use_ents if idx == 0 else None
             if item["type"] == "video":
                 media_obj = InputMediaVideo(media=item["file_id"], caption=cap, caption_entities=ents)
             else:
@@ -7499,17 +7522,19 @@ async def send_rich_broadcast_payload(
         try:
             await bot.send_media_group(chat_id=chat_id, media=media_group)
         except Exception:
-            # Retry album without caption entities (premium emoji may be rejected).
             retry_group = []
             for idx, item in enumerate(album):
-                cap = text if idx == 0 and text else None
+                cap = use_caption if idx == 0 else None
                 if item["type"] == "video":
                     retry_group.append(InputMediaVideo(media=item["file_id"], caption=cap))
                 else:
                     retry_group.append(InputMediaPhoto(media=item["file_id"], caption=cap))
             await bot.send_media_group(chat_id=chat_id, media=retry_group)
+        leftover_text = text if use_caption != text else ""
         text = ""
         entities = None
+        if leftover_text:
+            await _send_text_with_markup(body=leftover_text, ents=deserialize_message_entities(entities_raw))
         if reply_markup and not markup_sent:
             await bot.send_message(chat_id=chat_id, text="👇", reply_markup=reply_markup)
             markup_sent = True
@@ -7521,20 +7546,42 @@ async def send_rich_broadcast_payload(
         else:
             kwargs = {"chat_id": chat_id, "photo": item["file_id"]}
             send = bot.send_photo
+        use_caption = None
         if text:
-            kwargs["caption"] = text
-            if entities:
+            use_caption = text if len(text) <= GIVEAWAY_PHOTO_CAPTION_MAX else text[: GIVEAWAY_PHOTO_CAPTION_MAX - 1] + "…"
+            kwargs["caption"] = use_caption
+            if entities and use_caption == text:
                 kwargs["caption_entities"] = entities
         if reply_markup and not markup_sent:
             kwargs["reply_markup"] = reply_markup
             markup_sent = True
+        photo_sent = False
         try:
             await send(**kwargs)
-        except Exception:
+            photo_sent = True
+        except Exception as first_err:
             kwargs.pop("caption_entities", None)
-            await send(**kwargs)
-        text = ""
-        entities = None
+            try:
+                await send(**kwargs)
+                photo_sent = True
+            except Exception:
+                logger.warning(
+                    "send_rich: media failed chat_id=%s type=%s err=%s",
+                    chat_id,
+                    item.get("type"),
+                    first_err,
+                )
+                # Фото не ушло — всё равно отправим текст ниже.
+                markup_sent = False if reply_markup else markup_sent
+        if photo_sent:
+            if use_caption == text:
+                text = ""
+                entities = None
+            else:
+                # Был укороченный caption — полный текст отдельно.
+                await _send_text_with_markup(body=text, ents=entities)
+                text = ""
+                entities = None
 
     if text or (reply_markup and not markup_sent):
         await _send_text_with_markup(force_markup=True)
