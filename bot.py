@@ -988,6 +988,32 @@ else:
     )
 conn.commit()
 
+# Разовое «мы тебя ждём» через 5 дней после единственного заказа.
+if USE_POSTGRES:
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reorder_followups (
+            user_id BIGINT PRIMARY KEY,
+            order_id BIGINT NOT NULL,
+            sent_at TEXT NOT NULL,
+            delivered INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+else:
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reorder_followups (
+            user_id INTEGER PRIMARY KEY,
+            order_id INTEGER NOT NULL,
+            sent_at TEXT NOT NULL,
+            delivered INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+conn.commit()
+ensure_column("reorder_followups", "delivered", "INTEGER NOT NULL DEFAULT 0")
+
 
 def migrate_promocode_usage_counters() -> None:
     """Одноразовая подгонка: лимит 1 раз, счётчик из флага used."""
@@ -1709,6 +1735,73 @@ def get_broadcast_recipient_user_ids() -> list[int]:
         """
     )
     return [row[0] for row in cursor.fetchall()]
+
+
+# Одноразовое напоминание: 1 заказ → через 5 дней короткое «мы тебя ждём» (без повторов).
+REORDER_FOLLOWUP_AFTER_DAYS = 5
+REORDER_FOLLOWUP_BATCH_LIMIT = 40
+REORDER_FOLLOWUP_TEXT = "Тебя давно не было у нас, мы тебя ждём ❤️"
+REORDER_FOLLOWUP_REPORT_HOUR = 21  # локальное время (Екатеринбург)
+
+
+def get_all_admin_ids() -> list[int]:
+    ids = set(ADMIN_IDS)
+    cursor.execute("SELECT user_id FROM extra_admins")
+    ids.update(int(row[0]) for row in cursor.fetchall())
+    return sorted(ids)
+
+
+def get_reorder_followup_candidates(limit: int = REORDER_FOLLOWUP_BATCH_LIMIT) -> list[tuple[int, int]]:
+    """Клиенты с ровно одним неотменённым заказом старше N дней, ещё без follow-up."""
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=REORDER_FOLLOWUP_AFTER_DAYS)
+    ).replace(microsecond=0).isoformat()
+    cursor.execute(
+        """
+        SELECT o.user_id, MAX(o.order_id) AS order_id
+        FROM orders o
+        WHERE COALESCE(o.status, 'new') != 'canceled'
+          AND NOT EXISTS (SELECT 1 FROM blacklist b WHERE b.user_id = o.user_id)
+          AND NOT EXISTS (SELECT 1 FROM reorder_followups r WHERE r.user_id = o.user_id)
+        GROUP BY o.user_id
+        HAVING COUNT(*) = 1 AND MAX(o.created_at) <= ?
+        ORDER BY MAX(o.created_at) ASC
+        LIMIT ?
+        """,
+        (cutoff, int(limit)),
+    )
+    return [(int(row[0]), int(row[1])) for row in cursor.fetchall()]
+
+
+def mark_reorder_followup_sent(user_id: int, order_id: int, delivered: bool) -> None:
+    cursor.execute(
+        """
+        INSERT INTO reorder_followups (user_id, order_id, sent_at, delivered)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO NOTHING
+        """,
+        (user_id, order_id, now_iso(), 1 if delivered else 0),
+    )
+    conn.commit()
+
+
+def count_reorder_followups_delivered_for_local_day(day) -> int:
+    """Сколько успешно доставлено за календарный день (Asia/Yekaterinburg)."""
+    start_local = datetime(day.year, day.month, day.day, tzinfo=BOT_DISPLAY_TZ)
+    end_local = start_local + timedelta(days=1)
+    start_utc = start_local.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+    end_utc = end_local.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+    cursor.execute(
+        """
+        SELECT COUNT(*) FROM reorder_followups
+        WHERE COALESCE(delivered, 0) = 1
+          AND sent_at >= ?
+          AND sent_at < ?
+        """,
+        (start_utc, end_utc),
+    )
+    row = cursor.fetchone()
+    return int(row[0] if row and row[0] is not None else 0)
 
 
 def giveaway_buttons_markup_from_json(buttons_json_raw: str | None) -> InlineKeyboardMarkup | None:
@@ -8693,6 +8786,71 @@ async def process_item_autosort(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("process_item_autosort")
 
 
+async def process_reorder_followups(context: ContextTypes.DEFAULT_TYPE):
+    """Разовое короткое сообщение клиентам с 1 заказом через 5 дней без повторного."""
+    try:
+        candidates = get_reorder_followup_candidates()
+    except Exception:
+        logger.exception("process_reorder_followups: select")
+        return
+    if not candidates:
+        return
+
+    sent = 0
+    failed = 0
+    for user_id, order_id in candidates:
+        delivered = False
+        try:
+            await context.bot.send_message(chat_id=user_id, text=REORDER_FOLLOWUP_TEXT)
+            delivered = True
+            sent += 1
+        except Exception as e:
+            failed += 1
+            msg = str(e).lower()
+            if "blocked" not in msg and "forbidden" not in msg and "chat not found" not in msg:
+                logger.warning("reorder_followup fail user=%s: %s", user_id, e)
+        # Помечаем и при ошибке доставки — иначе будет бесконечный ретрай одному и тому же.
+        try:
+            mark_reorder_followup_sent(user_id, order_id, delivered=delivered)
+        except Exception:
+            logger.exception("reorder_followup mark user=%s", user_id)
+
+    if sent or failed:
+        log_action(None, "reorder_followup", f"sent={sent};failed={failed}")
+        logger.info("Reorder follow-up: sent=%s failed=%s", sent, failed)
+
+
+async def process_reorder_followup_daily_report(context: ContextTypes.DEFAULT_TYPE):
+    """Раз в день (21:00 Екатеринбург) — админам: сколько человек получили напоминание."""
+    local = datetime.now(timezone.utc).astimezone(BOT_DISPLAY_TZ)
+    if local.hour != REORDER_FOLLOWUP_REPORT_HOUR:
+        return
+    day_key = local.date().isoformat()
+    if get_setting("reorder_followup_report_last_day", "") == day_key:
+        return
+
+    try:
+        delivered_count = count_reorder_followups_delivered_for_local_day(local.date())
+    except Exception:
+        logger.exception("process_reorder_followup_daily_report: count")
+        return
+
+    text = (
+        "📊 Отчёт: напоминание «мы тебя ждём»\n"
+        f"Дата: {local.strftime('%d.%m.%Y')}\n"
+        f"Получили сообщение: {delivered_count}"
+    )
+    for admin_id in get_all_admin_ids():
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=text)
+        except Exception as e:
+            logger.warning("reorder_followup report fail admin=%s: %s", admin_id, e)
+
+    set_setting("reorder_followup_report_last_day", day_key)
+    log_action(None, "reorder_followup_report", f"day={day_key};delivered={delivered_count}")
+    logger.info("Reorder follow-up daily report: day=%s delivered=%s", day_key, delivered_count)
+
+
 async def admin_add_pickup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
@@ -10378,6 +10536,8 @@ def main():
     if app.job_queue:
         app.job_queue.run_repeating(process_auto_posts, interval=60, first=20)
         app.job_queue.run_repeating(process_item_autosort, interval=3600, first=90)
+        app.job_queue.run_repeating(process_reorder_followups, interval=300, first=150)
+        app.job_queue.run_repeating(process_reorder_followup_daily_report, interval=600, first=180)
 
     app.add_error_handler(error_handler)
 
