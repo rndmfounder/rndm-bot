@@ -236,6 +236,7 @@ ADMIN_AUTOPOST_BUTTON_WAITING = next(_state)
 ADMIN_AUTOPOST_INTERVAL_WAITING = next(_state)
 ADMIN_BLACKLIST_WAITING = next(_state)
 ADMIN_CATEGORY_DISCOUNT_WAITING = next(_state)
+ADMIN_PRICE_HIKE_WAITING = next(_state)
 ADMIN_WELCOME_MENU_WAITING = next(_state)
 ADMIN_WELCOME_TEXT_WAITING = next(_state)
 ADMIN_WELCOME_PHOTO_WAITING = next(_state)
@@ -271,9 +272,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _safe_print(msg: str) -> None:
+    """Печать в stdout для Railway; на Windows cp1252 не падаем на кириллице."""
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        print(msg.encode("ascii", "replace").decode("ascii"), flush=True)
+
+
 # Отображение времени пользователям (заказы, история, промо): Екатеринбург (UTC+5).
 # В БД пишем UTC через now_iso(); старые строки без смещения считаем записанными в UTC (типично для сервера).
-BOT_DISPLAY_TZ = ZoneInfo("Asia/Yekaterinburg")
+try:
+    BOT_DISPLAY_TZ = ZoneInfo("Asia/Yekaterinburg")
+except Exception:
+    logger.warning("tzdata/Asia/Yekaterinburg недоступен — используем UTC+5")
+    BOT_DISPLAY_TZ = timezone(timedelta(hours=5))
 
 USE_POSTGRES = bool(DATABASE_URL)
 if USE_POSTGRES:
@@ -2096,19 +2110,147 @@ def is_user_blacklisted(user_id: int) -> bool:
     return cursor.fetchone() is not None
 
 
+def get_category_discounts_map() -> dict[str, int]:
+    cursor.execute("SELECT category_key, discount_percent FROM category_discounts")
+    result = {}
+    for category_key, discount_percent in cursor.fetchall():
+        pct = int(discount_percent or 0)
+        if pct > 0:
+            result[str(category_key)] = pct
+    return result
+
+
 def get_category_discount_percent(category_key: str) -> int:
     cursor.execute("SELECT discount_percent FROM category_discounts WHERE category_key = ?", (category_key,))
     row = cursor.fetchone()
     return int(row[0]) if row else 0
 
 
-def calc_discounted_price(base_price: int, category_key: str) -> int:
+def calc_discounted_price(base_price: int, category_key: str, discount: int | None = None) -> int:
     if base_price <= 0:
         return base_price
-    discount = get_category_discount_percent(category_key)
+    if discount is None:
+        discount = get_category_discount_percent(category_key)
     if discount <= 0:
         return base_price
     return max(int(round(base_price * (100 - discount) / 100.0)), 0)
+
+
+def strikethrough_plain(text: str) -> str:
+    """Зачёркивание без Markdown/HTML — работает в тексте сообщений и на inline-кнопках."""
+    return "".join(ch + "\u0336" for ch in str(text) if ch != "\n")
+
+
+def format_price_with_sale(
+    base_price: int,
+    sale_price: int,
+    *,
+    markdown: bool = False,
+    html_mode: bool = False,
+) -> str:
+    """Старая цена зачёркнута + новая со скидкой. html_mode — надёжное <s> в Telegram."""
+    if sale_price <= 0 and base_price <= 0:
+        return "Цена уточняется"
+    if base_price > 0 and sale_price > 0 and sale_price < base_price:
+        if html_mode:
+            old = html.escape(f"{base_price} ₽", quote=False)
+            new = html.escape(f"{sale_price} ₽", quote=False)
+            return f"<s>{old}</s> → <b>{new}</b>"
+        old = strikethrough_plain(f"{base_price} ₽")
+        new = f"{sale_price} ₽"
+        return f"{old} → *{new}*" if markdown else f"{old} → {new}"
+    return format_price(sale_price if sale_price > 0 else base_price)
+
+
+def clip_button_text(text: str, limit: int = 64) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - 1, 1)] + "…"
+
+
+def compute_hiked_price(price: int, percent: int) -> int:
+    if price <= 0 or percent <= 0:
+        return price
+    hiked = int(round(price * (100 + percent) / 100.0))
+    hiked = int(round(hiked / 10.0) * 10)
+    if hiked <= price:
+        hiked = price + 10
+    return hiked
+
+
+def set_category_discounts(category_keys: list[str], percent: int, admin_id: int) -> int:
+    now = now_iso()
+    changed = 0
+    for category_key in category_keys:
+        cursor.execute(
+            """
+            INSERT INTO category_discounts (category_key, discount_percent, updated_at, updated_by)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(category_key) DO UPDATE SET
+                discount_percent = EXCLUDED.discount_percent,
+                updated_at = EXCLUDED.updated_at,
+                updated_by = EXCLUDED.updated_by
+            """,
+            (category_key, percent, now, admin_id),
+        )
+        changed += 1
+    conn.commit()
+    return changed
+
+
+def raise_prices_in_categories(category_keys: list[str], percent: int) -> tuple[int, int]:
+    """Поднимает цены в базе. Возвращает (обновлено позиций, сумма прибавки ₽)."""
+    if not category_keys or percent <= 0:
+        return 0, 0
+    placeholders = ",".join("?" * len(category_keys))
+    cursor.execute(
+        f"SELECT item_id, price FROM items WHERE category_key IN ({placeholders}) AND price > 0",
+        tuple(category_keys),
+    )
+    rows = cursor.fetchall()
+    updated = 0
+    extra = 0
+    for item_id, price in rows:
+        old = int(price or 0)
+        new = compute_hiked_price(old, percent)
+        if new == old:
+            continue
+        cursor.execute("UPDATE items SET price = ? WHERE item_id = ?", (new, item_id))
+        updated += 1
+        extra += new - old
+    conn.commit()
+    return updated, extra
+
+
+def preview_price_hike(category_keys: list[str], percent: int, limit: int = 8) -> list[tuple[str, int, int]]:
+    if not category_keys:
+        return []
+    placeholders = ",".join("?" * len(category_keys))
+    cursor.execute(
+        f"""
+        SELECT label, price FROM items
+        WHERE category_key IN ({placeholders}) AND price > 0
+        ORDER BY label ASC
+        LIMIT ?
+        """,
+        (*category_keys, limit),
+    )
+    out = []
+    for label, price in cursor.fetchall():
+        old = int(price or 0)
+        out.append((str(label), old, compute_hiked_price(old, percent)))
+    return out
+
+
+def count_priced_items(category_keys: list[str]) -> int:
+    if not category_keys:
+        return 0
+    placeholders = ",".join("?" * len(category_keys))
+    cursor.execute(
+        f"SELECT COUNT(*) FROM items WHERE category_key IN ({placeholders}) AND price > 0",
+        tuple(category_keys),
+    )
+    return int(cursor.fetchone()[0] or 0)
 
 
 def rating_summary_for_user(user_id: int) -> tuple[float, int]:
@@ -2938,45 +3080,53 @@ def get_cart(user_id: int):
         (user_id,),
     )
     rows = cursor.fetchall()
+    discounts = get_category_discounts_map()
     result = []
     for item_id, quantity, label, base_price, category_key in rows:
-        price = calc_discounted_price(base_price, category_key)
-        result.append((item_id, quantity, label, price, category_key))
+        disc = discounts.get(category_key, 0)
+        price = calc_discounted_price(base_price, category_key, disc)
+        result.append((item_id, quantity, label, price, category_key, int(base_price or 0)))
     return result
 
 
 def cart_total(user_id: int) -> int:
     rows = get_cart(user_id)
-    return sum(price * quantity for _, quantity, _, price, _ in rows)
+    return sum(price * quantity for _, quantity, _, price, *_ in rows)
 
 
 def cart_text(user_id: int) -> str:
     rows = get_cart(user_id)
     if not rows:
-        return "🛒 *Корзина пока пустая.*"
+        return "🛒 <b>Корзина пока пустая.</b>"
 
     q_ok = get_qualified_referrals_count(user_id)
     tier_key, tier_em, ref_pct = referral_tier_from_qualified_count(q_ok)
     lines = [
-        "🛒 *ТВОЯ КОРЗИНА*\n",
-        f"{tier_em} *Ранг:* {tier_key} · скидка *{ref_pct}%* · в ранге друзей: *{q_ok}*\n",
+        "🛒 <b>ТВОЯ КОРЗИНА</b>\n",
+        f"{tier_em} <b>Ранг:</b> {html.escape(tier_key, quote=False)} · скидка <b>{ref_pct}%</b> · в ранге друзей: <b>{q_ok}</b>\n",
     ]
-    for _, quantity, label, price, _ in rows:
+    for _, quantity, label, price, _, base_price in rows:
+        unit = format_price_with_sale(base_price, price, html_mode=True)
+        safe_label = html.escape(str(label), quote=False)
         if price > 0:
-            lines.append(f"• {label} — {quantity} шт × {price} ₽ = {price * quantity} ₽")
+            lines.append(
+                f"• {safe_label} — {quantity} шт × {unit} = "
+                f"<b>{html.escape(f'{price * quantity} ₽', quote=False)}</b>"
+            )
         else:
-            lines.append(f"• {label} — {quantity} шт × цена уточняется")
+            lines.append(f"• {safe_label} — {quantity} шт × цена уточняется")
 
     total = cart_total(user_id)
     lines.append("")
-    lines.append(f"*Итого:* {format_price(total)}" if total > 0 else "*Итого:* цена уточняется")
+    total_s = html.escape(format_price(total), quote=False) if total > 0 else "цена уточняется"
+    lines.append(f"<b>Итого:</b> {total_s}")
     return "\n".join(lines)
 
 
 def cart_keyboard(user_id: int) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("✅ Оформить заказ", callback_data="cart_checkout")]]
 
-    for item_id, _, label, _, _ in get_cart(user_id):
+    for item_id, _, label, _, _, *_ in get_cart(user_id):
         rows.append([InlineKeyboardButton(f"❌ Удалить: {label}", callback_data=f"cart_remove:{item_id}")])
 
     rows.append([InlineKeyboardButton("🗑 Очистить корзину", callback_data="cart_clear")])
@@ -3040,7 +3190,7 @@ def admin_catalog_keyboard() -> ReplyKeyboardMarkup:
             ["📍 Точки самовывоза", "↕️ Порядок кнопок"],
             ["🔄 Автосортировка каталога"],
             ["🖼 Фото категорий", "🗑 Удалить фото категории"],
-            ["🏷 Акции категорий"],
+            ["🏷 Скидки на ассортимент", "📈 Поднять цены"],
             ["↩️ Админка"],
         ],
         resize_keyboard=True,
@@ -3265,7 +3415,14 @@ def admin_category_choice_keyboard() -> ReplyKeyboardMarkup:
 
 
 def category_menu_keyboard() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(CATEGORY_LABELS[key], callback_data=f"category:{key}")] for key in CATEGORY_ORDER]
+    discounts = get_category_discounts_map()
+    rows = []
+    for key in CATEGORY_ORDER:
+        title = CATEGORY_LABELS[key]
+        pct = discounts.get(key, 0)
+        if pct > 0:
+            title = clip_button_text(f"{title} · -{pct}%")
+        rows.append([InlineKeyboardButton(title, callback_data=f"category:{key}")])
     rows.append([InlineKeyboardButton("🛒 Открыть корзину", callback_data="cart_open")])
     return InlineKeyboardMarkup(rows)
 
@@ -3274,11 +3431,18 @@ def item_menu_keyboard(category_key: str) -> InlineKeyboardMarkup:
     rows = []
     category_discount = get_category_discount_percent(category_key)
     for item_id, _, _, label, _, _, _, base_price in get_items_by_category(category_key):
-        price = calc_discounted_price(base_price, category_key)
-        suffix = f" — {price} ₽" if price > 0 else ""
-        if category_discount > 0 and base_price > 0:
-            suffix += f" (-{category_discount}%)"
-        rows.append([InlineKeyboardButton(f"{label}{suffix}", callback_data=f"item:{item_id}")])
+        price = calc_discounted_price(base_price, category_key, category_discount)
+        if price > 0 and category_discount > 0 and base_price > 0 and price < base_price:
+            # На кнопках только unicode-зачёркивание (HTML/Markdown в label не работает).
+            old = strikethrough_plain(f"{base_price}₽")
+            suffix = f" — {old}→{price}₽"
+        elif price > 0:
+            suffix = f" — {price} ₽"
+        else:
+            suffix = ""
+        rows.append(
+            [InlineKeyboardButton(clip_button_text(f"{label}{suffix}"), callback_data=f"item:{item_id}")]
+        )
 
     rows.append([InlineKeyboardButton("🛒 Корзина", callback_data="cart_open")])
     rows.append([InlineKeyboardButton("⬅️ Назад к категориям", callback_data="assortment_menu")])
@@ -3649,7 +3813,15 @@ def build_manager_order_message_html(order_row: tuple, claimed_by_user) -> tuple
 
 async def open_category_view(target_message, category_key: str):
     category_title = CATEGORY_LABELS.get(category_key, "КАТЕГОРИЯ")
-    caption = f"📂 *{category_title}*\n\nВыбирай позицию ниже 👇"
+    discount = get_category_discount_percent(category_key)
+    if discount > 0:
+        sale_line = (
+            f"\n🔥 Акция <b>−{discount}%</b>: на кнопках "
+            f"<s>старая цена</s> → <b>новая</b>"
+        )
+    else:
+        sale_line = ""
+    caption = f"📂 <b>{html_esc(category_title)}</b>{sale_line}\n\nВыбирай позицию ниже 👇"
     reply_markup = item_menu_keyboard(category_key)
     category_image = get_category_image(category_key)
 
@@ -3658,7 +3830,7 @@ async def open_category_view(target_message, category_key: str):
             await target_message.reply_photo(
                 photo=category_image,
                 caption=caption,
-                parse_mode="Markdown",
+                parse_mode="HTML",
                 reply_markup=reply_markup,
             )
             return
@@ -3667,7 +3839,7 @@ async def open_category_view(target_message, category_key: str):
 
     await target_message.reply_text(
         caption,
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=reply_markup,
     )
 
@@ -3713,17 +3885,22 @@ async def show_item(query, item_id: int):
         return
 
     item_id, _, category_key, label, description, image, _, base_price = item
-    price = calc_discounted_price(base_price, category_key)
     discount = get_category_discount_percent(category_key)
+    price = calc_discounted_price(base_price, category_key, discount)
+    price_line = format_price_with_sale(base_price, price, html_mode=True)
     discount_line = ""
-    if discount > 0 and base_price > 0:
-        discount_line = f"\n🏷 Акция категории: -{discount}% (было {base_price} ₽)"
-    caption = f"*{label}*\n\n{description}\n\n💰 *Цена:* {format_price(price)}{discount_line}"
+    if discount > 0 and base_price > 0 and price < base_price:
+        discount_line = f"\n🏷 Скидка <b>−{discount}%</b>"
+    caption = (
+        f"<b>{html_esc(label)}</b>\n\n"
+        f"{html_esc(description)}\n\n"
+        f"💰 <b>Цена:</b> {price_line}{discount_line}"
+    )
 
     if not image:
         await query.message.reply_text(
             caption,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=item_card_keyboard(item_id, category_key),
         )
         return
@@ -3732,14 +3909,14 @@ async def show_item(query, item_id: int):
         await query.message.reply_photo(
             photo=image,
             caption=caption,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=item_card_keyboard(item_id, category_key),
         )
     except Exception:
         logger.exception("Ошибка при открытии товара item_id=%s, image=%s", item_id, image)
         await query.message.reply_text(
             f"{caption}\n\n⚠️ Фото товара не загрузилось.",
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=item_card_keyboard(item_id, category_key),
         )
 
@@ -3747,7 +3924,7 @@ async def show_item(query, item_id: int):
 async def open_cart_message(target_message, user_id: int):
     await target_message.reply_text(
         cart_text(user_id),
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=cart_keyboard(user_id),
     )
 
@@ -3918,15 +4095,17 @@ def collect_checkout_items(user_id: int, buy_now_item_id):
             "item_id": item[0],
             "label": item[3],
             "price": final_price,
+            "base_price": int(item[7] or 0),
             "quantity": 1,
         }]
 
     result = []
-    for item_id, quantity, label, price, _ in get_cart(user_id):
+    for item_id, quantity, label, price, _, base_price in get_cart(user_id):
         result.append({
             "item_id": item_id,
             "label": label,
             "price": price,
+            "base_price": int(base_price or 0),
             "quantity": quantity,
         })
     return result
@@ -3952,8 +4131,9 @@ def recalculate_checkout_totals(context: ContextTypes.DEFAULT_TYPE, user_id: int
 def build_items_text(items: list[dict]) -> str:
     lines = []
     for item in items:
+        unit = format_price_with_sale(int(item.get("base_price") or 0), int(item["price"] or 0), markdown=False)
         if item["price"] > 0:
-            lines.append(f'{item["label"]} — {item["quantity"]} шт × {item["price"]} ₽ = {item["quantity"] * item["price"]} ₽')
+            lines.append(f'{item["label"]} — {item["quantity"]} шт × {unit} = {item["quantity"] * item["price"]} ₽')
         else:
             lines.append(f'{item["label"]} — {item["quantity"]} шт × цена уточняется')
     return "\n".join(lines)
@@ -4535,7 +4715,7 @@ async def checkout_goto_step(query, context: ContextTypes.DEFAULT_TYPE, step: st
             context,
             query,
             cart_text(user.id),
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=cart_keyboard(user.id),
         )
         return ConversationHandler.END
@@ -5098,7 +5278,7 @@ async def show_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_send(
         update,
         cart_text(user.id),
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=cart_keyboard(user.id),
     )
 
@@ -6205,12 +6385,238 @@ async def admin_blacklist_manage(update: Update, context: ContextTypes.DEFAULT_T
     return ADMIN_BLACKLIST_WAITING
 
 
+CATALOG_PROMO_PERCENTS = (10, 15, 20, 25, 30, 40, 50)
+PRICE_HIKE_PERCENTS = (10, 15, 20, 25, 30, 40, 50)
+
+
+def _selected_catalog_keys(context: ContextTypes.DEFAULT_TYPE, data_key: str) -> list[str]:
+    keys = context.user_data.get(data_key) or []
+    return [k for k in keys if k in CATEGORY_LABELS]
+
+
+def _toggle_catalog_key(context: ContextTypes.DEFAULT_TYPE, data_key: str, category_key: str) -> None:
+    selected = _selected_catalog_keys(context, data_key)
+    if category_key in selected:
+        selected = [k for k in selected if k != category_key]
+    else:
+        selected.append(category_key)
+    context.user_data[data_key] = selected
+
+
+def format_current_discounts_text() -> str:
+    discounts = get_category_discounts_map()
+    lines = []
+    for key in CATEGORY_ORDER:
+        pct = discounts.get(key, 0)
+        mark = f"*-{pct}%*" if pct > 0 else "нет"
+        lines.append(f"• {CATEGORY_LABELS[key]} — {mark}")
+    return "\n".join(lines)
+
+
+def catalog_category_pick_keyboard(selected: list[str], prefix: str) -> InlineKeyboardMarkup:
+    selected_set = set(selected)
+    rows = []
+    for key in CATEGORY_ORDER:
+        mark = "✅" if key in selected_set else "☐"
+        rows.append(
+            [InlineKeyboardButton(f"{mark} {CATEGORY_LABELS[key]}", callback_data=f"{prefix}:t:{key}")]
+        )
+    all_on = bool(CATEGORY_ORDER) and all(k in selected_set for k in CATEGORY_ORDER)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "✅ Весь ассортимент" if all_on else "🛒 Весь ассортимент",
+                callback_data=f"{prefix}:all",
+            ),
+            InlineKeyboardButton("🧹 Сброс выбора", callback_data=f"{prefix}:none"),
+        ]
+    )
+    pct_row = []
+    percents = CATALOG_PROMO_PERCENTS if prefix == "cdisc" else PRICE_HIKE_PERCENTS
+    for pct in percents:
+        pct_row.append(InlineKeyboardButton(f"{pct}%", callback_data=f"{prefix}:p:{pct}"))
+        if len(pct_row) == 4:
+            rows.append(pct_row)
+            pct_row = []
+    if pct_row:
+        rows.append(pct_row)
+    if prefix == "cdisc":
+        rows.append([InlineKeyboardButton("🚫 Снять скидку с выбранных", callback_data=f"{prefix}:off")])
+    if prefix == "phike":
+        rows.append([InlineKeyboardButton("❌ Отмена", callback_data=f"{prefix}:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def catalog_discount_panel_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    selected = _selected_catalog_keys(context, "cdisc_keys")
+    if selected:
+        chosen = ", ".join(CATEGORY_LABELS[k] for k in selected)
+    else:
+        chosen = "пока ничего (отметь категории ниже)"
+    return (
+        "🏷 *Скидки на ассортимент*\n\n"
+        "Покупатель видит *зачёркнутую старую цену* и новую цену со скидкой.\n"
+        "Скидка считается от текущей цены в каталоге.\n\n"
+        "*Сейчас:*\n"
+        f"{format_current_discounts_text()}\n\n"
+        f"*Выбрано:* {chosen}\n\n"
+        "Отметь категории (можно несколько или весь ассортимент), затем нажми процент "
+        "или напиши число / `off`."
+    )
+
+
+def price_hike_panel_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    selected = _selected_catalog_keys(context, "phike_keys")
+    if selected:
+        chosen = ", ".join(CATEGORY_LABELS[k] for k in selected)
+        n = count_priced_items(selected)
+        extra = f"\nТоваров с ценой: *{n}*"
+    else:
+        chosen = "пока ничего"
+        extra = ""
+    pending = context.user_data.get("phike_pending_percent")
+    pending_line = ""
+    if pending:
+        pending_line = (
+            f"\n\n⚠️ Подтверди поднятие на *+{int(pending)}%*. "
+            "Это *навсегда меняет цену в базе*. Скидка будет считаться уже от новой цены."
+        )
+    return (
+        "📈 *Поднятие цен по категориям*\n\n"
+        "Меняет *базовую цену в каталоге* (например, при росте закупочных цен).\n\n"
+        f"*Выбрано:* {chosen}{extra}{pending_line}\n\n"
+        "Отметь категории, нажми процент или напиши число 1–100."
+    )
+
+
+def price_hike_keyboard(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    selected = _selected_catalog_keys(context, "phike_keys")
+    markup = catalog_category_pick_keyboard(selected, "phike")
+    pending = context.user_data.get("phike_pending_percent")
+    if pending:
+        rows = list(markup.inline_keyboard)
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"✅ Подтвердить +{int(pending)}%",
+                    callback_data="phike:ok",
+                ),
+                InlineKeyboardButton("↩️ Сбросить %", callback_data="phike:nop"),
+            ]
+        )
+        return InlineKeyboardMarkup(rows)
+    return markup
+
+
+def parse_admin_percent(raw: str, *, allow_off: bool, max_value: int = 95) -> tuple[int | None, str | None]:
+    text = (raw or "").strip().lower().replace("%", "").replace(" ", "")
+    if allow_off and text in ("off", "0", "нет", "снять"):
+        return 0, None
+    if text.isdigit():
+        value = int(text)
+        if 0 <= value <= max_value:
+            return value, None
+        return None, f"❌ Процент должен быть 0…{max_value}."
+    return None, "❌ Нужно число процента" + (" или off." if allow_off else ".")
+
+
+def _admin_actor_id(obj) -> int:
+    user = getattr(obj, "effective_user", None) or getattr(obj, "from_user", None)
+    return int(user.id) if user else 0
+
+
+async def _edit_admin_panel(query, text: str, markup: InlineKeyboardMarkup) -> None:
+    try:
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+    except Exception:
+        if query.message:
+            await query.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+
+
 async def admin_category_discount_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-    text = "🏷 Формат:\nКАТЕГОРИЯ = 20\nили\nКАТЕГОРИЯ = off\n\nДоступно:\n"
-    text += "\n".join([f"• {v}" for v in CATEGORY_LABELS.values()])
-    await safe_send(update, text)
+    context.user_data["cdisc_keys"] = list(CATEGORY_ORDER)
+    await safe_send(
+        update,
+        catalog_discount_panel_text(context),
+        parse_mode="Markdown",
+        reply_markup=catalog_category_pick_keyboard(context.user_data["cdisc_keys"], "cdisc"),
+    )
+    return ADMIN_CATEGORY_DISCOUNT_WAITING
+
+
+async def _apply_selected_discounts(update, context, percent: int, *, from_query=False) -> int:
+    selected = _selected_catalog_keys(context, "cdisc_keys")
+    if not selected:
+        msg = "❌ Сначала отметь категории или «Весь ассортимент»."
+        if from_query:
+            try:
+                await update.answer(msg, show_alert=True)
+            except Exception:
+                if getattr(update, "message", None):
+                    await update.message.reply_text(msg)
+        else:
+            await safe_send(update, msg)
+        return ADMIN_CATEGORY_DISCOUNT_WAITING
+    set_category_discounts(selected, percent, _admin_actor_id(update))
+    names = ", ".join(CATEGORY_LABELS[k] for k in selected)
+    log_action(
+        _admin_actor_id(update),
+        "category_discount",
+        f"keys={','.join(selected)};percent={percent}",
+    )
+    if from_query:
+        try:
+            await update.answer("Готово")
+        except Exception:
+            pass
+    if percent <= 0:
+        done = f"✅ Скидка снята: {names}"
+    else:
+        done = f"✅ Скидка *-{percent}%* для: {names}"
+    markup = catalog_category_pick_keyboard(selected, "cdisc")
+    text = catalog_discount_panel_text(context) + f"\n\n{done}"
+    if from_query:
+        await _edit_admin_panel(update, text, markup)
+    else:
+        await safe_send(update, text, parse_mode="Markdown", reply_markup=markup)
+    return ADMIN_CATEGORY_DISCOUNT_WAITING
+
+
+async def admin_category_discount_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not is_admin(update.effective_user.id):
+        return ADMIN_CATEGORY_DISCOUNT_WAITING
+    data = (query.data or "")[len("cdisc:") :]
+    if data in ("off",) or data.startswith("p:"):
+        pass
+    else:
+        try:
+            await query.answer()
+        except Exception:
+            pass
+    if data == "all":
+        context.user_data["cdisc_keys"] = list(CATEGORY_ORDER)
+    elif data == "none":
+        context.user_data["cdisc_keys"] = []
+    elif data.startswith("t:"):
+        key = data[2:]
+        if key in CATEGORY_LABELS:
+            _toggle_catalog_key(context, "cdisc_keys", key)
+    elif data == "off":
+        return await _apply_selected_discounts(query, context, 0, from_query=True)
+    elif data.startswith("p:"):
+        raw = data[2:]
+        if raw.isdigit():
+            return await _apply_selected_discounts(query, context, int(raw), from_query=True)
+    else:
+        return ADMIN_CATEGORY_DISCOUNT_WAITING
+    await _edit_admin_panel(
+        query,
+        catalog_discount_panel_text(context),
+        catalog_category_pick_keyboard(_selected_catalog_keys(context, "cdisc_keys"), "cdisc"),
+    )
     return ADMIN_CATEGORY_DISCOUNT_WAITING
 
 
@@ -6219,37 +6625,184 @@ async def admin_category_discount_save(update: Update, context: ContextTypes.DEF
     nav = normalized_reply_keyboard_text(raw)
     if is_broadcast_autopost_nav(nav):
         return await reply_broadcast_nav_stuck_hint(update, context)
-    if "=" not in raw:
-        await safe_send(update, "❌ Формат: КАТЕГОРИЯ = 20 / off")
+    if "=" in raw:
+        label, value = [x.strip() for x in raw.split("=", 1)]
+        category_key = parse_category_from_label(label)
+        if not category_key:
+            await safe_send(update, "❌ Категория не найдена.")
+            return ADMIN_CATEGORY_DISCOUNT_WAITING
+        percent, err = parse_admin_percent(value, allow_off=True, max_value=95)
+        if err:
+            await safe_send(update, err)
+            return ADMIN_CATEGORY_DISCOUNT_WAITING
+        context.user_data["cdisc_keys"] = [category_key]
+        return await _apply_selected_discounts(update, context, int(percent))
+    percent, err = parse_admin_percent(raw, allow_off=True, max_value=95)
+    if err:
+        await safe_send(update, err + "\nМожно также: `КАТЕГОРИЯ = 20` или `КАТЕГОРИЯ = off`.")
         return ADMIN_CATEGORY_DISCOUNT_WAITING
-    label, value = [x.strip() for x in raw.split("=", 1)]
-    category_key = parse_category_from_label(label)
-    if not category_key:
-        await safe_send(update, "❌ Категория не найдена.")
-        return ADMIN_CATEGORY_DISCOUNT_WAITING
+    return await _apply_selected_discounts(update, context, int(percent))
 
-    if value.lower() == "off":
-        percent = 0
-    elif value.isdigit() and 0 <= int(value) <= 95:
-        percent = int(value)
-    else:
-        await safe_send(update, "❌ Процент должен быть 0..95 или off.")
-        return ADMIN_CATEGORY_DISCOUNT_WAITING
 
-    cursor.execute(
-        """
-        INSERT INTO category_discounts (category_key, discount_percent, updated_at, updated_by)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(category_key) DO UPDATE SET
-            discount_percent = EXCLUDED.discount_percent,
-            updated_at = EXCLUDED.updated_at,
-            updated_by = EXCLUDED.updated_by
-        """,
-        (category_key, percent, now_iso(), update.effective_user.id),
+async def admin_price_hike_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    context.user_data["phike_keys"] = []
+    context.user_data.pop("phike_pending_percent", None)
+    await safe_send(
+        update,
+        price_hike_panel_text(context),
+        parse_mode="Markdown",
+        reply_markup=price_hike_keyboard(context),
     )
-    conn.commit()
-    await safe_send(update, f"✅ Акция для {CATEGORY_LABELS[category_key]}: -{percent}%")
-    return ADMIN_CATEGORY_DISCOUNT_WAITING
+    return ADMIN_PRICE_HIKE_WAITING
+
+
+def _price_hike_preview_block(selected: list[str], percent: int) -> str:
+    samples = preview_price_hike(selected, percent)
+    n = count_priced_items(selected)
+    lines = [
+        f"Будет поднято позиций: *{n}*",
+        f"Наценка: *+{percent}%* (округление до 10 ₽)",
+        "",
+        "*Примеры:*",
+    ]
+    if not samples:
+        lines.append("нет товаров с ценой в выбранных категориях")
+    for label, old, new in samples:
+        lines.append(f"• {label}: {old} ₽ → *{new} ₽*")
+    return "\n".join(lines)
+
+
+async def _prepare_price_hike(update, context, percent: int, *, from_query=False) -> int:
+    selected = _selected_catalog_keys(context, "phike_keys")
+    if not selected:
+        msg = "❌ Сначала отметь категории или «Весь ассортимент»."
+        if from_query:
+            await update.answer(msg, show_alert=True)
+        else:
+            await safe_send(update, msg)
+        return ADMIN_PRICE_HIKE_WAITING
+    if percent <= 0:
+        msg = "❌ Процент поднятия должен быть больше 0."
+        if from_query:
+            await update.answer(msg, show_alert=True)
+        else:
+            await safe_send(update, msg)
+        return ADMIN_PRICE_HIKE_WAITING
+    context.user_data["phike_pending_percent"] = percent
+    if from_query:
+        try:
+            await update.answer()
+        except Exception:
+            pass
+    text = price_hike_panel_text(context) + "\n\n" + _price_hike_preview_block(selected, percent)
+    markup = price_hike_keyboard(context)
+    if from_query:
+        await _edit_admin_panel(update, text, markup)
+    else:
+        await safe_send(update, text, parse_mode="Markdown", reply_markup=markup)
+    return ADMIN_PRICE_HIKE_WAITING
+
+
+async def _confirm_price_hike(update, context, *, from_query=False) -> int:
+    selected = _selected_catalog_keys(context, "phike_keys")
+    percent = int(context.user_data.get("phike_pending_percent") or 0)
+    if not selected or percent <= 0:
+        msg = "❌ Нет подтверждения: выбери категории и процент."
+        if from_query:
+            await update.answer(msg, show_alert=True)
+        else:
+            await safe_send(update, msg)
+        return ADMIN_PRICE_HIKE_WAITING
+    updated, extra = raise_prices_in_categories(selected, percent)
+    names = ", ".join(CATEGORY_LABELS[k] for k in selected)
+    log_action(
+        _admin_actor_id(update),
+        "price_hike",
+        f"keys={','.join(selected)};percent={percent};updated={updated};extra={extra}",
+    )
+    context.user_data.pop("phike_pending_percent", None)
+    if from_query:
+        try:
+            await update.answer("Цены обновлены")
+        except Exception:
+            pass
+    done = (
+        f"✅ Цены подняты на *+{percent}%*\n"
+        f"Категории: {names}\n"
+        f"Обновлено позиций: *{updated}*\n"
+        f"Суммарная прибавка по позициям: *{extra} ₽*"
+    )
+    text = price_hike_panel_text(context) + f"\n\n{done}"
+    markup = price_hike_keyboard(context)
+    if from_query:
+        await _edit_admin_panel(update, text, markup)
+    else:
+        await safe_send(update, text, parse_mode="Markdown", reply_markup=markup)
+    return ADMIN_PRICE_HIKE_WAITING
+
+
+async def admin_price_hike_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not is_admin(update.effective_user.id):
+        return ADMIN_PRICE_HIKE_WAITING
+    data = (query.data or "")[len("phike:") :]
+    if data == "cancel":
+        try:
+            await query.answer("Отменено")
+        except Exception:
+            pass
+        context.user_data.pop("phike_keys", None)
+        context.user_data.pop("phike_pending_percent", None)
+        await _edit_admin_panel(query, "📈 Поднятие цен отменено.", InlineKeyboardMarkup([]))
+        return ConversationHandler.END
+    if not (data.startswith("p:") or data in ("ok",)):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+    if data == "all":
+        context.user_data["phike_keys"] = list(CATEGORY_ORDER)
+        context.user_data.pop("phike_pending_percent", None)
+    elif data == "none":
+        context.user_data["phike_keys"] = []
+        context.user_data.pop("phike_pending_percent", None)
+    elif data.startswith("t:"):
+        key = data[2:]
+        if key in CATEGORY_LABELS:
+            _toggle_catalog_key(context, "phike_keys", key)
+            context.user_data.pop("phike_pending_percent", None)
+    elif data.startswith("p:"):
+        raw = data[2:]
+        if raw.isdigit():
+            return await _prepare_price_hike(query, context, int(raw), from_query=True)
+    elif data == "ok":
+        return await _confirm_price_hike(query, context, from_query=True)
+    elif data == "nop":
+        context.user_data.pop("phike_pending_percent", None)
+    else:
+        return ADMIN_PRICE_HIKE_WAITING
+    await _edit_admin_panel(query, price_hike_panel_text(context), price_hike_keyboard(context))
+    return ADMIN_PRICE_HIKE_WAITING
+
+
+async def admin_price_hike_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = (update.message.text or "").strip()
+    nav = normalized_reply_keyboard_text(raw)
+    if is_broadcast_autopost_nav(nav):
+        return await reply_broadcast_nav_stuck_hint(update, context)
+    lowered = raw.lower()
+    if lowered in ("да", "yes", "ок", "ok", "подтвердить"):
+        return await _confirm_price_hike(update, context)
+    percent, err = parse_admin_percent(raw, allow_off=False, max_value=100)
+    if err or percent is None:
+        await safe_send(update, "❌ Напиши процент 1–100 или «да» для подтверждения.")
+        return ADMIN_PRICE_HIKE_WAITING
+    if percent <= 0:
+        await safe_send(update, "❌ Процент поднятия должен быть больше 0.")
+        return ADMIN_PRICE_HIKE_WAITING
+    return await _prepare_price_hike(update, context, percent)
 
 
 async def admin_create_giveaway_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10391,9 +10944,32 @@ def main():
     )
 
     category_discount_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^🏷 Акции категорий$"), admin_category_discount_start)],
-        states={ADMIN_CATEGORY_DISCOUNT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_category_discount_save)]},
+        entry_points=[
+            MessageHandler(
+                filters.Regex(r"^🏷 (Скидки на ассортимент|Акции категорий)$"),
+                admin_category_discount_start,
+            )
+        ],
+        states={
+            ADMIN_CATEGORY_DISCOUNT_WAITING: [
+                CallbackQueryHandler(admin_category_discount_callback, pattern=r"^cdisc:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_category_discount_save),
+            ]
+        },
         fallbacks=[*ADMIN_CONV_FALLBACKS],
+        allow_reentry=True,
+    )
+
+    price_hike_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^📈 Поднять цены$"), admin_price_hike_start)],
+        states={
+            ADMIN_PRICE_HIKE_WAITING: [
+                CallbackQueryHandler(admin_price_hike_callback, pattern=r"^phike:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_price_hike_save),
+            ]
+        },
+        fallbacks=[*ADMIN_CONV_FALLBACKS],
+        allow_reentry=True,
     )
 
     create_promo_conv = ConversationHandler(
@@ -10482,7 +11058,10 @@ def main():
     app.add_handler(admins_remove_conv)
     app.add_handler(blacklist_conv)
     app.add_handler(category_discount_conv)
+    app.add_handler(price_hike_conv)
     app.add_handler(welcome_screen_conv)
+    app.add_handler(CallbackQueryHandler(admin_category_discount_callback, pattern=r"^cdisc:"))
+    app.add_handler(CallbackQueryHandler(admin_price_hike_callback, pattern=r"^phike:"))
 
     # Срабатывают, когда пользователь не в активном ConversationHandler (внутри сценария — fallbacks).
     app.add_handler(CommandHandler("cancel", cancel))
@@ -10544,13 +11123,13 @@ def main():
     # В логах Railway «верх» часто обрезан — дублируем режим БД рядом с финальным сообщением.
     if USE_POSTGRES:
         logger.info("Старт бота: режим БД = PostgreSQL")
-        print("Старт бота: режим БД = PostgreSQL", flush=True)
+        _safe_print("Старт бота: режим БД = PostgreSQL")
     else:
         _p = os.path.abspath(DB_PATH)
         logger.warning("Старт бота: режим БД = SQLite (%s)", _p)
-        print(f"Старт бота: режим БД = SQLite ({_p})", flush=True)
+        _safe_print(f"Старт бота: режим БД = SQLite ({_p})")
 
-    print("RNDM SHOP bot запущен...", flush=True)
+    _safe_print("RNDM SHOP bot запущен...")
     _acquire_postgres_polling_singleton_lock()
     app.run_polling(poll_interval=1, timeout=10, drop_pending_updates=True)
 
